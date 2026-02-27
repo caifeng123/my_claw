@@ -1,0 +1,22 @@
+{
+  "name": "cf_claw",
+  "version": "0.1.0",
+  "description": "A single-user AI Agent system based on Claude Agent SDK with layered memory and Feishu integration",
+  "module": "src/index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "bun --watch src/index.ts",
+    "start": "bun src/index.ts",
+    "build": "bun build src/index.ts --outdir dist",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.62",
+    "@larksuiteoapi/node-sdk": "^1.59.0",
+    "hono": "^4.12.3"
+  }
+}
