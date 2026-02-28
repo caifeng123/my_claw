@@ -109,7 +109,6 @@ export class AgentEngine {
 
       // 获取会话消息历史
       const messages = this.sessionManager.getMessages(sessionId)
-
       // 获取工具配置
       if (!this.toolsConfig) {
         await this.initializeTools()
@@ -120,12 +119,19 @@ export class AgentEngine {
         this.streamHandler.setEventHandlers(eventHandlers)
       }
 
-      // 发送流式消息给Claude
-      await this.claudeEngine.sendMessageStream(
+      // 发送流式消息给Claude并获取响应内容
+      const responseContent = await this.claudeEngine.sendMessageStream(
         messages,
         this.toolsConfig,
         eventHandlers || this.streamHandler.getEventHandlers()
       )
+
+      // 添加助手响应到会话
+      const assistantMessage: SDKMessage = {
+        role: 'assistant',
+        content: responseContent,
+      }
+      this.sessionManager.addMessage(sessionId, assistantMessage)
     } catch (error) {
       console.error('Agent流式消息处理错误:', error)
       this.streamHandler.handleEvent({

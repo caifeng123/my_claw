@@ -48,7 +48,6 @@ export class ClaudeEngine {
         }
         return `${msg.role}: [complex content]`
       }).join('\n')
-      console.log('userQuery:', toolsConfig)
       // 使用异步生成器作为提示
       const response = query({
         prompt: userQuery,
