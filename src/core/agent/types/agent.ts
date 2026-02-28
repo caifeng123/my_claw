@@ -56,10 +56,10 @@ export interface ToolCallResult {
 
 // 事件处理器
 export interface EventHandlers {
-  onContentStart?: () => void
-  onContentDelta?: (delta: string) => void
-  onContentStop?: () => void
-  onToolUseStart?: (toolName: string) => void
-  onToolUseStop?: (toolName: string, result: any) => void
-  onError?: (error: string) => void
+  onContentStart?: () => Promise<void>
+  onContentDelta?: (delta: string) => Promise<void>
+  onContentStop?: () => Promise<void>
+  onToolUseStart?: (toolName: string) => Promise<void>
+  onToolUseStop?: (toolName: string, result: any) => Promise<void>
+  onError?: (error: string) => Promise<void>
 }

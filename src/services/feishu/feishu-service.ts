@@ -1,5 +1,14 @@
 import * as lark from '@larksuiteoapi/node-sdk';
-import type { FeishuConnection, FeishuConnectionConfig, FeishuMessage } from './types.js';
+import { existsSync, readFileSync, statSync } from 'fs';
+import { extname, isAbsolute, resolve } from 'path';
+import type {
+  FeishuConnection,
+  FeishuConnectionConfig,
+  FeishuMessage,
+  ImageUploadOptions,
+  ImageUploadResult,
+  ContentProcessResult
+} from './types.js';
 
 // 飞书消息类型
 const MESSAGE_TYPE_TEXT = 'text';
@@ -42,7 +51,8 @@ export class FeishuService implements FeishuConnection {
       this.client = new lark.Client({
         appId: this.config.appId,
         appSecret: this.config.appSecret,
-        appType: lark.AppType.SelfBuild,
+        // appType: lark.AppType.SelfBuild,
+        loggerLevel: lark.LoggerLevel.debug,
       });
 
       // 创建事件分发器
@@ -104,16 +114,25 @@ export class FeishuService implements FeishuConnection {
     };
 
     try {
+      // 处理内容中的图片
+      const processResult = await this.processContentWithImages(text);
+
+      if (processResult.errors.length > 0) {
+        console.warn('Some images failed to upload:', processResult.errors);
+      }
+
+      const processedText = processResult.processedText;
+
       // 根据内容长度选择消息类型
-      if (text.length <= PLAIN_TEXT_LIMIT) {
+      if (processedText.length <= PLAIN_TEXT_LIMIT) {
         // 短文本，使用纯文本消息
-        await this.sendPlainTextMessage(chatId, text);
-      } else if (text.length <= CARD_MD_LIMIT) {
+        await this.sendPlainTextMessage(chatId, processedText);
+      } else if (processedText.length <= CARD_MD_LIMIT) {
         // 中等长度文本，使用交互式卡片
-        await this.sendInteractiveCardMessage(chatId, text);
+        await this.sendInteractiveCardMessage(chatId, processedText);
       } else {
         // 长文本，分割成多个卡片消息
-        const chunks = this.splitAtParagraphs(text, CARD_MD_LIMIT);
+        const chunks = this.splitAtParagraphs(processedText, CARD_MD_LIMIT);
         for (let i = 0; i < chunks.length; i++) {
           const chunk = chunks[i];
           // 如果是第一个消息，可能作为新消息发送，后续消息作为回复
@@ -513,6 +532,248 @@ export class FeishuService implements FeishuConnection {
       });
     } catch (error) {
       console.debug('Failed to remove reaction:', error);
+    }
+  }
+
+  /**
+   * 上传图片到飞书
+   */
+  async uploadImage(filePath: string, options?: ImageUploadOptions): Promise<ImageUploadResult> {
+    if (!this.client) {
+      return { success: false, error: 'Feishu client not initialized' };
+    }
+
+    const maxFileSize = options?.maxFileSize || 10 * 1024 * 1024; // 默认10MB
+
+    try {
+      // 验证文件存在性
+      if (!existsSync(filePath)) {
+        return { success: false, error: `File not found: ${filePath}` };
+      }
+
+      // 验证文件大小
+      const stats = statSync(filePath);
+      if (stats.size > maxFileSize) {
+        return { success: false, error: `File too large: ${stats.size} bytes (max: ${maxFileSize} bytes)` };
+      }
+
+      // 验证文件类型（通过后缀名）
+      const ext = extname(filePath).toLowerCase();
+      const allowedExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.svg'];
+      if (!allowedExtensions.includes(ext)) {
+        return { success: false, error: `Unsupported file type: ${ext}` };
+      }
+
+      // 读取文件内容
+      const fileBuffer = readFileSync(filePath);
+
+      // 上传图片
+      const result = await this.client.im.image.create({
+        data: {
+          image: fileBuffer,
+          image_type: 'message',
+        },
+      });
+      console.log(JSON.stringify(result, null, 2))
+
+      const imageKey = result?.image_key;
+      if (imageKey) {
+        console.log(`Image uploaded successfully: ${filePath} -> ${imageKey}`);
+        return { success: true, imageKey };
+      } else {
+        return { success: false, error: 'Failed to get image key from response' };
+      }
+    } catch (error) {
+      console.error(`Failed to upload image ${filePath}:`, error);
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /**
+   * 从 HTTPS URL 下载图片并上传到飞书
+   */
+  async uploadImageFromUrl(
+    imageUrl: string,
+    options?: ImageUploadOptions
+  ): Promise<ImageUploadResult> {
+    if (!this.client) {
+      return { success: false, error: 'Feishu client not initialized' };
+    }
+
+    if (!imageUrl.startsWith('https://')) {
+      return { success: false, error: 'Only HTTPS URLs are supported' };
+    }
+
+    const maxFileSize = options?.maxFileSize || 10 * 1024 * 1024;
+    const timeout = options?.timeout || 30000;
+    const allowedContentTypes = [
+      'image/jpeg',
+      'image/png',
+      'image/gif',
+      'image/bmp',
+      'image/webp',
+      'image/svg+xml',
+    ];
+
+    try {
+      // 超时控制
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), timeout);
+
+      let response: Response;
+      try {
+        response = await fetch(imageUrl, {
+          method: 'GET',
+          signal: controller.signal,
+          headers: { 'User-Agent': 'FeishuImageUploader/1.0' },
+        });
+      } finally {
+        clearTimeout(timeoutId);
+      }
+
+      if (!response.ok) {
+        return { success: false, error: `HTTP request failed with status: ${response.status}` };
+      }
+
+      // 验证 Content-Type
+      const contentType = response.headers.get('content-type')?.split(';')[0]?.trim().toLowerCase();
+      if (contentType && !allowedContentTypes.includes(contentType)) {
+        return { success: false, error: `Unsupported content type: ${contentType}` };
+      }
+
+      // 预检 Content-Length
+      const contentLength = response.headers.get('content-length');
+      if (contentLength && parseInt(contentLength, 10) > maxFileSize) {
+        return {
+          success: false,
+          error: `File too large: ${contentLength} bytes (max: ${maxFileSize} bytes)`,
+        };
+      }
+
+      // 读取为 Buffer
+      const arrayBuffer = await response.arrayBuffer();
+      const fileBuffer = Buffer.from(arrayBuffer);
+
+      if (fileBuffer.length > maxFileSize) {
+        return {
+          success: false,
+          error: `File too large: ${fileBuffer.length} bytes (max: ${maxFileSize} bytes)`,
+        };
+      }
+
+      if (fileBuffer.length === 0) {
+        return { success: false, error: 'Downloaded file is empty' };
+      }
+
+      // 上传到飞书 —— 匹配 @larksuiteoapi/node-sdk 的 im.v1.image.create 签名
+      const res = await this.client.im.image.create({
+        data: {
+          image_type: 'message',
+          image: fileBuffer,
+        },
+      });
+
+      const imageKey = res?.image_key;
+      if (imageKey) {
+        console.log(`Image uploaded from URL successfully: ${imageUrl} -> ${imageKey}`);
+        return { success: true, imageKey };
+      } else {
+        return { success: false, error: 'Failed to get image key from response' };
+      }
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') {
+        return { success: false, error: `Download timed out after ${timeout}ms` };
+      }
+      console.error(`Failed to upload image from URL ${imageUrl}:`, error);
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /**
+   * 处理文本内容，自动检测并上传图片（支持本地路径和远程URL）
+   */
+  async processContentWithImages(text: string): Promise<ContentProcessResult> {
+    const imageKeys: string[] = [];
+    const errors: string[] = [];
+    let processedText = text;
+
+    // 正则表达式匹配图片路径和URL
+    // 支持：
+    // 1. 本地绝对路径：/home/user/image.jpg, C:\\Users\\image.png
+    // 2. 本地相对路径：./images/photo.jpg, ../assets/pic.png
+    // 3. 远程URL：https://example.com/image.jpg, http://site.com/pic.png
+    const imagePattern = /(https?:\/\/[^\s]+\.(?:jpg|jpeg|png|gif|bmp|webp|svg)|[a-zA-Z]:\\[^\s]+\.(?:jpg|jpeg|png|gif|bmp|webp|svg)|\/[^\s]+\.(?:jpg|jpeg|png|gif|bmp|webp|svg)|\.[\\\/][^\s]+\.(?:jpg|jpeg|png|gif|bmp|webp|svg))/gi;
+
+    const matches = text.match(imagePattern);
+    if (!matches || matches.length === 0) {
+      return { processedText: text, imageKeys: [], errors: [] };
+    }
+
+    // 去重处理
+    const uniquePaths = [...new Set(matches)];
+
+    for (const imagePath of uniquePaths) {
+      try {
+        let result: ImageUploadResult;
+
+        // 判断是本地路径还是远程URL
+        if (imagePath.startsWith('http://') || imagePath.startsWith('https://')) {
+          // 远程URL处理
+          result = await this.uploadImageFromUrl(imagePath);
+        } else {
+          // 本地路径处理
+          let resolvedPath = imagePath;
+          if (!isAbsolute(imagePath)) {
+            resolvedPath = resolve(process.cwd(), imagePath);
+          }
+          result = await this.uploadImage(resolvedPath);
+        }
+
+        if (result.success && result.imageKey) {
+          // 替换为Markdown格式的图片链接
+          const markdownLink = `![](${result.imageKey})`;
+          processedText = processedText.replace(new RegExp(imagePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), markdownLink);
+          imageKeys.push(result.imageKey);
+          console.log(`Replaced image: ${imagePath} -> ${markdownLink}`);
+        } else {
+          errors.push(`Failed to upload image: ${imagePath} - ${result.error}`);
+          console.warn(`Image upload failed: ${imagePath} - ${result.error}`);
+        }
+      } catch (error) {
+        const errorMsg = `Error processing image ${imagePath}: ${error instanceof Error ? error.message : 'Unknown error'}`;
+        errors.push(errorMsg);
+        console.error(errorMsg);
+      }
+    }
+
+    return { processedText, imageKeys, errors };
+  }
+
+  /**
+   * 发送处理后的消息（包含图片自动上传）
+   */
+  async sendMessageWithProcessedContent(chatId: string, text: string): Promise<void> {
+    if (!this.client) {
+      console.warn('Feishu client not initialized, skipping message send');
+      return;
+    }
+
+    try {
+      // 处理内容中的图片
+      const processResult = await this.processContentWithImages(text);
+
+      if (processResult.errors.length > 0) {
+        console.warn('Some images failed to upload:', processResult.errors);
+      }
+
+      // 使用处理后的文本发送消息
+      await this.sendMessage(chatId, processResult.processedText);
+
+      console.log(`Message with processed content sent to chat ${chatId}`);
+    } catch (error) {
+      console.error('Failed to send message with processed content:', error);
+      // 降级为原始文本发送
+      await this.sendMessage(chatId, text);
     }
   }
 }
