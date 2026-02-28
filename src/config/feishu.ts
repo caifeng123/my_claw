@@ -1,4 +1,4 @@
-import { FeishuAgentBridgeConfig } from '../services/feishu/feishu-agent-bridge.js'
+import type { FeishuAgentBridgeConfig } from '../services/feishu/feishu-agent-bridge.js'
 
 /**
  * 飞书配置

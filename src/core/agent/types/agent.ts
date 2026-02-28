@@ -1,14 +1,5 @@
 import type { SDKMessage, SDKToolUseSummaryMessage } from '@anthropic-ai/claude-agent-sdk'
 
-// Agent 配置类型
-export interface AgentConfig {
-  apiKey: string
-  model?: string
-  maxTokens?: number
-  temperature?: number
-  systemPrompt?: string
-}
-
 // 会话配置
 export interface SessionConfig {
   sessionId: string
@@ -65,10 +56,10 @@ export interface ToolCallResult {
 
 // 事件处理器
 export interface EventHandlers {
-  onContentStart?: () => void
-  onContentDelta?: (delta: string) => void
-  onContentStop?: () => void
-  onToolUseStart?: (toolName: string) => void
-  onToolUseStop?: (toolName: string, result: any) => void
-  onError?: (error: string) => void
+  onContentStart?: () => Promise<void>
+  onContentDelta?: (delta: string) => Promise<void>
+  onContentStop?: () => Promise<void>
+  onToolUseStart?: (toolName: string) => Promise<void>
+  onToolUseStop?: (toolName: string, result: any) => Promise<void>
+  onError?: (error: string) => Promise<void>
 }

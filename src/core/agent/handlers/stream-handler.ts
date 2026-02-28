@@ -10,18 +10,18 @@ export class StreamHandler {
   /**
    * 处理流式事件
    */
-  handleEvent(event: StreamEvent): void {
+  async handleEvent(event: StreamEvent): Promise<void> {
     switch (event.type) {
       case 'content_start':
-        this.eventHandlers.onContentStart?.()
+        await this.eventHandlers.onContentStart?.()
         break
 
       case 'content_delta':
-        this.eventHandlers.onContentDelta?.(event.delta)
+        await this.eventHandlers.onContentDelta?.(event.delta)
         break
 
       case 'content_stop':
-        this.eventHandlers.onContentStop?.()
+        await this.eventHandlers.onContentStop?.()
         break
 
       case 'tool_use_start':
@@ -29,11 +29,11 @@ export class StreamHandler {
         break
 
       case 'tool_use_stop':
-        this.eventHandlers.onToolUseStop?.(event.toolName, event.result)
+        await this.eventHandlers.onToolUseStop?.(event.toolName, event.result)
         break
 
       case 'error':
-        this.eventHandlers.onError?.(event.error)
+        await this.eventHandlers.onError?.(event.error)
         break
 
       default:
@@ -60,22 +60,22 @@ export class StreamHandler {
    */
   createWebSocketHandler(ws: WebSocket): EventHandlers {
     return {
-      onContentStart: () => {
+      onContentStart: async () => {
         ws.send(JSON.stringify({ type: 'content_start' }))
       },
-      onContentDelta: (delta: string) => {
+      onContentDelta: async (delta: string) => {
         ws.send(JSON.stringify({ type: 'content_delta', delta }))
       },
-      onContentStop: () => {
+      onContentStop: async () => {
         ws.send(JSON.stringify({ type: 'content_stop' }))
       },
-      onToolUseStart: (toolName: string) => {
+      onToolUseStart: async (toolName: string) => {
         ws.send(JSON.stringify({ type: 'tool_use_start', toolName }))
       },
-      onToolUseStop: (toolName: string, result: any) => {
+      onToolUseStop: async (toolName: string, result: any) => {
         ws.send(JSON.stringify({ type: 'tool_use_stop', toolName, result }))
       },
-      onError: (error: string) => {
+      onError: async (error: string) => {
         ws.send(JSON.stringify({ type: 'error', error }))
       },
     }
@@ -86,22 +86,22 @@ export class StreamHandler {
    */
   createHTTPStreamHandler(write: (chunk: string) => void): EventHandlers {
     return {
-      onContentStart: () => {
+      onContentStart: async () => {
         write('data: ' + JSON.stringify({ type: 'content_start' }) + '\n\n')
       },
-      onContentDelta: (delta: string) => {
+      onContentDelta: async (delta: string) => {
         write('data: ' + JSON.stringify({ type: 'content_delta', delta }) + '\n\n')
       },
-      onContentStop: () => {
+      onContentStop: async () => {
         write('data: ' + JSON.stringify({ type: 'content_stop' }) + '\n\n')
       },
-      onToolUseStart: (toolName: string) => {
+      onToolUseStart: async (toolName: string) => {
         write('data: ' + JSON.stringify({ type: 'tool_use_start', toolName }) + '\n\n')
       },
-      onToolUseStop: (toolName: string, result: any) => {
+      onToolUseStop: async (toolName: string, result: any) => {
         write('data: ' + JSON.stringify({ type: 'tool_use_stop', toolName, result }) + '\n\n')
       },
-      onError: (error: string) => {
+      onError: async (error: string) => {
         write('data: ' + JSON.stringify({ type: 'error', error }) + '\n\n')
       },
     }

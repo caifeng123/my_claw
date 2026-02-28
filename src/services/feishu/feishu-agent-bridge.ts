@@ -131,17 +131,17 @@ export class FeishuAgentBridge {
     let fullResponse = '';
 
     const eventHandlers: EventHandlers = {
-      onContentDelta: (textDelta: string) => {
+      onContentDelta: async (textDelta: string) => {
         fullResponse += textDelta;
       },
       onContentStop: async () => {
-        // 发送最终回复
+        // 发送最终回复（包含图片自动处理）
         if (fullResponse) {
           await this.feishuService.sendMessage(message.chatId, fullResponse);
           console.log(`✅ 流式回复完成: ${fullResponse.length} 字符`);
         }
       },
-      onError: (error: string) => {
+      onError: async (error: string) => {
         console.error('流式回复错误:', error);
         this.sendErrorResponse(message.chatId, new Error(error)).catch(console.error);
       },

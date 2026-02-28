@@ -28,3 +28,28 @@ export interface FeishuServiceConfig {
   onMessage?: (message: FeishuMessage) => void;
   onError?: (error: Error) => void;
 }
+
+// 图片上传选项
+export interface ImageUploadOptions {
+  timeout?: number; // 超时时间（毫秒）
+  maxFileSize?: number; // 最大文件大小（字节）
+}
+
+// 图片上传结果
+export interface ImageUploadResult {
+  success: boolean;
+  imageKey?: string; // 上传成功后的图片key
+  error?: string; // 错误信息
+}
+
+// 支持图片的消息接口
+export interface FeishuMessageWithImage extends FeishuMessage {
+  imageKeys?: string[]; // 图片键值列表
+}
+
+// 内容处理结果
+export interface ContentProcessResult {
+  processedText: string; // 处理后的文本（图片路径替换为Markdown链接）
+  imageKeys: string[]; // 上传的图片键值列表
+  errors: string[]; // 处理过程中遇到的错误
+}

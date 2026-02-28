@@ -1,5 +1,16 @@
 import * as lark from '@larksuiteoapi/node-sdk';
-import type { FeishuConnection, FeishuConnectionConfig, FeishuMessage } from './types.js';
+import { existsSync, readFileSync, statSync, writeFileSync, mkdirSync } from 'fs';
+import mime from 'mime';
+import { extname, isAbsolute, resolve, join } from 'path';
+import type {
+  FeishuConnection,
+  FeishuConnectionConfig,
+  FeishuMessage,
+  ImageUploadOptions,
+  ImageUploadResult,
+  ContentProcessResult
+} from './types.js';
+import { fileURLToPath } from 'url';
 
 // 飞书消息类型
 const MESSAGE_TYPE_TEXT = 'text';
@@ -14,6 +25,12 @@ const TEXT_MSG_LIMIT = 2048; // 飞书纯文本消息限制
 // 消息去重缓存设置
 const MSG_DEDUP_MAX = 1000;
 const MSG_DEDUP_TTL = 30 * 60 * 1000; // 30分钟
+
+function getExtFromContentType(contentType: string) {
+  const type = contentType.split(';')?.[0]?.trim() || '';
+  const ext = mime.getExtension(type);
+  return ext ? `.${ext}` : '';
+}
 
 export class FeishuService implements FeishuConnection {
   private client: lark.Client | null = null;
@@ -42,7 +59,8 @@ export class FeishuService implements FeishuConnection {
       this.client = new lark.Client({
         appId: this.config.appId,
         appSecret: this.config.appSecret,
-        appType: lark.AppType.SelfBuild,
+        // appType: lark.AppType.SelfBuild,
+        loggerLevel: lark.LoggerLevel.debug,
       });
 
       // 创建事件分发器
@@ -84,6 +102,7 @@ export class FeishuService implements FeishuConnection {
     this.onMessageCallback = null;
   }
 
+  // shouldMarkdown 强制使用 markdown 格式
   async sendMessage(chatId: string, text: string): Promise<void> {
     if (!this.client) {
       console.warn('Feishu client not initialized, skipping message send');
@@ -104,16 +123,25 @@ export class FeishuService implements FeishuConnection {
     };
 
     try {
+      // 处理内容中的图片
+      const processResult = await this.processContentWithImages(text);
+
+      if (processResult.errors.length > 0) {
+        console.warn('Some images failed to upload:', processResult.errors);
+      }
+
+      const processedText = processResult.processedText;
+
       // 根据内容长度选择消息类型
-      if (text.length <= PLAIN_TEXT_LIMIT) {
+      if (processedText.length <= PLAIN_TEXT_LIMIT && !processResult.imageKeys.length) {
         // 短文本，使用纯文本消息
-        await this.sendPlainTextMessage(chatId, text);
-      } else if (text.length <= CARD_MD_LIMIT) {
+        await this.sendPlainTextMessage(chatId, processedText);
+      } else if (processedText.length <= CARD_MD_LIMIT) {
         // 中等长度文本，使用交互式卡片
-        await this.sendInteractiveCardMessage(chatId, text);
+        await this.sendInteractiveCardMessage(chatId, processedText);
       } else {
         // 长文本，分割成多个卡片消息
-        const chunks = this.splitAtParagraphs(text, CARD_MD_LIMIT);
+        const chunks = this.splitAtParagraphs(processedText, CARD_MD_LIMIT);
         for (let i = 0; i < chunks.length; i++) {
           const chunk = chunks[i];
           // 如果是第一个消息，可能作为新消息发送，后续消息作为回复
@@ -166,7 +194,6 @@ export class FeishuService implements FeishuConnection {
       const message = data.message;
       const chatId = message.chat_id;
       const messageId = message.message_id;
-
       // 消息去重检查
       if (this.isDuplicate(messageId)) {
         console.debug('Duplicate message, skipping');
@@ -175,12 +202,30 @@ export class FeishuService implements FeishuConnection {
       this.markSeen(messageId);
 
       // 提取消息内容
-      const extracted = this.extractMessageContent(message.message_type, message.content);
+      const extracted = this.extractMessageContent(message.message_type, message.content, message.create_time);
       let content = extracted.text;
 
-      if (!content && !extracted.imageKeys) {
-        console.debug('No text or image content, skipping');
+      if (!content && !extracted.imageKeys && !extracted.fileKeys) {
+        console.debug('No text or image content or file content, skipping');
         return;
+      }
+
+      // 下载图片（如果有）
+      if (extracted.imageKeys && extracted.imageKeys.length > 0) {
+        for (let i = 0; i < extracted.imageKeys.length; i++) {
+          const imageKey = extracted.imageKeys[i] as string;
+          try {
+            const filePath = await this.downloadFile(
+              messageId,
+              imageKey,
+              `${message.create_time}-image-${i}`,
+              'image'
+            );
+            console.log(`图片下载成功: ${filePath}`);
+          } catch (downloadError) {
+            console.error(`下载图片失败: ${imageKey}`, downloadError);
+          }
+        }
       }
 
       // 处理 @ 提及
@@ -191,6 +236,25 @@ export class FeishuService implements FeishuConnection {
           }
         }
       }
+
+      // // 下载文件（如果有）
+      // if (extracted.fileKeys?.length) {
+      //   console.log(`检测到 ${extracted.fileKeys.length} 个文件，开始下载...`);
+      //   for (let i = 0; i < extracted.fileKeys.length; i++) {
+      //     const fileKey = extracted.fileKeys[i] as string;
+      //     try {
+      //       const filePath = await this.downloadFile(
+      //         messageId,
+      //         fileKey,
+      //         `${message.create_time}-file-${i}`,
+      //         'file'
+      //       );
+      //       console.log(`文件下载成功: ${filePath}`);
+      //     } catch (downloadError) {
+      //       console.error(`下载文件失败: ${fileKey}`, downloadError);
+      //     }
+      //   }
+      // }
 
       // 记录最后一条消息ID
       this.lastMessageIdByChat.set(chatId, messageId);
@@ -217,48 +281,104 @@ export class FeishuService implements FeishuConnection {
     }
   }
 
-  private extractMessageContent(messageType: string, content: string): { text: string; imageKeys?: string[] } {
-    try {
-      const parsed = JSON.parse(content);
+private extractMessageContent(messageType: string, content: string, createTime: string): { text: string; imageKeys?: string[]; fileKeys?: string[] } {
+  try {
+    const parsed = JSON.parse(content);
 
-      if (messageType === MESSAGE_TYPE_TEXT) {
-        return { text: parsed.text || '' };
-      }
+    if (messageType === MESSAGE_TYPE_TEXT) {
+      return { text: parsed.text || '' };
+    }
 
-      if (messageType === MESSAGE_TYPE_POST) {
-        // 从富文本中提取文本
-        const lines: string[] = [];
-        const post = parsed.post;
-        if (!post) return { text: '' };
+    if (messageType === MESSAGE_TYPE_POST) {
+      const lines: string[] = [];
+      const imageKeys: string[] = [];
+      const fileKeys: string[] = [];
 
-        const contentData = post.zh_cn || post.en_us || Object.values(post)[0];
-        if (!contentData || !Array.isArray(contentData.content)) return { text: '' };
+      const contentArray = parsed.content;
+      if (!Array.isArray(contentArray)) return { text: parsed.title || '' };
 
-        for (const paragraph of contentData.content) {
-          if (!Array.isArray(paragraph)) continue;
-          for (const segment of paragraph) {
-            if (segment.tag === 'text' && segment.text) {
-              lines.push(segment.text);
-            }
+      let imageIdx = 0;
+      let mediaIdx = 0;
+
+      for (const paragraph of contentArray) {
+        if (!Array.isArray(paragraph)) continue;
+
+        const paragraphTexts: string[] = [];
+
+        for (const segment of paragraph) {
+          if (!segment || !segment.tag) continue;
+
+          switch (segment.tag) {
+            case 'text':
+              if (segment.text) paragraphTexts.push(segment.text);
+              break;
+            case 'a':
+              paragraphTexts.push(segment.text || segment.href || '');
+              break;
+            case 'at':
+              if (segment.user_id) {
+                paragraphTexts.push(`@${segment.user_name || segment.user_id}`);
+              }
+              break;
+            case 'img':
+              if (segment.image_key) {
+                imageKeys.push(segment.image_key);
+                paragraphTexts.push(`![${createTime}-image-${imageIdx++}](data/lark/images/${createTime}-image-${imageIdx++})`);
+              }
+              break;
+            case 'media':
+              if (segment.file_key) {
+                fileKeys.push(segment.file_key);
+                paragraphTexts.push(`data/lark/files/${createTime}-file-${mediaIdx++}`);
+              }
+              break;
+            case 'emotion':
+              if (segment.emoji_type) paragraphTexts.push(`[表情:${segment.emoji_type}]`);
+              break;
+            case 'code_block':
+              if (segment.text) paragraphTexts.push(`\`\`\`${segment.language || ''}\n${segment.text}\n\`\`\``);
+              break;
+            case 'md':
+              if (segment.text) paragraphTexts.push(segment.text);
+              break;
+            case 'hr':
+              paragraphTexts.push('---');
+              break;
+            default:
+              if (segment.text) paragraphTexts.push(segment.text);
+              break;
           }
         }
 
-        return { text: lines.join('\n') };
+        if (paragraphTexts.length > 0) lines.push(paragraphTexts.join(''));
       }
 
-      if (messageType === MESSAGE_TYPE_IMAGE) {
-        const imageKey = parsed.image_key;
-        if (imageKey) {
-          return { text: '[图片]', imageKeys: [imageKey] };
-        }
-      }
+      const title = parsed.title ? `${parsed.title}\n` : '';
 
-      return { text: '' };
-    } catch (error) {
-      console.warn('Failed to parse message content:', error);
-      return { text: '' };
+      return {
+        text: title + lines.join('\n'),
+        imageKeys: imageKeys.length > 0 ? imageKeys : undefined,
+        fileKeys: fileKeys.length > 0 ? fileKeys : undefined,
+      };
     }
+
+    if (messageType === MESSAGE_TYPE_IMAGE) {
+      const imageKey = parsed.image_key;
+      if (imageKey) {
+        return {
+          text: `${createTime}-image-0`,
+          imageKeys: [imageKey],
+          fileKeys: parsed.file_key ? [parsed.file_key] : undefined,
+        };
+      }
+    }
+
+    return { text: '' };
+  } catch (error) {
+    console.warn('Failed to parse message content:', error);
+    return { text: '' };
   }
+}
 
   /**
    * 发送纯文本消息
@@ -513,6 +633,339 @@ export class FeishuService implements FeishuConnection {
       });
     } catch (error) {
       console.debug('Failed to remove reaction:', error);
+    }
+  }
+
+  /**
+   * 上传图片到飞书
+   */
+  async uploadImage(filePath: string, options?: ImageUploadOptions): Promise<ImageUploadResult> {
+    if (!this.client) {
+      return { success: false, error: 'Feishu client not initialized' };
+    }
+
+    const maxFileSize = options?.maxFileSize || 10 * 1024 * 1024; // 默认10MB
+
+    try {
+      // 验证文件存在性
+      if (!existsSync(filePath)) {
+        return { success: false, error: `File not found: ${filePath}` };
+      }
+
+      // 验证文件大小
+      const stats = statSync(filePath);
+      if (stats.size > maxFileSize) {
+        return { success: false, error: `File too large: ${stats.size} bytes (max: ${maxFileSize} bytes)` };
+      }
+
+      // 验证文件类型（通过后缀名）
+      const ext = extname(filePath).toLowerCase();
+      const allowedExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.svg'];
+      if (!allowedExtensions.includes(ext)) {
+        return { success: false, error: `Unsupported file type: ${ext}` };
+      }
+
+      // 读取文件内容
+      const fileBuffer = readFileSync(filePath);
+
+      // 上传图片
+      const result = await this.client.im.image.create({
+        data: {
+          image: fileBuffer,
+          image_type: 'message',
+        },
+      });
+      console.log(JSON.stringify(result, null, 2))
+
+      const imageKey = result?.image_key;
+      if (imageKey) {
+        console.log(`Image uploaded successfully: ${filePath} -> ${imageKey}`);
+        return { success: true, imageKey };
+      } else {
+        return { success: false, error: 'Failed to get image key from response' };
+      }
+    } catch (error) {
+      console.error(`Failed to upload image ${filePath}:`, error);
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /**
+   * 从 HTTPS URL 下载图片并上传到飞书
+   */
+  async uploadImageFromUrl(
+    imageUrl: string,
+    options?: ImageUploadOptions
+  ): Promise<ImageUploadResult> {
+    if (!this.client) {
+      return { success: false, error: 'Feishu client not initialized' };
+    }
+
+    if (!imageUrl.startsWith('https://')) {
+      return { success: false, error: 'Only HTTPS URLs are supported' };
+    }
+
+    const maxFileSize = options?.maxFileSize || 10 * 1024 * 1024;
+    const timeout = options?.timeout || 30000;
+    const allowedContentTypes = [
+      'image/jpeg',
+      'image/png',
+      'image/gif',
+      'image/bmp',
+      'image/webp',
+      'image/svg+xml',
+    ];
+
+    try {
+      // 超时控制
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), timeout);
+
+      let response: Response;
+      try {
+        response = await fetch(imageUrl, {
+          method: 'GET',
+          signal: controller.signal,
+          headers: { 'User-Agent': 'FeishuImageUploader/1.0' },
+        });
+      } finally {
+        clearTimeout(timeoutId);
+      }
+
+      if (!response.ok) {
+        return { success: false, error: `HTTP request failed with status: ${response.status}` };
+      }
+
+      // 验证 Content-Type
+      const contentType = response.headers.get('content-type')?.split(';')[0]?.trim().toLowerCase();
+      if (contentType && !allowedContentTypes.includes(contentType)) {
+        return { success: false, error: `Unsupported content type: ${contentType}` };
+      }
+
+      // 预检 Content-Length
+      const contentLength = response.headers.get('content-length');
+      if (contentLength && parseInt(contentLength, 10) > maxFileSize) {
+        return {
+          success: false,
+          error: `File too large: ${contentLength} bytes (max: ${maxFileSize} bytes)`,
+        };
+      }
+
+      // 读取为 Buffer
+      const arrayBuffer = await response.arrayBuffer();
+      const fileBuffer = Buffer.from(arrayBuffer);
+
+      if (fileBuffer.length > maxFileSize) {
+        return {
+          success: false,
+          error: `File too large: ${fileBuffer.length} bytes (max: ${maxFileSize} bytes)`,
+        };
+      }
+
+      if (fileBuffer.length === 0) {
+        return { success: false, error: 'Downloaded file is empty' };
+      }
+
+      // 上传到飞书 —— 匹配 @larksuiteoapi/node-sdk 的 im.v1.image.create 签名
+      const res = await this.client.im.image.create({
+        data: {
+          image_type: 'message',
+          image: fileBuffer,
+        },
+      });
+
+      const imageKey = res?.image_key;
+      if (imageKey) {
+        console.log(`Image uploaded from URL successfully: ${imageUrl} -> ${imageKey}`);
+        return { success: true, imageKey };
+      } else {
+        return { success: false, error: 'Failed to get image key from response' };
+      }
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') {
+        return { success: false, error: `Download timed out after ${timeout}ms` };
+      }
+      console.error(`Failed to upload image from URL ${imageUrl}:`, error);
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /**
+   * 处理文本内容，自动检测并上传图片（支持本地路径和远程URL）
+   */
+  async processContentWithImages(text: string): Promise<ContentProcessResult> {
+    const imageKeys: string[] = [];
+    const errors: string[] = [];
+
+    const IMG_EXT = 'jpg|jpeg|png|gif|bmp|webp|svg';
+
+    // ===== 第1步：提取所有图片路径 =====
+    const pathPattern = new RegExp(
+      `(?:https?|file):\\/\\/[^\\s\\)"'<>]+\\.(?:${IMG_EXT})(?:\\?[^\\s\\)"'<>]*)?` +
+      `|[a-zA-Z]:\\\\[^\\s\\)"'<>]+\\.(?:${IMG_EXT})` +
+      `|\\.{0,2}[\\\\\/][^\\s\\)"'<>]+\\.(?:${IMG_EXT})`,
+      'gi'
+    );
+
+    const allPaths = [...new Set(text.match(pathPattern) || [])];
+    if (allPaths.length === 0) {
+      return { processedText: text, imageKeys: [], errors: [] };
+    }
+
+    // ===== 第2步：批量上传，构建替换映射 =====
+    const replacements = new Map<string, string>();
+
+    await Promise.all(allPaths.map(async (imgPath) => {
+      try {
+        const result = await this.resolveAndUpload(imgPath);
+        if (result.success && result.imageKey) {
+          replacements.set(imgPath, result.imageKey);
+          imageKeys.push(result.imageKey);
+        } else {
+          errors.push(`Upload failed: ${imgPath} - ${result.error}`);
+        }
+      } catch (e) {
+        errors.push(`Error: ${imgPath} - ${e instanceof Error ? e.message : 'Unknown'}`);
+      }
+    }));
+
+    if (replacements.size === 0) {
+      return { processedText: text, imageKeys: [], errors };
+    }
+
+    // ===== 第3步：一次性替换 =====
+    // 构建一个大正则，按路径长度降序排列（避免短路径先匹配吃掉长路径的一部分）
+    const sorted = [...replacements.keys()]
+      .sort((a, b) => b.length - a.length);
+
+    const escaped = sorted
+      .map(p => p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+
+    // 统一匹配：![alt](path) 或 <img src="path"> 或 裸路径
+    const masterPattern = new RegExp(
+      `(!\\[[^\\]]*\\]\\()` +              // Markdown 前缀: ![alt](
+      `(${escaped.join('|')})` +           // 图片路径（核心捕获）
+      `(\\))` +                            // Markdown 后缀: )
+      `|(<img\\s[^>]*?src=["'])` +         // HTML img 前缀
+      `(${escaped.join('|')})` +           // 图片路径
+      `(["'][^>]*?>)` +                    // HTML img 后缀
+      `|(${escaped.join('|')})`,           // 裸路径
+      'gi'
+    );
+
+    const processedText = text.replace(masterPattern, (...args) => {
+      // Markdown: ![alt](path)
+      if (args[1] && args[2]) {
+        const key = replacements.get(args[2]);
+        return key ? `${args[1]}${key}${args[3]}` : args[0];
+      }
+      // HTML: <img src="path">
+      if (args[4] && args[5]) {
+        const key = replacements.get(args[5]);
+        return key ? `${args[4]}${key}${args[6]}` : args[0];
+      }
+      // 裸路径
+      if (args[7]) {
+        const key = replacements.get(args[7]);
+        return key ? `![](${key})` : args[0];
+      }
+      return args[0];
+    });
+
+    return { processedText, imageKeys, errors };
+  }
+
+  // 统一的路径解析 + 上传
+  private async resolveAndUpload(imagePath: string): Promise<ImageUploadResult> {
+    if (imagePath.startsWith('file://')) {
+      // file:// 转本地路径
+      const localPath = fileURLToPath(imagePath); // Node.js url 模块
+      return this.uploadImage(localPath);
+    } else if (imagePath.startsWith('http://') || imagePath.startsWith('https://')) {
+      return this.uploadImageFromUrl(imagePath);
+    } else {
+      const resolved = isAbsolute(imagePath) ? imagePath : resolve(process.cwd(), imagePath);
+      return this.uploadImage(resolved);
+    }
+  }
+
+  /**
+   * 发送处理后的消息（包含图片自动上传）
+   */
+  async sendMessageWithProcessedContent(chatId: string, text: string): Promise<void> {
+    if (!this.client) {
+      console.warn('Feishu client not initialized, skipping message send');
+      return;
+    }
+
+    try {
+      // 处理内容中的图片
+      const processResult = await this.processContentWithImages(text);
+
+      if (processResult.errors.length > 0) {
+        console.warn('Some images failed to upload:', processResult.errors);
+      }
+
+      // 使用处理后的文本发送消息
+      await this.sendMessage(chatId, processResult.processedText);
+
+      console.log(`Message with processed content sent to chat ${chatId}`);
+    } catch (error) {
+      console.error('Failed to send message with processed content:', error);
+      // 降级为原始文本发送
+      await this.sendMessage(chatId, text);
+    }
+  }
+
+  /**
+   * 下载飞书图片/文件
+   * @param messageId 消息ID
+   * @param fileKey 文件key（用于messageResource.get API）
+   * @param timestamp 时间戳（用于文件名），可选，默认使用当前时间
+   * @returns 下载后的本地文件路径
+   */
+  async downloadFile(
+    messageId: string,
+    fileKey: string,
+    timestamp: string,
+    type: 'image' | 'file',
+  ): Promise<string> {
+    if (!this.client) {
+      throw new Error('Feishu client not initialized');
+    }
+
+    try {
+      // 确保目录存在
+      const imageDir = join(process.cwd(), 'data', 'lark', `${type}s`);
+      if (!existsSync(imageDir)) {
+        mkdirSync(imageDir, { recursive: true });
+      }
+
+      if (!fileKey) {
+        throw new Error('fileKey is required for downloading image');
+      }
+
+      const response = await this.client.im.v1.messageResource.get({
+        path: {
+          message_id: messageId,
+          file_key: fileKey,
+        },
+        params: {
+          type,
+        },
+      });
+
+      // 生成文件名
+      const fileName = `${timestamp || Date.now()}${getExtFromContentType(response.headers['Content-Type'] || response.headers['content-type'] || '')}`;
+      const filePath = join(imageDir, fileName);
+
+      // 获取图片数据 - SDK 返回的是二进制数据
+      await response.writeFile(filePath);
+
+      return filePath;
+    } catch (error) {
+      console.error('下载飞书图片失败:', error);
+      throw error;
     }
   }
 }
