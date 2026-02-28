@@ -1,14 +1,5 @@
 import type { SDKMessage, SDKToolUseSummaryMessage } from '@anthropic-ai/claude-agent-sdk'
 
-// Agent 配置类型
-export interface AgentConfig {
-  apiKey: string
-  model?: string
-  maxTokens?: number
-  temperature?: number
-  systemPrompt?: string
-}
-
 // 会话配置
 export interface SessionConfig {
   sessionId: string

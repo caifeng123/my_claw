@@ -4,6 +4,7 @@ import { cors } from 'hono/cors'
 import { logger } from 'hono/logger'
 import agentRouter from './routes/agent'
 import feishuRouter from './routes/feishu.js'
+import memoryRouter from './routes/memory.js'
 import { agentEngine } from './core/agent'
 import { getFeishuConfig, validateFeishuConfig } from './config/feishu.js'
 import { startDefaultFeishuBridge, stopDefaultFeishuBridge } from './services/feishu/feishu-agent-bridge.js'
@@ -80,6 +81,9 @@ app.route('/api/agent', agentRouter)
 
 // 飞书 API 路由
 app.route('/api/feishu', feishuRouter)
+
+// Memory API 路由
+app.route('/api/memory', memoryRouter)
 
 const port = process.env.PORT ? parseInt(process.env.PORT) : 3000
 

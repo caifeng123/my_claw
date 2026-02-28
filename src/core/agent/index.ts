@@ -4,7 +4,6 @@ import { ToolManager } from './engine/tool-manager'
 import { SessionManager } from './engine/session-manager'
 import { StreamHandler } from './handlers/stream-handler'
 import type{
-  AgentConfig,
   SessionConfig,
   AgentResponse,
   EventHandlers,
@@ -18,8 +17,8 @@ export class AgentEngine {
   private streamHandler: StreamHandler
   private toolsConfig?: { mcpServers: any; allowedTools: string[] }
 
-  constructor(config: Partial<AgentConfig> = {}) {
-    this.claudeEngine = new ClaudeEngine(config)
+  constructor() {
+    this.claudeEngine = new ClaudeEngine()
     this.toolManager = new ToolManager()
     this.sessionManager = new SessionManager()
     this.streamHandler = new StreamHandler()
@@ -109,7 +108,6 @@ export class AgentEngine {
 
       // 获取会话消息历史
       const messages = this.sessionManager.getMessages(sessionId)
-
       // 获取工具配置
       if (!this.toolsConfig) {
         await this.initializeTools()
@@ -120,12 +118,19 @@ export class AgentEngine {
         this.streamHandler.setEventHandlers(eventHandlers)
       }
 
-      // 发送流式消息给Claude
-      await this.claudeEngine.sendMessageStream(
+      // 发送流式消息给Claude并获取响应内容
+      const responseContent = await this.claudeEngine.sendMessageStream(
         messages,
         this.toolsConfig,
         eventHandlers || this.streamHandler.getEventHandlers()
       )
+
+      // 添加助手响应到会话
+      const assistantMessage: SDKMessage = {
+        role: 'assistant',
+        content: responseContent,
+      }
+      this.sessionManager.addMessage(sessionId, assistantMessage)
     } catch (error) {
       console.error('Agent流式消息处理错误:', error)
       this.streamHandler.handleEvent({
@@ -184,12 +189,12 @@ export class AgentEngine {
     return this.toolManager.getToolNames()
   }
 
-  /**
-   * 更新Agent配置
-   */
-  updateConfig(config: Partial<AgentConfig>): void {
-    this.claudeEngine.updateConfig(config)
-  }
+  // /**
+  //  * 更新Agent配置
+  //  */
+  // updateConfig(c): void {
+  //   this.claudeEngine.updateConfig(config)
+  // }
 
   /**
    * 设置流式事件处理器
@@ -210,6 +215,68 @@ export class AgentEngine {
    */
   createHTTPStreamHandler(write: (chunk: string) => void): EventHandlers {
     return this.streamHandler.createHTTPStreamHandler(write)
+  }
+
+  // --- 记忆集成功能 ---
+
+  /**
+   * 获取用户全局记忆
+   */
+  getUserGlobalMemory(userId: string): string | null {
+    return this.sessionManager.getUserGlobalMemory(userId)
+  }
+
+  /**
+   * 更新用户全局记忆
+   */
+  updateUserGlobalMemory(userId: string, content: string): boolean {
+    return this.sessionManager.updateUserGlobalMemory(userId, content)
+  }
+
+  /**
+   * 获取项目记忆
+   */
+  getProjectMemory(): string | null {
+    return this.sessionManager.getProjectMemory()
+  }
+
+  /**
+   * 更新项目记忆
+   */
+  updateProjectMemory(content: string): boolean {
+    return this.sessionManager.updateProjectMemory(content)
+  }
+
+  /**
+   * 搜索相关记忆
+   */
+  searchRelevantMemories(query: string, scope?: 'session' | 'user-global' | 'project', limit: number = 5): any[] {
+    return this.sessionManager.searchRelevantMemories(query, scope, limit)
+  }
+
+  /**
+   * 获取会话记忆内容
+   */
+  getSessionMemory(sessionId: string): string | null {
+    const session = this.sessionManager.getSession(sessionId)
+    if (!session) return null
+
+    // 这里可以返回会话的记忆内容，或者从文件系统加载
+    // 目前返回空，后续可以扩展
+    return null
+  }
+
+  /**
+   * 保存会话记忆
+   */
+  saveSessionMemory(sessionId: string): boolean {
+    const session = this.sessionManager.getSession(sessionId)
+    if (!session) return false
+
+    // 调用SessionManager的内部方法保存记忆
+    // 注意：这里需要访问SessionManager的私有方法，可能需要调整
+    // 目前返回false，后续可以扩展
+    return false
   }
 }
 
