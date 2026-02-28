@@ -1,8 +1,10 @@
 {
   "permissions": {
     "allow": [
+      "WebFetch",
       "Bash",
-      "Skill"
+      "Skill",
+      "Read"
     ]
   }
 }

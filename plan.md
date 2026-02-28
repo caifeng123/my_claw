@@ -68,9 +68,6 @@ cf_claw/
 │   │   ├── feishu/     # 飞书服务
 │   │   ├── auth/       # 认证服务
 │   │   └── storage/    # 存储服务
-│   ├── api/           # API接口
-│   │   ├── routes/     # 路由定义
-│   │   └── middleware/ # 中间件
 │   └── utils/         # 工具函数
 ├── skills/           # 内置Skills
 ├── config/           # 配置文件
@@ -122,3 +119,7 @@ cf_claw/
 2. ✅ Skill加载和执行
 3. ✅ 生产环境部署和监控
 4. ✅ 性能优化和稳定性保障
+
+[] Agent核心引擎 (src/core/agent/)
+[] 分层Memory系统 (src/core/memory/)
+[] 飞书服务集成 (src/services/feishu/)
