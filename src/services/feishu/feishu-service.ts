@@ -1,6 +1,7 @@
 import * as lark from '@larksuiteoapi/node-sdk';
-import { existsSync, readFileSync, statSync } from 'fs';
-import { extname, isAbsolute, resolve } from 'path';
+import { existsSync, readFileSync, statSync, writeFileSync, mkdirSync } from 'fs';
+import mime from 'mime';
+import { extname, isAbsolute, resolve, join } from 'path';
 import type {
   FeishuConnection,
   FeishuConnectionConfig,
@@ -24,6 +25,12 @@ const TEXT_MSG_LIMIT = 2048; // 飞书纯文本消息限制
 // 消息去重缓存设置
 const MSG_DEDUP_MAX = 1000;
 const MSG_DEDUP_TTL = 30 * 60 * 1000; // 30分钟
+
+function getExtFromContentType(contentType: string) {
+  const type = contentType.split(';')?.[0]?.trim() || '';
+  const ext = mime.getExtension(type);
+  return ext ? `.${ext}` : '';
+}
 
 export class FeishuService implements FeishuConnection {
   private client: lark.Client | null = null;
@@ -187,7 +194,6 @@ export class FeishuService implements FeishuConnection {
       const message = data.message;
       const chatId = message.chat_id;
       const messageId = message.message_id;
-
       // 消息去重检查
       if (this.isDuplicate(messageId)) {
         console.debug('Duplicate message, skipping');
@@ -196,12 +202,30 @@ export class FeishuService implements FeishuConnection {
       this.markSeen(messageId);
 
       // 提取消息内容
-      const extracted = this.extractMessageContent(message.message_type, message.content);
+      const extracted = this.extractMessageContent(message.message_type, message.content, message.create_time);
       let content = extracted.text;
 
-      if (!content && !extracted.imageKeys) {
-        console.debug('No text or image content, skipping');
+      if (!content && !extracted.imageKeys && !extracted.fileKeys) {
+        console.debug('No text or image content or file content, skipping');
         return;
+      }
+
+      // 下载图片（如果有）
+      if (extracted.imageKeys && extracted.imageKeys.length > 0) {
+        for (let i = 0; i < extracted.imageKeys.length; i++) {
+          const imageKey = extracted.imageKeys[i] as string;
+          try {
+            const filePath = await this.downloadFile(
+              messageId,
+              imageKey,
+              `${message.create_time}-image-${i}`,
+              'image'
+            );
+            console.log(`图片下载成功: ${filePath}`);
+          } catch (downloadError) {
+            console.error(`下载图片失败: ${imageKey}`, downloadError);
+          }
+        }
       }
 
       // 处理 @ 提及
@@ -212,6 +236,25 @@ export class FeishuService implements FeishuConnection {
           }
         }
       }
+
+      // // 下载文件（如果有）
+      // if (extracted.fileKeys?.length) {
+      //   console.log(`检测到 ${extracted.fileKeys.length} 个文件，开始下载...`);
+      //   for (let i = 0; i < extracted.fileKeys.length; i++) {
+      //     const fileKey = extracted.fileKeys[i] as string;
+      //     try {
+      //       const filePath = await this.downloadFile(
+      //         messageId,
+      //         fileKey,
+      //         `${message.create_time}-file-${i}`,
+      //         'file'
+      //       );
+      //       console.log(`文件下载成功: ${filePath}`);
+      //     } catch (downloadError) {
+      //       console.error(`下载文件失败: ${fileKey}`, downloadError);
+      //     }
+      //   }
+      // }
 
       // 记录最后一条消息ID
       this.lastMessageIdByChat.set(chatId, messageId);
@@ -238,48 +281,104 @@ export class FeishuService implements FeishuConnection {
     }
   }
 
-  private extractMessageContent(messageType: string, content: string): { text: string; imageKeys?: string[] } {
-    try {
-      const parsed = JSON.parse(content);
+private extractMessageContent(messageType: string, content: string, createTime: string): { text: string; imageKeys?: string[]; fileKeys?: string[] } {
+  try {
+    const parsed = JSON.parse(content);
 
-      if (messageType === MESSAGE_TYPE_TEXT) {
-        return { text: parsed.text || '' };
-      }
+    if (messageType === MESSAGE_TYPE_TEXT) {
+      return { text: parsed.text || '' };
+    }
 
-      if (messageType === MESSAGE_TYPE_POST) {
-        // 从富文本中提取文本
-        const lines: string[] = [];
-        const post = parsed.post;
-        if (!post) return { text: '' };
+    if (messageType === MESSAGE_TYPE_POST) {
+      const lines: string[] = [];
+      const imageKeys: string[] = [];
+      const fileKeys: string[] = [];
 
-        const contentData = post.zh_cn || post.en_us || Object.values(post)[0];
-        if (!contentData || !Array.isArray(contentData.content)) return { text: '' };
+      const contentArray = parsed.content;
+      if (!Array.isArray(contentArray)) return { text: parsed.title || '' };
 
-        for (const paragraph of contentData.content) {
-          if (!Array.isArray(paragraph)) continue;
-          for (const segment of paragraph) {
-            if (segment.tag === 'text' && segment.text) {
-              lines.push(segment.text);
-            }
+      let imageIdx = 0;
+      let mediaIdx = 0;
+
+      for (const paragraph of contentArray) {
+        if (!Array.isArray(paragraph)) continue;
+
+        const paragraphTexts: string[] = [];
+
+        for (const segment of paragraph) {
+          if (!segment || !segment.tag) continue;
+
+          switch (segment.tag) {
+            case 'text':
+              if (segment.text) paragraphTexts.push(segment.text);
+              break;
+            case 'a':
+              paragraphTexts.push(segment.text || segment.href || '');
+              break;
+            case 'at':
+              if (segment.user_id) {
+                paragraphTexts.push(`@${segment.user_name || segment.user_id}`);
+              }
+              break;
+            case 'img':
+              if (segment.image_key) {
+                imageKeys.push(segment.image_key);
+                paragraphTexts.push(`![${createTime}-image-${imageIdx++}](data/lark/images/${createTime}-image-${imageIdx++})`);
+              }
+              break;
+            case 'media':
+              if (segment.file_key) {
+                fileKeys.push(segment.file_key);
+                paragraphTexts.push(`data/lark/files/${createTime}-file-${mediaIdx++}`);
+              }
+              break;
+            case 'emotion':
+              if (segment.emoji_type) paragraphTexts.push(`[表情:${segment.emoji_type}]`);
+              break;
+            case 'code_block':
+              if (segment.text) paragraphTexts.push(`\`\`\`${segment.language || ''}\n${segment.text}\n\`\`\``);
+              break;
+            case 'md':
+              if (segment.text) paragraphTexts.push(segment.text);
+              break;
+            case 'hr':
+              paragraphTexts.push('---');
+              break;
+            default:
+              if (segment.text) paragraphTexts.push(segment.text);
+              break;
           }
         }
 
-        return { text: lines.join('\n') };
+        if (paragraphTexts.length > 0) lines.push(paragraphTexts.join(''));
       }
 
-      if (messageType === MESSAGE_TYPE_IMAGE) {
-        const imageKey = parsed.image_key;
-        if (imageKey) {
-          return { text: '[图片]', imageKeys: [imageKey] };
-        }
-      }
+      const title = parsed.title ? `${parsed.title}\n` : '';
 
-      return { text: '' };
-    } catch (error) {
-      console.warn('Failed to parse message content:', error);
-      return { text: '' };
+      return {
+        text: title + lines.join('\n'),
+        imageKeys: imageKeys.length > 0 ? imageKeys : undefined,
+        fileKeys: fileKeys.length > 0 ? fileKeys : undefined,
+      };
     }
+
+    if (messageType === MESSAGE_TYPE_IMAGE) {
+      const imageKey = parsed.image_key;
+      if (imageKey) {
+        return {
+          text: `${createTime}-image-0`,
+          imageKeys: [imageKey],
+          fileKeys: parsed.file_key ? [parsed.file_key] : undefined,
+        };
+      }
+    }
+
+    return { text: '' };
+  } catch (error) {
+    console.warn('Failed to parse message content:', error);
+    return { text: '' };
   }
+}
 
   /**
    * 发送纯文本消息
@@ -815,6 +914,58 @@ export class FeishuService implements FeishuConnection {
       console.error('Failed to send message with processed content:', error);
       // 降级为原始文本发送
       await this.sendMessage(chatId, text);
+    }
+  }
+
+  /**
+   * 下载飞书图片/文件
+   * @param messageId 消息ID
+   * @param fileKey 文件key（用于messageResource.get API）
+   * @param timestamp 时间戳（用于文件名），可选，默认使用当前时间
+   * @returns 下载后的本地文件路径
+   */
+  async downloadFile(
+    messageId: string,
+    fileKey: string,
+    timestamp: string,
+    type: 'image' | 'file',
+  ): Promise<string> {
+    if (!this.client) {
+      throw new Error('Feishu client not initialized');
+    }
+
+    try {
+      // 确保目录存在
+      const imageDir = join(process.cwd(), 'data', 'lark', `${type}s`);
+      if (!existsSync(imageDir)) {
+        mkdirSync(imageDir, { recursive: true });
+      }
+
+      if (!fileKey) {
+        throw new Error('fileKey is required for downloading image');
+      }
+
+      const response = await this.client.im.v1.messageResource.get({
+        path: {
+          message_id: messageId,
+          file_key: fileKey,
+        },
+        params: {
+          type,
+        },
+      });
+
+      // 生成文件名
+      const fileName = `${timestamp || Date.now()}${getExtFromContentType(response.headers['Content-Type'] || response.headers['content-type'] || '')}`;
+      const filePath = join(imageDir, fileName);
+
+      // 获取图片数据 - SDK 返回的是二进制数据
+      await response.writeFile(filePath);
+
+      return filePath;
+    } catch (error) {
+      console.error('下载飞书图片失败:', error);
+      throw error;
     }
   }
 }

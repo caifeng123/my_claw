@@ -18,6 +18,7 @@
     "@larksuiteoapi/node-sdk": "^1.59.0",
     "dotenv": "^17.3.1",
     "hono": "^4.12.3",
+    "mime": "^4.1.0",
     "zod": "^4.3.6"
   }
 }
