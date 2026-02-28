@@ -36,8 +36,17 @@ export class ClaudeEngine {
         if (typeof msg.content === 'string') {
           return `${msg.role}: ${msg.content}`
         }
+        // 处理数组类型的 content
+        if (Array.isArray(msg.content)) {
+          const textParts = msg.content
+            .filter((block: any) => block.type === 'text')
+            .map((block: any) => block.text)
+            .join('\n')
+          return `${msg.role}: ${textParts || '[non-text content]'}`
+        }
         return `${msg.role}: [complex content]`
       }).join('\n')
+
       // 使用异步生成器作为提示
       const response = query({
         prompt: userQuery,
@@ -91,27 +100,17 @@ export class ClaudeEngine {
 
       const { model, env } = this.config
 
-      // 构建工具配置
-      const toolOptions: any = {
-        // systemPrompt: this.config.systemPrompt,
-        model,
-        settingSources: ['project'],
-        cwd: process.cwd(),
-        env,
-      }
-
-      // 如果有工具配置，则设置MCP服务器和允许的工具
-      if (toolsConfig) {
-        toolOptions.mcpServers = toolsConfig.mcpServers
-        toolOptions.allowedTools = toolsConfig.allowedTools
-      } else {
-        toolOptions.allowedTools = []
-      }
-
-      // 构建用户查询文本
       const userQuery = messages.map(msg => {
         if (typeof msg.content === 'string') {
           return `${msg.role}: ${msg.content}`
+        }
+        // 处理数组类型的 content
+        if (Array.isArray(msg.content)) {
+          const textParts = msg.content
+            .filter((block: any) => block.type === 'text')
+            .map((block: any) => block.text)
+            .join('\n')
+          return `${msg.role}: ${textParts || '[non-text content]'}`
         }
         return `${msg.role}: [complex content]`
       }).join('\n')
@@ -119,7 +118,14 @@ export class ClaudeEngine {
       // 使用异步生成器作为提示
       const response = query({
         prompt: userQuery,
-        options: toolOptions,
+        options: {
+          ...toolsConfig,
+          // systemPrompt: this.config.systemPrompt,
+          model,
+          settingSources: ['project'],
+          cwd: process.cwd(),
+          env,
+        },
       })
 
       let result = ''
@@ -139,7 +145,7 @@ export class ClaudeEngine {
       await eventHandlers?.onContentStop?.()
 
       if (!result.trim()) {
-        throw new Error('AI响应为空')
+        // throw new Error('AI响应为空')
       }
 
       return result

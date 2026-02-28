@@ -9,6 +9,7 @@ import type {
   ImageUploadResult,
   ContentProcessResult
 } from './types.js';
+import { fileURLToPath } from 'url';
 
 // 飞书消息类型
 const MESSAGE_TYPE_TEXT = 'text';
@@ -94,6 +95,7 @@ export class FeishuService implements FeishuConnection {
     this.onMessageCallback = null;
   }
 
+  // shouldMarkdown 强制使用 markdown 格式
   async sendMessage(chatId: string, text: string): Promise<void> {
     if (!this.client) {
       console.warn('Feishu client not initialized, skipping message send');
@@ -124,7 +126,7 @@ export class FeishuService implements FeishuConnection {
       const processedText = processResult.processedText;
 
       // 根据内容长度选择消息类型
-      if (processedText.length <= PLAIN_TEXT_LIMIT) {
+      if (processedText.length <= PLAIN_TEXT_LIMIT && !processResult.imageKeys.length) {
         // 短文本，使用纯文本消息
         await this.sendPlainTextMessage(chatId, processedText);
       } else if (processedText.length <= CARD_MD_LIMIT) {
@@ -695,58 +697,97 @@ export class FeishuService implements FeishuConnection {
   async processContentWithImages(text: string): Promise<ContentProcessResult> {
     const imageKeys: string[] = [];
     const errors: string[] = [];
-    let processedText = text;
 
-    // 正则表达式匹配图片路径和URL
-    // 支持：
-    // 1. 本地绝对路径：/home/user/image.jpg, C:\\Users\\image.png
-    // 2. 本地相对路径：./images/photo.jpg, ../assets/pic.png
-    // 3. 远程URL：https://example.com/image.jpg, http://site.com/pic.png
-    const imagePattern = /(https?:\/\/[^\s]+\.(?:jpg|jpeg|png|gif|bmp|webp|svg)|[a-zA-Z]:\\[^\s]+\.(?:jpg|jpeg|png|gif|bmp|webp|svg)|\/[^\s]+\.(?:jpg|jpeg|png|gif|bmp|webp|svg)|\.[\\\/][^\s]+\.(?:jpg|jpeg|png|gif|bmp|webp|svg))/gi;
+    const IMG_EXT = 'jpg|jpeg|png|gif|bmp|webp|svg';
 
-    const matches = text.match(imagePattern);
-    if (!matches || matches.length === 0) {
+    // ===== 第1步：提取所有图片路径 =====
+    const pathPattern = new RegExp(
+      `(?:https?|file):\\/\\/[^\\s\\)"'<>]+\\.(?:${IMG_EXT})(?:\\?[^\\s\\)"'<>]*)?` +
+      `|[a-zA-Z]:\\\\[^\\s\\)"'<>]+\\.(?:${IMG_EXT})` +
+      `|\\.{0,2}[\\\\\/][^\\s\\)"'<>]+\\.(?:${IMG_EXT})`,
+      'gi'
+    );
+
+    const allPaths = [...new Set(text.match(pathPattern) || [])];
+    if (allPaths.length === 0) {
       return { processedText: text, imageKeys: [], errors: [] };
     }
 
-    // 去重处理
-    const uniquePaths = [...new Set(matches)];
+    // ===== 第2步：批量上传，构建替换映射 =====
+    const replacements = new Map<string, string>();
 
-    for (const imagePath of uniquePaths) {
+    await Promise.all(allPaths.map(async (imgPath) => {
       try {
-        let result: ImageUploadResult;
-
-        // 判断是本地路径还是远程URL
-        if (imagePath.startsWith('http://') || imagePath.startsWith('https://')) {
-          // 远程URL处理
-          result = await this.uploadImageFromUrl(imagePath);
-        } else {
-          // 本地路径处理
-          let resolvedPath = imagePath;
-          if (!isAbsolute(imagePath)) {
-            resolvedPath = resolve(process.cwd(), imagePath);
-          }
-          result = await this.uploadImage(resolvedPath);
-        }
-
+        const result = await this.resolveAndUpload(imgPath);
         if (result.success && result.imageKey) {
-          // 替换为Markdown格式的图片链接
-          const markdownLink = `![](${result.imageKey})`;
-          processedText = processedText.replace(new RegExp(imagePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), markdownLink);
+          replacements.set(imgPath, result.imageKey);
           imageKeys.push(result.imageKey);
-          console.log(`Replaced image: ${imagePath} -> ${markdownLink}`);
         } else {
-          errors.push(`Failed to upload image: ${imagePath} - ${result.error}`);
-          console.warn(`Image upload failed: ${imagePath} - ${result.error}`);
+          errors.push(`Upload failed: ${imgPath} - ${result.error}`);
         }
-      } catch (error) {
-        const errorMsg = `Error processing image ${imagePath}: ${error instanceof Error ? error.message : 'Unknown error'}`;
-        errors.push(errorMsg);
-        console.error(errorMsg);
+      } catch (e) {
+        errors.push(`Error: ${imgPath} - ${e instanceof Error ? e.message : 'Unknown'}`);
       }
+    }));
+
+    if (replacements.size === 0) {
+      return { processedText: text, imageKeys: [], errors };
     }
 
+    // ===== 第3步：一次性替换 =====
+    // 构建一个大正则，按路径长度降序排列（避免短路径先匹配吃掉长路径的一部分）
+    const sorted = [...replacements.keys()]
+      .sort((a, b) => b.length - a.length);
+
+    const escaped = sorted
+      .map(p => p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+
+    // 统一匹配：![alt](path) 或 <img src="path"> 或 裸路径
+    const masterPattern = new RegExp(
+      `(!\\[[^\\]]*\\]\\()` +              // Markdown 前缀: ![alt](
+      `(${escaped.join('|')})` +           // 图片路径（核心捕获）
+      `(\\))` +                            // Markdown 后缀: )
+      `|(<img\\s[^>]*?src=["'])` +         // HTML img 前缀
+      `(${escaped.join('|')})` +           // 图片路径
+      `(["'][^>]*?>)` +                    // HTML img 后缀
+      `|(${escaped.join('|')})`,           // 裸路径
+      'gi'
+    );
+
+    const processedText = text.replace(masterPattern, (...args) => {
+      // Markdown: ![alt](path)
+      if (args[1] && args[2]) {
+        const key = replacements.get(args[2]);
+        return key ? `${args[1]}${key}${args[3]}` : args[0];
+      }
+      // HTML: <img src="path">
+      if (args[4] && args[5]) {
+        const key = replacements.get(args[5]);
+        return key ? `${args[4]}${key}${args[6]}` : args[0];
+      }
+      // 裸路径
+      if (args[7]) {
+        const key = replacements.get(args[7]);
+        return key ? `![](${key})` : args[0];
+      }
+      return args[0];
+    });
+
     return { processedText, imageKeys, errors };
+  }
+
+  // 统一的路径解析 + 上传
+  private async resolveAndUpload(imagePath: string): Promise<ImageUploadResult> {
+    if (imagePath.startsWith('file://')) {
+      // file:// 转本地路径
+      const localPath = fileURLToPath(imagePath); // Node.js url 模块
+      return this.uploadImage(localPath);
+    } else if (imagePath.startsWith('http://') || imagePath.startsWith('https://')) {
+      return this.uploadImageFromUrl(imagePath);
+    } else {
+      const resolved = isAbsolute(imagePath) ? imagePath : resolve(process.cwd(), imagePath);
+      return this.uploadImage(resolved);
+    }
   }
 
   /**

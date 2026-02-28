@@ -6,13 +6,12 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "dev": "bun --inspect --watch src/index.ts",
-    "start": "bun src/index.ts",
-    "build": "bun build src/index.ts --outdir dist",
-    "test": "bun test"
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "build": "tsc src/index.ts --outdir dist"
   },
   "devDependencies": {
-    "@types/bun": "latest"
+    "tsx": "^4.21.0"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.2.62",

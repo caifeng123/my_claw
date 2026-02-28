@@ -10,6 +10,10 @@ import type{
   SessionState
 } from './types/agent'
 
+interface SimpleMessage {
+  role: 'user' | 'assistant'
+  content: string
+}
 export class AgentEngine {
   private claudeEngine: ClaudeEngine
   private toolManager: ToolManager
@@ -54,7 +58,7 @@ export class AgentEngine {
       }
 
       // 添加用户消息到会话
-      const userMessage: SDKMessage = {
+      const userMessage: SimpleMessage = {
         role: 'user',
         content: message,
       }
@@ -70,7 +74,7 @@ export class AgentEngine {
       const response = await this.claudeEngine.sendMessage(messages, this.toolsConfig)
 
       // 添加助手响应到会话
-      const assistantMessage: SDKMessage = {
+      const assistantMessage: SimpleMessage = {
         role: 'assistant',
         content: response.content,
       }
@@ -100,8 +104,8 @@ export class AgentEngine {
       }
 
       // 添加用户消息到会话
-      const userMessage: SDKMessage = {
-        role: 'user',
+      const userMessage: SimpleMessage = {
+        role: "user",
         content: message,
       }
       this.sessionManager.addMessage(sessionId, userMessage)
@@ -126,7 +130,7 @@ export class AgentEngine {
       )
 
       // 添加助手响应到会话
-      const assistantMessage: SDKMessage = {
+      const assistantMessage: SimpleMessage = {
         role: 'assistant',
         content: responseContent,
       }

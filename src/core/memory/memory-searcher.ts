@@ -1,7 +1,7 @@
 // 记忆搜索器
 
 import { MemoryManager } from './memory-manager.js';
-import { MemorySearchHit, MemorySearchOptions } from './types.js';
+import type { MemorySearchHit, MemorySearchOptions } from './types.js';
 
 export class MemorySearcher {
   private memoryManager: MemoryManager;
