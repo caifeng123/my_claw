@@ -1,4 +1,7 @@
-# dependencies (bun install)
+# 重启状态文件
+.restart-state.json
+
+# dependencies
 node_modules
 
 # output

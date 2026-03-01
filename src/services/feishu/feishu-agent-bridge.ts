@@ -2,6 +2,20 @@ import { FeishuService } from './feishu-service.js';
 import type { FeishuConnectionConfig, FeishuMessage, ThreadContext } from './types.js';
 import { agentEngine } from '../../core/agent/index.js';
 import type { EventHandlers } from '@/core/agent/types/agent.js';
+import { writeFileSync } from 'fs';
+
+// 状态文件路径
+const STATE_FILE = '.restart-state.json';
+
+// 重启状态接口
+interface RestartState {
+  chatIds: string[];
+  messageIds: string[];
+  status: 'restarting' | 'rollback' | 'success';
+  timestamp: number;
+  error?: string;
+  hasConflict?: boolean;
+}
 
 export interface FeishuAgentBridgeConfig {
   feishu: FeishuConnectionConfig;
@@ -79,6 +93,44 @@ export class FeishuAgentBridge {
   }
 
   /**
+   * 处理 /restart 指令
+   */
+  private async handleRestartCommand(message: FeishuMessage): Promise<void> {
+    console.log('🔄 收到 /restart 指令');
+
+    await this.feishuService.sendMessage(
+      message.chatId,
+      '正在重启服务，请稍候...',
+      message.messageId,
+      message.threadId
+    );
+
+    // 写入状态文件（子进程写，Launcher 读，单一数据源）
+    const state: RestartState = {
+      chatIds: [message.chatId],
+      messageIds: [message.messageId],
+      status: 'restarting',
+      timestamp: Date.now(),
+    };
+
+    try {
+      writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+      console.log('📄 状态文件已写入');
+    } catch (error) {
+      console.error('❌ 写入状态文件失败:', error);
+    }
+
+    // 通知 Launcher 来重启（不要自己 process.exit）
+    if (process.send) {
+      process.send({ type: 'restart' });
+      console.log('📤 已发送重启请求给 Launcher');
+    } else {
+      console.warn('⚠️ 未检测到 Launcher，直接退出');
+      setTimeout(() => process.exit(0), 500);
+    }
+  }
+
+  /**
    * 获取会话统计信息
    */
   getSessionStats(): any {
@@ -99,6 +151,13 @@ export class FeishuAgentBridge {
 
     // 忽略空消息
     if (!message.content.trim()) {
+      return;
+    }
+
+    // 检查是否是 /restart 指令
+    const trimmedContent = message.content.trim();
+    if (trimmedContent === '/restart') {
+      await this.handleRestartCommand(message);
       return;
     }
 
@@ -250,7 +309,6 @@ export class FeishuAgentBridge {
     agentEngine.createSession({
       sessionId,
       userId: chatId, // 使用chatId作为用户ID
-      metadata: threadId ? { threadId, chatId } : undefined,
     });
 
     console.log(`🆕 Created new ${threadId ? 'thread' : 'chat'} session: ${sessionId}`);
