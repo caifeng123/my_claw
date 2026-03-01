@@ -62,6 +62,7 @@ export class ClaudeEngine {
 
       let result = ''
       let resume = ''
+      let lastAssistantContent = ''  // 临时存储最后一个 assistant 消息
 
       // 处理AI响应流
       for await (const message of response) {
@@ -69,9 +70,22 @@ export class ClaudeEngine {
           resume = message.session_id
           result += (message as any).result
         } else if (message.type === 'assistant') {
-          // 处理assistant消息
-          console.log('Assistant message:', message?.message?.content)
+          // 提取 assistant 消息内容并存储
+          const assistantContent = message?.message?.content
+          if (assistantContent) {
+            // content 可能是数组格式，需要提取文本
+            const textContent = Array.isArray(assistantContent)
+              ? assistantContent.filter(c => c.type === 'text').map(c => c.text).join('')
+              : String(assistantContent)
+            lastAssistantContent = textContent
+            console.log('Assistant message:', assistantContent)
+          }
         }
+      }
+
+      // 如果 result 为空，使用最后一个 assistant 消息
+      if (!result.trim() && lastAssistantContent) {
+        result = lastAssistantContent
       }
 
       if (!result.trim()) {
@@ -129,6 +143,7 @@ export class ClaudeEngine {
       })
 
       let result = ''
+      let lastAssistantContent = ''  // 临时存储最后一个 assistant 消息
 
       // 处理AI响应流
       for await (const message of response) {
@@ -137,15 +152,26 @@ export class ClaudeEngine {
           result += messageResult
           await eventHandlers?.onContentDelta?.(messageResult)
         } else if (message.type === 'assistant') {
-          // 处理assistant消息
-          console.log('Assistant message:', message?.message?.content)
+          // 提取 assistant 消息内容并存储
+          const assistantContent = message?.message?.content
+          if (assistantContent) {
+            // content 可能是数组格式，需要提取文本
+            const textContent = Array.isArray(assistantContent)
+              ? assistantContent.filter(c => c.type === 'text').map(c => c.text).join('')
+              : String(assistantContent)
+            lastAssistantContent = textContent
+            console.log('Assistant message:', assistantContent)
+          }
         }
       }
 
       await eventHandlers?.onContentStop?.()
 
-      if (!result.trim()) {
-        // throw new Error('AI响应为空')
+      // 如果 result 为空，使用最后一个 assistant 消息
+      if (!result.trim() && lastAssistantContent) {
+        result = lastAssistantContent
+        // 主动触发 onContentDelta，确保飞书能收到这个内容
+        await eventHandlers?.onContentDelta?.(result)
       }
 
       return result
