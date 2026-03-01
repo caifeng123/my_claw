@@ -12,13 +12,6 @@ import { startDefaultFeishuBridge, stopDefaultFeishuBridge } from './services/fe
 const app = new Hono()
 dotenv.config();
 
-// 初始化工具配置
-agentEngine.initializeTools().then(() => {
-  console.log('🔧 工具配置初始化完成')
-}).catch(error => {
-  console.error('❌ 工具配置初始化失败:', error)
-})
-
 // 初始化飞书服务
 async function initializeFeishuService() {
   const feishuConfig = getFeishuConfig()

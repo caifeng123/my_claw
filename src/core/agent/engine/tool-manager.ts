@@ -37,7 +37,7 @@ export class ToolManager {
    */
   registerTool(options: RegisteredTool): void {
     if (this.tools.has(options.name)) {
-      throw new Error(`工具名称已存在: ${options.name}`)
+      return
     }
 
     const tool: RegisteredTool = {

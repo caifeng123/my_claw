@@ -1,5 +1,5 @@
 import { FeishuService } from './feishu-service.js';
-import type { FeishuConnectionConfig, FeishuMessage } from './types.js';
+import type { FeishuConnectionConfig, FeishuMessage, ThreadContext } from './types.js';
 import { agentEngine } from '../../core/agent/index.js';
 import type { EventHandlers } from '@/core/agent/types/agent.js';
 
@@ -16,8 +16,10 @@ export interface FeishuAgentBridgeConfig {
 export class FeishuAgentBridge {
   private feishuService: FeishuService;
   private config: FeishuAgentBridgeConfig;
-  private chatToSessionMap = new Map<string, string>(); // 飞书聊天ID -> 会话ID
+  private chatToSessionMap = new Map<string, string>(); // 飞书聊天ID -> 会话ID (key: chatId or chatId:threadId)
+  private threadContexts = new Map<string, ThreadContext>(); // Thread context tracking
   private isConnected = false;
+  private processingChats = new Set<string>(); // 正在处理的聊天ID，用于并发控制
 
   constructor(config: FeishuAgentBridgeConfig) {
     this.config = {
@@ -58,6 +60,7 @@ export class FeishuAgentBridge {
     await this.feishuService.disconnect();
     this.isConnected = false;
     this.chatToSessionMap.clear();
+    this.threadContexts.clear();
     console.log('✅ 飞书Agent桥接服务已停止');
   }
 
@@ -71,8 +74,8 @@ export class FeishuAgentBridge {
   /**
    * 手动发送消息到飞书聊天
    */
-  async sendMessageToChat(chatId: string, text: string): Promise<void> {
-    await this.feishuService.sendMessage(chatId, text);
+  async sendMessageToChat(chatId: string, text: string, replyMessageId?: string, threadId?: string): Promise<void> {
+    await this.feishuService.sendMessage(chatId, text, replyMessageId, threadId);
   }
 
   /**
@@ -81,8 +84,10 @@ export class FeishuAgentBridge {
   getSessionStats(): any {
     return {
       activeSessions: this.chatToSessionMap.size,
+      activeThreads: this.threadContexts.size,
       isConnected: this.isBridgeConnected(),
       chatToSessionMap: Object.fromEntries(this.chatToSessionMap),
+      threadContexts: Object.fromEntries(this.threadContexts),
     };
   }
 
@@ -90,38 +95,80 @@ export class FeishuAgentBridge {
    * 处理飞书消息
    */
   private async handleFeishuMessage(message: FeishuMessage): Promise<void> {
-    console.log(`📨 收到飞书消息: ${message.senderName} -> ${message.content.substring(0, 50)}...`);
+    console.log(`📨 Received Feishu message: ${message.senderName} -> ${message.content.substring(0, 50)}...`);
 
     // 忽略空消息
     if (!message.content.trim()) {
       return;
     }
 
-    // 获取或创建会话ID
-    const sessionId = this.getOrCreateSessionId(message.chatId);
+    // 使用 chatId + threadId 作为并发控制的 key
+    const processingKey = message.threadId ? `${message.chatId}:${message.threadId}` : message.chatId;
 
-    // 显示输入状态（如果启用）
-    if (this.config.showTypingIndicator) {
-      await this.feishuService.sendTyping(message.chatId, true);
+    // 如果同一聊天正在处理，排队等待
+    if (this.processingChats.has(processingKey)) {
+      console.log(`⏳ Chat ${processingKey} is busy, waiting for previous message to complete...`);
+      await this.waitForProcessingComplete(processingKey);
     }
+
+    // 标记为正在处理
+    this.processingChats.add(processingKey);
 
     try {
-      if (this.config.enableStreaming) {
-        // 流式回复
-        await this.handleStreamingResponse(sessionId, message);
-      } else {
-        // 非流式回复
-        await this.handleRegularResponse(sessionId, message);
+      // 使用 threadId 区分不同线程的会话
+      const sessionId = await this.getOrCreateSessionId(message.chatId, message.threadId);
+
+      // 跟踪线程活动
+      if (message.threadId) {
+        this.updateThreadActivity(message.threadId, message.chatId);
       }
-    } catch (error) {
-      console.error('处理飞书消息时出错:', error);
-      await this.sendErrorResponse(message.chatId, error);
-    } finally {
-      // 隐藏输入状态
+
+      // 显示输入状态（如果启用）
       if (this.config.showTypingIndicator) {
-        await this.feishuService.sendTyping(message.chatId, false);
+        await this.feishuService.sendTyping(message.chatId, true, message.threadId);
       }
+
+      try {
+        if (this.config.enableStreaming) {
+          // 流式回复
+          await this.handleStreamingResponse(sessionId, message);
+        } else {
+          // 非流式回复
+          await this.handleRegularResponse(sessionId, message);
+        }
+      } catch (error) {
+        console.error('Error processing Feishu message:', error);
+        await this.sendErrorResponse(message.chatId, error, message.messageId, message.threadId);
+      } finally {
+        // 隐藏输入状态
+        if (this.config.showTypingIndicator) {
+          await this.feishuService.sendTyping(message.chatId, false, message.threadId);
+        }
+      }
+    } finally {
+      // 移除处理标记
+      this.processingChats.delete(processingKey);
     }
+  }
+
+  /**
+   * 等待指定聊天的处理完成
+   */
+  private async waitForProcessingComplete(processingKey: string): Promise<void> {
+    return new Promise((resolve) => {
+      const checkInterval = setInterval(() => {
+        if (!this.processingChats.has(processingKey)) {
+          clearInterval(checkInterval);
+          resolve();
+        }
+      }, 100); // 每100ms检查一次
+
+      // 最多等待30秒
+      setTimeout(() => {
+        clearInterval(checkInterval);
+        resolve();
+      }, 30000);
+    });
   }
 
   /**
@@ -130,6 +177,10 @@ export class FeishuAgentBridge {
   private async handleStreamingResponse(sessionId: string, message: FeishuMessage): Promise<void> {
     let fullResponse = '';
 
+    // IMPORTANT: For thread messages: reply to the user's message (places response in thread)
+    // For normal messages: messageId can also be passed to use reply, or omit for create
+    const replyMessageId = message.threadId ? message.messageId : undefined;
+
     const eventHandlers: EventHandlers = {
       onContentDelta: async (textDelta: string) => {
         fullResponse += textDelta;
@@ -137,13 +188,13 @@ export class FeishuAgentBridge {
       onContentStop: async () => {
         // 发送最终回复（包含图片自动处理）
         if (fullResponse) {
-          await this.feishuService.sendMessage(message.chatId, fullResponse);
-          console.log(`✅ 流式回复完成: ${fullResponse.length} 字符`);
+          await this.feishuService.sendMessage(message.chatId, fullResponse, replyMessageId, message.threadId);
+          console.log(`✅ Streaming response completed: ${fullResponse.length} chars`);
         }
       },
       onError: async (error: string) => {
-        console.error('流式回复错误:', error);
-        this.sendErrorResponse(message.chatId, new Error(error)).catch(console.error);
+        console.error('Streaming response error:', error);
+        this.sendErrorResponse(message.chatId, new Error(error), replyMessageId, message.threadId).catch(console.error);
       },
     };
 
@@ -157,11 +208,15 @@ export class FeishuAgentBridge {
   private async handleRegularResponse(sessionId: string, message: FeishuMessage): Promise<void> {
     const response = await agentEngine.sendMessage(sessionId, message.content, message.senderId);
 
+    // IMPORTANT: For thread messages: reply to the user's message (places response in thread)
+    // For normal messages: messageId can also be passed to use reply, or omit for create
+    const replyMessageId = message.threadId ? message.messageId : undefined;
+
     if (response && response.content) {
-      await this.feishuService.sendMessage(message.chatId, response.content);
-      console.log(`✅ 常规回复完成: ${response.content.length} 字符`);
+      await this.feishuService.sendMessage(message.chatId, response.content, replyMessageId, message.threadId);
+      console.log(`✅ Regular response completed: ${response.content.length} chars`);
     } else {
-      await this.sendErrorResponse(message.chatId, new Error('Agent返回空回复'));
+      await this.sendErrorResponse(message.chatId, new Error('Agent returned empty response'), replyMessageId, message.threadId);
     }
   }
 
@@ -169,30 +224,52 @@ export class FeishuAgentBridge {
   /**
    * 发送错误回复
    */
-  private async sendErrorResponse(chatId: string, error: any): Promise<void> {
+  private async sendErrorResponse(chatId: string, error: any, replyMessageId?: string, threadId?: string): Promise<void> {
     const errorMessage = `抱歉，处理消息时出现了错误：\n\n${error instanceof Error ? error.message : '未知错误'}`;
-    await this.feishuService.sendMessage(chatId, errorMessage);
+    await this.feishuService.sendMessage(chatId, errorMessage, replyMessageId, threadId);
   }
 
   /**
    * 获取或创建会话ID
    */
-  private getOrCreateSessionId(chatId: string): string {
-    if (this.chatToSessionMap.has(chatId)) {
-      return this.chatToSessionMap.get(chatId)!;
+  private getOrCreateSessionId(chatId: string, threadId?: string): string {
+    // Use composite key to avoid potential cross-group threadId collision
+    const sessionKey = threadId ? `${chatId}:${threadId}` : chatId;
+
+    if (this.chatToSessionMap.has(sessionKey)) {
+      return this.chatToSessionMap.get(sessionKey)!;
     }
 
-    const sessionId = `${this.config.sessionPrefix}${chatId}`;
-    this.chatToSessionMap.set(chatId, sessionId);
+    const sessionId = threadId
+      ? `${this.config.sessionPrefix}${chatId}_${threadId}`
+      : `${this.config.sessionPrefix}${chatId}`;
+
+    this.chatToSessionMap.set(sessionKey, sessionId);
 
     // 创建新会话
     agentEngine.createSession({
       sessionId,
       userId: chatId, // 使用chatId作为用户ID
+      metadata: threadId ? { threadId, chatId } : undefined,
     });
 
-    console.log(`🆕 创建新会话: ${sessionId}`);
+    console.log(`🆕 Created new ${threadId ? 'thread' : 'chat'} session: ${sessionId}`);
     return sessionId;
+  }
+
+  /**
+   * 更新线程活动状态
+   */
+  private updateThreadActivity(threadId: string, chatId: string): void {
+    const contextKey = `${chatId}:${threadId}`;
+    const context: ThreadContext = {
+      threadId,
+      chatId,
+      sessionId: this.getOrCreateSessionId(chatId, threadId),
+      lastActivityAt: Date.now(),
+      messageCount: (this.threadContexts.get(contextKey)?.messageCount || 0) + 1,
+    };
+    this.threadContexts.set(contextKey, context);
   }
 }
 
