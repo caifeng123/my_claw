@@ -49,6 +49,7 @@ Push uses the default remote transport (typically key-based auth). `gh`/`glab` C
 2. Read the diff output files produced by the script
 3. Generate a professional PR/MR summary based on the diff
 4. Present the PR/MR link and summary to the user
+5. Update PR/MR description with the detailed summary
 
 ### Step 1: Execute the Script
 
@@ -65,6 +66,7 @@ Optional parameters:
 The script outputs structured key-value pairs. Parse these from the output:
 - `PLATFORM`: "github" or "gitlab"
 - `PR_URL`: The created PR/MR link
+- `PR_NUMBER`: The PR/MR number (for updating description later)
 - `NEW_BRANCH`: The new branch name (auto-pr-{timestamp})
 - `TARGET_BRANCH`: The target branch
 - `DIFF_FILE`: Path to temp file with full diff content
@@ -100,13 +102,48 @@ Guidelines for summary generation:
 - Keep descriptions concise but informative
 - Identify the primary change type (feat/fix/refactor/etc.)
 - If diff is too large (>500 lines), summarize by module rather than by file
+- If diff was truncated (indicated by "truncated" in the file), note this in the summary
 
-### Step 3: Present Results
+### Step 3: Present Results to User
 
 Return to the user:
 
 1. **PR/MR Link** — clickable URL
 2. **Summary** — the generated summary from Step 2
+
+### Step 4: Update PR Description (CRITICAL - must execute automatically)
+
+After presenting to the user, **automatically update the PR/MR description** with the detailed summary.
+
+**For GitHub** (use `--body-file` to avoid shell escaping issues):
+```bash
+# Write summary to temp file first
+echo "$SUMMARY_MARKDOWN" > /tmp/pr_summary.md
+gh pr edit {PR_NUMBER} --body-file /tmp/pr_summary.md
+rm -f /tmp/pr_summary.md
+```
+
+**For GitLab:**
+```bash
+echo "$SUMMARY_MARKDOWN" > /tmp/mr_summary.md
+glab mr update {PR_NUMBER} --description "$(cat /tmp/mr_summary.md)"
+rm -f /tmp/mr_summary.md
+```
+
+IMPORTANT rules for this step:
+- This MUST happen automatically - never ask the user whether to update
+- Always use file-based body input (`--body-file`) for GitHub to avoid escaping issues
+- The PR body should contain the FULL detailed summary, not the simple placeholder from the script
+- If the update fails, still return the link and summary to the user, and append a note:
+  "Note: PR description auto-update failed. You can manually update it with the summary above."
+
+### Step 5: Cleanup
+
+After reading DIFF_FILE and STAT_FILE, clean up the temp files:
+
+```bash
+rm -f {DIFF_FILE} {STAT_FILE}
+```
 
 ## Error Handling
 
@@ -119,5 +156,6 @@ Return to the user:
 | "Cannot detect default branch" | No main/master found | Ask user to specify with --target |
 | "Push failed" | Auth or network issue | Check keys and connectivity |
 | "No changes detected" | Clean working tree | Inform user nothing to submit |
+| "PR description update failed" | Network/permission | Return link + summary, suggest manual paste |
 
 On any script failure, the script auto-rolls-back the temporary branch. No manual cleanup needed.
