@@ -1,13 +1,16 @@
-import { query } from '@anthropic-ai/claude-agent-sdk'
+import { query, type Options } from '@anthropic-ai/claude-agent-sdk'
 import type { AgentResponse, EventHandlers } from '../types/agent'
+import { ToolManager } from './tool-manager'
 
 export class ClaudeEngine {
   private config: {
     model: string
     env: Record<string, any>
   }
+  toolManager: ToolManager
 
   constructor() {
+    this.toolManager = new ToolManager()
     const env = {
       ...process.env,
       ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL,
@@ -24,12 +27,10 @@ export class ClaudeEngine {
   /**
    * 发送消息给Claude并获取响应
    */
-  async sendMessage(
-    messages: any[],
-    toolsConfig?: { mcpServers: any; allowedTools: string[] },
-  ): Promise<AgentResponse> {
+  async sendMessage(messages: any[]): Promise<AgentResponse> {
     try {
       const { model, env } = this.config
+      const toolsConfig = await this.toolManager.getTools()
 
       // 构建用户查询文本
       const userQuery = messages.map(msg => {
@@ -106,11 +107,11 @@ export class ClaudeEngine {
    */
   async sendMessageStream(
     messages: any[],
-    toolsConfig?: { mcpServers: any; allowedTools: string[] },
     eventHandlers?: EventHandlers
   ): Promise<string> {
     try {
       await eventHandlers?.onContentStart?.()
+      const toolsConfig = await this.toolManager.getTools()
 
       const { model, env } = this.config
 
@@ -179,6 +180,57 @@ export class ClaudeEngine {
       console.error('Claude流式引擎错误:', error)
       await eventHandlers?.onError?.(`Claude流式API调用失败: ${error instanceof Error ? error.message : '未知错误'}`)
       throw error
+    }
+  }
+
+  /**
+   * 原始查询Claude API
+   */
+  public async executeClaudeQueryRaw(
+    systemPrompt: string,
+    userQuery: string,
+    options: Options = {}
+  ): Promise<{ result: string; resume: string }> {
+    const { model, env } = this.config
+
+    const toolsConfig = await this.toolManager.getTools()
+    // const startTime = Date.now();
+    try {
+      const response = query({
+        prompt: userQuery,
+        options: {
+          ...toolsConfig,
+          systemPrompt,
+          model,
+          settingSources: ['project'],
+          cwd: process.cwd(),
+          env,
+          ...options,
+        },
+      });
+
+      let result = '';
+      let resume = '';
+
+      // 处理AI响应流
+      for await (const message of response) {
+        if (message.type === 'result') {
+          resume = message.session_id;
+          result += (message as any).result;
+        } else if (message.type === 'assistant') {
+          // console.log(message?.message?.content);
+        }
+      }
+
+      if (!result.trim()) {
+        throw new Error('AI响应为空');
+      }
+
+      return { result, resume };
+    } catch (error) {
+      throw new Error(`AI查询失败: ${error instanceof Error ? error.message : '未知错误'}`);
+    } finally {
+      // console.log(`Claude API调用耗时: ${(Date.now() - startTime) / 1000}s`);
     }
   }
 }

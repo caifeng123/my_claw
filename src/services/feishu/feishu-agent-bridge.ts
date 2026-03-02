@@ -3,6 +3,8 @@ import type { FeishuConnectionConfig, FeishuMessage, ThreadContext } from './typ
 import { agentEngine } from '../../core/agent/index.js';
 import type { EventHandlers } from '@/core/agent/types/agent.js';
 import { writeFileSync } from 'fs';
+import { execSync } from 'child_process';
+import { ClaudeEngine } from '@/core/agent/engine/claude-engine.js';
 
 // 状态文件路径
 const STATE_FILE = '.restart-state.json';
@@ -15,6 +17,7 @@ interface RestartState {
   timestamp: number;
   error?: string;
   hasConflict?: boolean;
+  commitMessage?: string;
 }
 
 export interface FeishuAgentBridgeConfig {
@@ -30,12 +33,14 @@ export interface FeishuAgentBridgeConfig {
 export class FeishuAgentBridge {
   private feishuService: FeishuService;
   private config: FeishuAgentBridgeConfig;
+  private claudeEngine: ClaudeEngine;
   private chatToSessionMap = new Map<string, string>(); // 飞书聊天ID -> 会话ID (key: chatId or chatId:threadId)
   private threadContexts = new Map<string, ThreadContext>(); // Thread context tracking
   private isConnected = false;
   private processingChats = new Set<string>(); // 正在处理的聊天ID，用于并发控制
 
   constructor(config: FeishuAgentBridgeConfig) {
+    this.claudeEngine = new ClaudeEngine()
     this.config = {
       sessionPrefix: 'feishu_',
       enableStreaming: true,
@@ -98,19 +103,48 @@ export class FeishuAgentBridge {
   private async handleRestartCommand(message: FeishuMessage): Promise<void> {
     console.log('🔄 收到 /restart 指令');
 
+    // 第一条提示：收到指令
     await this.feishuService.sendMessage(
       message.chatId,
-      '正在重启服务，请稍候...',
+      '🔄 收到重启指令，正在分析代码变更...',
       message.messageId,
       message.threadId
     );
 
-    // 写入状态文件（子进程写，Launcher 读，单一数据源）
+    // 生成 commit message
+    let commitMessage = 'auto: verified restart commit';
+    try {
+      const diff = execSync('git diff --stat', { encoding: 'utf-8' }).trim();
+      const untracked = execSync('git ls-files --others --exclude-standard', { encoding: 'utf-8' }).trim();
+      const summary = [diff, untracked ? `新增文件:\n${untracked}` : ''].filter(Boolean).join('\n\n');
+
+      if (summary) {
+        const result = await this.claudeEngine.executeClaudeQueryRaw(
+          '你是一个专业的 Git 提交消息生成器。根据代码变更，生成一个简洁的、符合 Git 提交规范的 commit message。只返回 commit message 本身，不要包含其他说明。',
+          `请根据以下代码变更生成一个简洁的 commit message:\n\n${summary}`,
+        );
+        commitMessage = result.result.trim()
+        console.log(`📝 生成的 commit message: ${commitMessage}`);
+      }
+    } catch (e) {
+      console.warn('⚠️ 生成 commit message 失败，使用默认值:', e);
+    }
+
+    // 第二条提示：分析完成，即将重启
+    await this.feishuService.sendMessage(
+      message.chatId,
+      `📝 变更摘要：${commitMessage}\n\n🚀 正在重启服务，请稍候...`,
+      message.messageId,
+      message.threadId
+    );
+
+    // 写入状态文件
     const state: RestartState = {
       chatIds: [message.chatId],
       messageIds: [message.messageId],
       status: 'restarting',
       timestamp: Date.now(),
+      commitMessage,
     };
 
     try {
@@ -120,7 +154,6 @@ export class FeishuAgentBridge {
       console.error('❌ 写入状态文件失败:', error);
     }
 
-    // 通知 Launcher 来重启（不要自己 process.exit）
     if (process.send) {
       process.send({ type: 'restart' });
       console.log('📤 已发送重启请求给 Launcher');

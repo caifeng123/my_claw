@@ -19,7 +19,7 @@
  * - 回滚成功 → git stash pop（新代码放回工作区继续修改）
  */
 
-import { fork, execSync, ChildProcess } from 'child_process';
+import { fork, execSync, ChildProcess, execFileSync } from 'child_process';
 import { existsSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -41,6 +41,7 @@ interface RestartState {
   timestamp: number;
   error?: string;
   stashCreated?: boolean;
+  commitMessage?: string;
 }
 
 // 子进程管理器
@@ -181,19 +182,18 @@ class Launcher {
     if (!state) return;
 
     if (state.status === 'restarting') {
-      // 重启成功，新代码验证通过，commit 入库
       try {
         const status = execSync('git status --porcelain', { encoding: 'utf-8' }).trim();
         if (status) {
-          console.log('📦 新代码验证通过，自动 commit...');
-          execSync('git add -A', { stdio: 'inherit' });
-          execSync('git commit -m "auto: verified restart commit"', { stdio: 'inherit' });
-          console.log('✅ 新代码已 commit');
+          const msg = (state.commitMessage || 'auto: verified restart commit').replace(/"/g, '\\"');
+          console.log(`📦 新代码验证通过，commit: ${msg}`);
+          execFileSync('git', ['add', '-A'], { stdio: 'inherit' });
+          execFileSync('git', ['commit', '-m', msg], { stdio: 'inherit' });
+          console.log('✅ 已 commit');
         }
       } catch (e) {
         console.warn('⚠️ 自动 commit 失败:', e);
       }
-      // 更新为成功 → 通知子进程发 "✅ 重启成功"
       this.updateState({ status: 'success' });
     } else if (state.status === 'rollback') {
       // 回滚后启动成功，恢复 stash
@@ -305,7 +305,7 @@ class Launcher {
 
       if (status) {
         console.log('📦 git stash push -u 暂存问题代码（含新增文件）...');
-        execSync('git stash push -u -m "launcher-auto-stash"', { stdio: 'inherit' });
+        execFileSync('git', ['stash', 'push', '-u', '-m', 'launcher-auto-stash'], { stdio: 'inherit' });
         console.log('✅ 问题代码已暂存到 stash');
         stashCreated = true;
       } else {
@@ -346,11 +346,11 @@ class Launcher {
         return;
       }
 
-      const stashRef = targetLine.split(':')[0];
+      const stashRef = targetLine.split(':')[0] as string;
       console.log(`📦 git stash pop ${stashRef}...`);
 
       try {
-        execSync(`git stash pop "${stashRef}"`, { stdio: 'inherit' });
+        execFileSync('git', ['stash', 'pop', stashRef], { stdio: 'inherit' });
         console.log('✅ 问题代码已恢复到工作区，可以继续修改');
       } catch {
         console.warn('⚠️ stash pop 冲突，请手动处理: git stash pop');
