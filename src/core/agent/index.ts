@@ -19,7 +19,6 @@ export class AgentEngine {
   private toolManager: ToolManager
   private sessionManager: SessionManager
   private streamHandler: StreamHandler
-  private toolsConfig?: { mcpServers: any; allowedTools: string[] }
 
   constructor() {
     this.claudeEngine = new ClaudeEngine()
@@ -28,18 +27,6 @@ export class AgentEngine {
     this.streamHandler = new StreamHandler()
 
     console.log('🤖 Agent引擎初始化完成')
-  }
-
-  /**
-   * 初始化工具配置
-   */
-  async initializeTools(): Promise<void> {
-    try {
-      this.toolsConfig = await this.toolManager.getTools()
-    } catch (error) {
-      console.error('工具配置初始化失败:', error)
-      this.toolsConfig = { mcpServers: {}, allowedTools: [] }
-    }
   }
 
   /**
@@ -66,12 +53,8 @@ export class AgentEngine {
 
       // 获取会话消息历史
       const messages = this.sessionManager.getMessages(sessionId)
-      // 获取工具配置
-      if (!this.toolsConfig) {
-        await this.initializeTools()
-      }
       // 发送消息给Claude
-      const response = await this.claudeEngine.sendMessage(messages, this.toolsConfig)
+      const response = await this.claudeEngine.sendMessage(messages)
 
       // 添加助手响应到会话
       const assistantMessage: SimpleMessage = {
@@ -112,10 +95,6 @@ export class AgentEngine {
 
       // 获取会话消息历史
       const messages = this.sessionManager.getMessages(sessionId)
-      // 获取工具配置
-      if (!this.toolsConfig) {
-        await this.initializeTools()
-      }
 
       // 设置流式处理器
       if (eventHandlers) {
@@ -125,7 +104,6 @@ export class AgentEngine {
       // 发送流式消息给Claude并获取响应内容
       const responseContent = await this.claudeEngine.sendMessageStream(
         messages,
-        this.toolsConfig,
         eventHandlers || this.streamHandler.getEventHandlers()
       )
 

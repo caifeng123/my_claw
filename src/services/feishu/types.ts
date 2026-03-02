@@ -4,8 +4,9 @@ export interface FeishuConnectionConfig {
 }
 
 export interface FeishuMessage {
-  messageId: string;
+  messageId: string;       // IMPORTANT: used as reply target for im.message.reply
   chatId: string;
+  threadId?: string;       // NEW: thread ID, only present for thread/topic group messages
   senderId: string;
   senderName: string;
   content: string;
@@ -14,11 +15,19 @@ export interface FeishuMessage {
   attachments?: string; // JSON string of attachment data
 }
 
+export interface ThreadContext {
+  threadId: string;
+  chatId: string;
+  sessionId: string;
+  lastActivityAt: number;
+  messageCount: number;
+}
+
 export interface FeishuConnection {
   connect(onMessage: (message: FeishuMessage) => void): Promise<boolean>;
   disconnect(): Promise<void>;
-  sendMessage(chatId: string, text: string): Promise<void>;
-  sendTyping(chatId: string, isTyping: boolean): Promise<void>;
+  sendMessage(chatId: string, text: string, messageId?: string, threadId?: string): Promise<void>;  // MODIFIED: added messageId for reply, threadId for context
+  sendTyping(chatId: string, isTyping: boolean, threadId?: string): Promise<void>;  // MODIFIED: threadId kept for forward compat, ignored in impl
   isConnected(): boolean;
 }
 

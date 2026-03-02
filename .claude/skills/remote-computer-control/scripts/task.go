@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -13,11 +14,21 @@ import (
 )
 
 func main() {
-	// 从命令行参数获取 taskPrompt
-	if len(os.Args) < 2 {
-		log.Fatalf("Usage: %s <taskPrompt>", os.Args[0])
+	if len(os.Args) < 3 {
+		log.Fatalf("Usage: %s <taskListFile> <projectDir>", os.Args[0])
 	}
-	taskPrompt := os.Args[1]
+	taskListFile := os.Args[1]
+	projectDir := os.Args[2]
+
+	// 从文件读取任务
+	taskBytes, err := os.ReadFile(taskListFile)
+	if err != nil {
+		log.Fatalf("Failed to read task list file %s: %v", taskListFile, err)
+	}
+	taskPrompt := strings.TrimSpace(string(taskBytes))
+	if taskPrompt == "" {
+		log.Fatalf("Task list file is empty: %s", taskListFile)
+	}
 
 	// Initialize Client
 	client := lumi_cua_sdk.NewLumiCuaClient(
@@ -43,7 +54,6 @@ func main() {
 		fmt.Printf("Using existing sandbox: ID=%s, IP=%s\n", sandbox.ID(), sandbox.IPAddress())
 	}
 
-	// 等待服务空闲
 	for {
 		isIdle, err := client.CheckIdle(ctx, sandbox.ID())
 		if err != nil {
@@ -59,7 +69,6 @@ func main() {
 		time.Sleep(5 * time.Second)
 	}
 
-	// Step 2: Get Available Models
 	models, err := client.ListModels(ctx, sandbox.ID())
 	if err != nil {
 		log.Fatalf("Failed to list models: %v", err)
@@ -73,7 +82,6 @@ func main() {
 
 	messageChan, err := client.RunTask(ctx, taskPrompt, sandbox.ID(), models[0].Name, "", "enabled", timeoutSeconds)
 	if err != nil {
-		// Handle specific error types
 		if taskBusyErr, ok := err.(*lumi_cua_sdk.TaskBusyError); ok {
 			log.Printf("Task is busy: %v", taskBusyErr)
 			fmt.Println("Another task is currently running. Please wait and try again later.")
@@ -90,13 +98,11 @@ func main() {
 			fmt.Printf("Action: %s\n", message.Action)
 			fmt.Printf("TaskID: %s\n", message.TaskID)
 
-			// Handle error message (SDK统一检测到的异常情况)
 			if message.Action == "error" {
 				fmt.Printf("❌ Task error: %s\n", message.Summary)
 				break
 			}
 
-			// Handle timeout message
 			if message.Action == "timeout" {
 				fmt.Printf("⚠️  Task timed out after %d seconds\n", timeoutSeconds)
 				break
@@ -110,39 +116,40 @@ func main() {
 		fmt.Printf("Task execution ended. Total messages received: %d\n", messageCount)
 	}
 
-	// 截图
+	screenshotDir := filepath.Join(projectDir, "data", "temp")
+	if err := os.MkdirAll(screenshotDir, 0755); err != nil {
+		log.Printf("Failed to create screenshot directory: %v", err)
+	}
+	screenshotPath := filepath.Join(screenshotDir, "final_screenshot.png")
+
 	finalScreenshot, err := sandbox.Screenshot(ctx)
 	if err != nil {
 		log.Printf("Failed to take final screenshot: %v", err)
 	} else {
-		err = saveBase64Image(finalScreenshot.Base64Image, "final_screenshot.png")
+		err = saveBase64Image(finalScreenshot.Base64Image, screenshotPath)
 		if err != nil {
 			log.Printf("Failed to save final screenshot: %v", err)
 		} else {
-			fmt.Println("✅ Final screenshot saved as final_screenshot.png")
+			fmt.Printf("✅ Final screenshot saved as %s\n", screenshotPath)
 		}
 	}
 }
 
-// save base64 image
 func saveBase64Image(s, filePath string) error {
 	if idx := strings.Index(s, ","); idx != -1 {
 		s = s[idx+1:]
 	}
-	// 解码base64字符串
 	imageData, err := base64.StdEncoding.DecodeString(s)
 	if err != nil {
 		return fmt.Errorf("failed to decode base64 string: %v", err)
 	}
 
-	// 创建文件
 	file, err := os.Create(filePath)
 	if err != nil {
 		return fmt.Errorf("failed to create file: %v", err)
 	}
 	defer file.Close()
 
-	// 写入文件
 	_, err = file.Write(imageData)
 	if err != nil {
 		return fmt.Errorf("failed to write to file: %v", err)

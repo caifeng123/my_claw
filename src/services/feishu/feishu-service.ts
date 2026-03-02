@@ -103,7 +103,7 @@ export class FeishuService implements FeishuConnection {
   }
 
   // shouldMarkdown 强制使用 markdown 格式
-  async sendMessage(chatId: string, text: string): Promise<void> {
+  async sendMessage(chatId: string, text: string, messageId?: string, threadId?: string): Promise<void> {
     if (!this.client) {
       console.warn('Feishu client not initialized, skipping message send');
       return;
@@ -135,10 +135,10 @@ export class FeishuService implements FeishuConnection {
       // 根据内容长度选择消息类型
       if (processedText.length <= PLAIN_TEXT_LIMIT && !processResult.imageKeys.length) {
         // 短文本，使用纯文本消息
-        await this.sendPlainTextMessage(chatId, processedText);
+        await this.sendPlainTextMessage(chatId, processedText, messageId, threadId);
       } else if (processedText.length <= CARD_MD_LIMIT) {
         // 中等长度文本，使用交互式卡片
-        await this.sendInteractiveCardMessage(chatId, processedText);
+        await this.sendInteractiveCardMessage(chatId, processedText, messageId, threadId);
       } else {
         // 长文本，分割成多个卡片消息
         const chunks = this.splitAtParagraphs(processedText, CARD_MD_LIMIT);
@@ -146,11 +146,11 @@ export class FeishuService implements FeishuConnection {
           const chunk = chunks[i];
           // 如果是第一个消息，可能作为新消息发送，后续消息作为回复
           if (i === 0) {
-            await this.sendInteractiveCardMessage(chatId, chunk!);
+            await this.sendInteractiveCardMessage(chatId, chunk!, messageId, threadId);
           } else {
             // 后续消息作为回复发送，但这里我们简单发送新消息，因为飞书回复链可能会很长
             // 为了避免回复链过长，我们选择发送新消息
-            await this.sendInteractiveCardMessage(chatId, chunk!);
+            await this.sendInteractiveCardMessage(chatId, chunk!, undefined, threadId);
           }
         }
       }
@@ -162,10 +162,12 @@ export class FeishuService implements FeishuConnection {
     }
   }
 
-  async sendTyping(chatId: string, isTyping: boolean): Promise<void> {
+  async sendTyping(chatId: string, isTyping: boolean, threadId?: string): Promise<void> {
     if (!this.client) return;
     const lastMsgId = this.lastMessageIdByChat.get(chatId);
     if (!lastMsgId) return;
+    // Note: threadId is kept for forward compatibility but ignored in implementation
+    // Feishu has no native typing API; we use messageReaction which is bound to message_id, not thread
 
     if (isTyping) {
       const reactionId = await this.addReaction(lastMsgId, 'OnIt');
@@ -194,6 +196,7 @@ export class FeishuService implements FeishuConnection {
       const message = data.message;
       const chatId = message.chat_id;
       const messageId = message.message_id;
+      const threadId = message.thread_id;
       // 消息去重检查
       if (this.isDuplicate(messageId)) {
         console.debug('Duplicate message, skipping');
@@ -261,8 +264,9 @@ export class FeishuService implements FeishuConnection {
 
       // 构建消息对象
       const feishuMessage: FeishuMessage = {
-        messageId,
+        messageId,             // IMPORTANT: needed for im.message.reply
         chatId,
+        threadId,              // NEW: pass through thread ID (undefined for non-thread groups)
         senderId: data.sender.sender_id?.open_id || '',
         senderName: this.getSenderName(data.sender.sender_id?.open_id || ''),
         content,
@@ -383,10 +387,8 @@ private extractMessageContent(messageType: string, content: string, createTime: 
   /**
    * 发送纯文本消息
    */
-  private async sendPlainTextMessage(chatId: string, text: string): Promise<void> {
+  private async sendPlainTextMessage(chatId: string, text: string, replyMessageId?: string, threadId?: string): Promise<void> {
     if (!this.client) return;
-
-    const lastMsgId = this.lastMessageIdByChat.get(chatId);
 
     try {
       // 如果文本超过飞书纯文本限制，需要分割
@@ -394,12 +396,11 @@ private extractMessageContent(messageType: string, content: string, createTime: 
         const chunks = this.splitAtParagraphs(text, TEXT_MSG_LIMIT);
         for (let i = 0; i < chunks.length; i++) {
           const chunk = chunks[i];
-          if (i === 0 && lastMsgId) {
-            // 第一条消息作为回复
-            await this.client.im.message.create({
-              params: { receive_id_type: 'chat_id' },
+          // 第一条消息作为回复（如果有replyMessageId），否则作为新消息
+          if (i === 0 && replyMessageId) {
+            await this.client.im.message.reply({
+              path: { message_id: replyMessageId },
               data: {
-                receive_id: chatId,
                 msg_type: 'text',
                 content: JSON.stringify({ text: chunk }),
               },
@@ -412,18 +413,18 @@ private extractMessageContent(messageType: string, content: string, createTime: 
                 receive_id: chatId,
                 msg_type: 'text',
                 content: JSON.stringify({ text: chunk }),
+                ...(threadId ? { thread_id: threadId } : {}),
               },
             });
           }
         }
       } else {
         // 单条纯文本消息
-        if (lastMsgId) {
-          // 作为回复发送
-          await this.client.im.message.create({
-            params: { receive_id_type: 'chat_id' },
+        if (replyMessageId) {
+          // 作为回复发送（使用im.message.reply自动关联到thread）
+          await this.client.im.message.reply({
+            path: { message_id: replyMessageId },
             data: {
-              receive_id: chatId,
               msg_type: 'text',
               content: JSON.stringify({ text }),
             },
@@ -436,32 +437,31 @@ private extractMessageContent(messageType: string, content: string, createTime: 
               receive_id: chatId,
               msg_type: 'text',
               content: JSON.stringify({ text }),
+              ...(threadId ? { thread_id: threadId } : {}),
             },
           });
         }
       }
     } catch (error) {
       console.warn('Plain text message failed, trying fallback:', error);
-      await this.sendFallbackMessage(chatId, text);
+      await this.sendFallbackMessage(chatId, text, replyMessageId, threadId);
     }
   }
 
   /**
    * 发送交互式卡片消息
    */
-  private async sendInteractiveCardMessage(chatId: string, text: string): Promise<void> {
+  private async sendInteractiveCardMessage(chatId: string, text: string, replyMessageId?: string, threadId?: string): Promise<void> {
     if (!this.client) return;
 
     const content = this.buildInteractiveCard(text);
-    const lastMsgId = this.lastMessageIdByChat.get(chatId);
 
     try {
-      if (lastMsgId) {
-        // 作为回复发送
-        await this.client.im.message.create({
-          params: { receive_id_type: 'chat_id' },
+      if (replyMessageId) {
+        // 作为回复发送（使用im.message.reply自动关联到thread）
+        await this.client.im.message.reply({
+          path: { message_id: replyMessageId },
           data: {
-            receive_id: chatId,
             msg_type: 'interactive',
             content,
           },
@@ -474,13 +474,14 @@ private extractMessageContent(messageType: string, content: string, createTime: 
             receive_id: chatId,
             msg_type: 'interactive',
             content,
+            ...(threadId ? { thread_id: threadId } : {}),
           },
         });
       }
     } catch (error) {
       console.warn('Interactive card message failed, fallback to plain text:', error);
       // 降级为纯文本
-      await this.sendPlainTextMessage(chatId, text);
+      await this.sendPlainTextMessage(chatId, text, replyMessageId, threadId);
     }
   }
 
@@ -546,27 +547,28 @@ private extractMessageContent(messageType: string, content: string, createTime: 
     return chunks;
   }
 
-  private async sendFallbackMessage(chatId: string, text: string): Promise<void> {
+  private async sendFallbackMessage(chatId: string, text: string, replyMessageId?: string, threadId?: string): Promise<void> {
     if (!this.client) return;
 
     try {
-      const lastMsgId = this.lastMessageIdByChat.get(chatId);
-      if (lastMsgId) {
-        await this.client.im.message.create({
-          params: { receive_id_type: 'chat_id' },
+      if (replyMessageId) {
+        // 作为回复发送（使用im.message.reply自动关联到thread）
+        await this.client.im.message.reply({
+          path: { message_id: replyMessageId },
           data: {
-            receive_id: chatId,
             msg_type: 'text',
             content: JSON.stringify({ text }),
           },
         });
       } else {
+        // 作为新消息发送
         await this.client.im.message.create({
           params: { receive_id_type: 'chat_id' },
           data: {
             receive_id: chatId,
             msg_type: 'text',
             content: JSON.stringify({ text }),
+            ...(threadId ? { thread_id: threadId } : {}),
           },
         });
       }

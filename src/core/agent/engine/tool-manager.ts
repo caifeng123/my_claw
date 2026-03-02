@@ -8,7 +8,7 @@ import type {
 } from '../types/tools'
 import { calculatorTool, timeTool } from '../tools/calculator';
 
-const DEFAULT_ALLOWED_TOOLS = [
+export const DEFAULT_ALLOWED_TOOLS = [
   'Bash',
   'Read', 'Write', 'Edit', 'Glob', 'Grep',
   'WebSearch', 'WebFetch',
@@ -37,7 +37,7 @@ export class ToolManager {
    */
   registerTool(options: RegisteredTool): void {
     if (this.tools.has(options.name)) {
-      throw new Error(`工具名称已存在: ${options.name}`)
+      return
     }
 
     const tool: RegisteredTool = {
