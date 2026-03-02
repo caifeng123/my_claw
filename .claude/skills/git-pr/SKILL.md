@@ -183,4 +183,4 @@ rm -f {DIFF_FILE} {STAT_FILE}
 | "No changes detected" | Clean working tree | Inform user nothing to submit |
 | "PR title/description update failed" | Network/permission | Return link + summary, suggest manual paste |
 
-On any script failure, the script auto-rolls-back the temporary branch. No manual cleanup needed.
+On any script failure, the local branch is untouched (commit is soft-reset). The remote branch may need manual deletion if push succeeded but PR creation failed.
