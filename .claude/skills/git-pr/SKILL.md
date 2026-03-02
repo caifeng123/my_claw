@@ -47,9 +47,9 @@ Push uses the default remote transport (typically key-based auth). `gh`/`glab` C
 
 1. Run `scripts/git_pr.sh` in the user's repo directory
 2. Read the diff output files produced by the script
-3. Generate a professional PR/MR summary based on the diff
+3. Generate a professional PR/MR title and summary based on the diff
 4. Present the PR/MR link and summary to the user
-5. Update PR/MR description with the detailed summary
+5. Update PR/MR title and description with the AI-generated content
 
 ### Step 1: Execute the Script
 
@@ -66,17 +66,42 @@ Optional parameters:
 The script outputs structured key-value pairs. Parse these from the output:
 - `PLATFORM`: "github" or "gitlab"
 - `PR_URL`: The created PR/MR link
-- `PR_NUMBER`: The PR/MR number (for updating description later)
+- `PR_NUMBER`: The PR/MR number (for updating title/description later)
 - `NEW_BRANCH`: The new branch name (auto-pr-{timestamp})
 - `TARGET_BRANCH`: The target branch
 - `DIFF_FILE`: Path to temp file with full diff content
 - `STAT_FILE`: Path to temp file with diff stats
 
-### Step 2: Read Diff and Generate Summary
+### Step 2: Read Diff and Generate Title + Summary
 
-After the script succeeds, read `DIFF_FILE` and `STAT_FILE` to generate a summary.
+After the script succeeds, read `DIFF_FILE` and `STAT_FILE` to generate BOTH a title and a summary.
 
-The summary must follow **Conventional Commits** style and include:
+#### Title Generation
+
+Generate a **Conventional Commits** style title that describes the semantic meaning of the change:
+
+```
+<type>(<scope>): <short description>
+```
+
+Rules:
+- `type`: feat / fix / refactor / docs / style / test / chore / build / ci / perf
+- `scope`: the primary module, directory, or component affected (optional but preferred)
+- `short description`: imperative mood, lowercase, no period, max 72 chars
+
+Examples:
+- `feat(auth): add JWT token validation middleware`
+- `fix(api): resolve timeout on large payload requests`
+- `refactor: migrate config files to new schema format`
+- `docs(readme): update installation instructions for Linux`
+- `chore(deps): bump axios from 0.21 to 1.6`
+
+If the change spans multiple unrelated areas, use the most significant one for scope, or omit scope:
+- `refactor: reorganize project structure and update configs`
+
+#### Summary Generation
+
+The summary must include:
 
 ```
 ## PR Summary
@@ -100,7 +125,6 @@ Guidelines for summary generation:
 - Group related file changes together by module/feature
 - Focus on **what** changed and **why**, not line-by-line diffs
 - Keep descriptions concise but informative
-- Identify the primary change type (feat/fix/refactor/etc.)
 - If diff is too large (>500 lines), summarize by module rather than by file
 - If diff was truncated (indicated by "truncated" in the file), note this in the summary
 
@@ -109,33 +133,34 @@ Guidelines for summary generation:
 Return to the user:
 
 1. **PR/MR Link** — clickable URL
-2. **Summary** — the generated summary from Step 2
+2. **Title** — the generated Conventional Commits title
+3. **Summary** — the generated summary from Step 2
 
-### Step 4: Update PR Description (CRITICAL - must execute automatically)
+### Step 4: Update PR Title and Description (CRITICAL - must execute automatically)
 
-After presenting to the user, **automatically update the PR/MR description** with the detailed summary.
+After presenting to the user, **automatically update BOTH the PR/MR title and description**.
 
 **For GitHub** (use `--body-file` to avoid shell escaping issues):
 ```bash
 # Write summary to temp file first
 echo "$SUMMARY_MARKDOWN" > /tmp/pr_summary.md
-gh pr edit {PR_NUMBER} --body-file /tmp/pr_summary.md
+gh pr edit {PR_NUMBER} --title "{GENERATED_TITLE}" --body-file /tmp/pr_summary.md
 rm -f /tmp/pr_summary.md
 ```
 
 **For GitLab:**
 ```bash
 echo "$SUMMARY_MARKDOWN" > /tmp/mr_summary.md
-glab mr update {PR_NUMBER} --description "$(cat /tmp/mr_summary.md)"
+glab mr update {PR_NUMBER} --title "{GENERATED_TITLE}" --description "$(cat /tmp/mr_summary.md)"
 rm -f /tmp/mr_summary.md
 ```
 
 IMPORTANT rules for this step:
 - This MUST happen automatically - never ask the user whether to update
+- Always update BOTH title AND body/description
 - Always use file-based body input (`--body-file`) for GitHub to avoid escaping issues
-- The PR body should contain the FULL detailed summary, not the simple placeholder from the script
 - If the update fails, still return the link and summary to the user, and append a note:
-  "Note: PR description auto-update failed. You can manually update it with the summary above."
+  "Note: PR title/description auto-update failed. You can manually update it with the content above."
 
 ### Step 5: Cleanup
 
@@ -156,6 +181,6 @@ rm -f {DIFF_FILE} {STAT_FILE}
 | "Cannot detect default branch" | No main/master found | Ask user to specify with --target |
 | "Push failed" | Auth or network issue | Check keys and connectivity |
 | "No changes detected" | Clean working tree | Inform user nothing to submit |
-| "PR description update failed" | Network/permission | Return link + summary, suggest manual paste |
+| "PR title/description update failed" | Network/permission | Return link + summary, suggest manual paste |
 
 On any script failure, the script auto-rolls-back the temporary branch. No manual cleanup needed.
