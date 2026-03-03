@@ -60,7 +60,7 @@ export class FeishuService implements FeishuConnection {
         appId: this.config.appId,
         appSecret: this.config.appSecret,
         // appType: lark.AppType.SelfBuild,
-        loggerLevel: lark.LoggerLevel.debug,
+        loggerLevel: lark.LoggerLevel.info,
       });
 
       // 创建事件分发器

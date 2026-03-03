@@ -8,6 +8,7 @@ import feishuRouter from './routes/feishu.js'
 import memoryRouter from './routes/memory.js'
 import { getFeishuConfig, validateFeishuConfig } from './config/feishu.js'
 import { startDefaultFeishuBridge, stopDefaultFeishuBridge, getDefaultFeishuAgentBridge } from './services/feishu/feishu-agent-bridge.js'
+import { agentEngine } from './core/agent/index.js'
 
 // 状态文件路径（与 launcher.ts 保持一致）
 const STATE_FILE = '.restart-state.json'
@@ -51,9 +52,7 @@ async function initializeFeishuService() {
       ...feishuConfig.bridge,
     })
 
-    if (success) {
-      console.log('✅ 飞书Agent桥接服务启动成功')
-    } else {
+    if (!success) {
       console.error('❌ 飞书Agent桥接服务启动失败')
     }
 
@@ -174,6 +173,7 @@ async function startServer() {
 
   process.on('SIGINT', async () => {
     console.log('\n🛑 收到关闭信号，正在优雅关闭...')
+    agentEngine.getCronScheduler().stop()
     await stopDefaultFeishuBridge()
     console.log('✅ 服务已关闭')
     process.exit(0)
@@ -181,6 +181,7 @@ async function startServer() {
 
   process.on('SIGTERM', async () => {
     console.log('\n🛑 收到终止信号，正在优雅关闭...')
+    agentEngine.getCronScheduler().stop()
     await stopDefaultFeishuBridge()
     console.log('✅ 服务已关闭')
     process.exit(0)
