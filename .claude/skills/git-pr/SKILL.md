@@ -13,174 +13,148 @@ description: >
 
 # Git-PR
 
-One-command workflow: stage all local changes → commit → push to a new branch → create PR/MR → return link + AI summary.
+One-command workflow: prepare → AI commit → push + create PR → AI describe.
 
 ## Prerequisites
 
-Users must set up CLI tools **once** (one-time setup):
-
 ### GitHub
-
 ```bash
-# Install gh CLI (macOS)
-brew install gh
-# Or Linux: see https://cli.github.com/
-
-# Authenticate (one-time)
-gh auth login
+brew install gh        # or see https://cli.github.com/
+gh auth login          # one-time
 ```
 
 ### GitLab (self-hosted)
-
 ```bash
-# Install glab CLI
-brew install glab
-# Or see https://gitlab.com/gitlab-org/cli
-
-# Authenticate with self-hosted instance (one-time)
+brew install glab      # or see https://gitlab.com/gitlab-org/cli
 glab auth login --hostname your-gitlab-host.com
 ```
 
-Push uses the default remote transport (typically key-based auth). `gh`/`glab` CLI manage their own API tokens internally.
-
 ## Workflow
 
-1. Run `scripts/git_pr.sh` in the user's repo directory
-2. Read the diff output files produced by the script
-3. Generate a professional PR/MR title and summary based on the diff
-4. Present the PR/MR link and summary to the user
-5. Update PR/MR title and description with the AI-generated content
+### Step 1: Prepare — Stage changes and export diff
 
-### Step 1: Execute the Script
-
-Run the script from the user's current working directory (must be inside a git repo):
+Run the prepare script:
 
 ```bash
-bash {SKILL_PATH}/scripts/git_pr.sh
+bash {SKILL_PATH}/scripts/git_prepare.sh
 ```
 
-Optional parameters:
-- `--target <branch>`: Override target branch (default: auto-detect main/master)
-- `--message <msg>`: Override commit message (default: auto-generated)
+Optional: `--target <branch>` to override target branch.
 
-The script outputs structured key-value pairs. Parse these from the output:
-- `PLATFORM`: "github" or "gitlab"
-- `PR_URL`: The created PR/MR link
-- `PR_NUMBER`: The PR/MR number (for updating title/description later)
-- `NEW_BRANCH`: The new branch name (auto-pr-{timestamp})
-- `TARGET_BRANCH`: The target branch
-- `DIFF_FILE`: Path to temp file with full diff content
-- `STAT_FILE`: Path to temp file with diff stats
+Parse the output key-value pairs:
+- `HAS_CHANGES`: `true` if uncommitted changes were found and committed
+- `ALREADY_COMMITTED`: `true` if no uncommitted changes but unpushed commits exist
+- `DIFF_FILE`: Path to full diff content
+- `STAT_FILE`: Path to diff stats
+- `COMMIT_SHA`: The placeholder commit SHA (only when HAS_CHANGES=true)
 
-### Step 2: Read Diff and Generate Title + Summary
+**If `HAS_CHANGES=false` and `ALREADY_COMMITTED=false`**: Inform user there's nothing to submit. Stop.
 
-After the script succeeds, read `DIFF_FILE` and `STAT_FILE` to generate BOTH a title and a summary.
+**If `ALREADY_COMMITTED=true`**: Skip Step 2 (commit already has a real message). Go to Step 3.
 
-#### Title Generation
+### Step 2: AI Amend — Generate meaningful commit message
 
-Generate a **Conventional Commits** style title that describes the semantic meaning of the change:
+Read `DIFF_FILE` and `STAT_FILE`, then generate a **Conventional Commits** style message:
 
-```
-<type>(<scope>): <short description>
-```
+Format: `<type>(<scope>): <short description>`
 
-Rules:
-- `type`: feat / fix / refactor / docs / style / test / chore / build / ci / perf
-- `scope`: the primary module, directory, or component affected (optional but preferred)
-- `short description`: imperative mood, lowercase, no period, max 72 chars
+- **type**: `feat` / `fix` / `refactor` / `docs` / `chore` / `style` / `test` / `perf` / `ci` / `build`
+- **scope**: primary module or directory affected (e.g., `memory`, `feishu`, `agent`, `api`). Optional but preferred.
+- **description**: imperative mood, lowercase, no period, max 72 chars. Describe **what** the change does semantically.
 
 Examples:
-- `feat(auth): add JWT token validation middleware`
-- `fix(api): resolve timeout on large payload requests`
-- `refactor: migrate config files to new schema format`
-- `docs(readme): update installation instructions for Linux`
-- `chore(deps): bump axios from 0.21 to 1.6`
+- `feat(memory): add SQLite FTS5 full-text search engine`
+- `fix(feishu): resolve session mapping for topic groups`
+- `refactor(agent): extract system prompt builder to separate module`
+- `docs: add data directory README and gitignore rules`
+- `chore(deps): downgrade better-sqlite3 to v9.6.0`
 
-If the change spans multiple unrelated areas, use the most significant one for scope, or omit scope:
-- `refactor: reorganize project structure and update configs`
+Then amend the placeholder commit:
 
-#### Summary Generation
-
-The summary must include:
-
+```bash
+git commit --amend -m "<generated message>"
 ```
-## PR Summary
 
-### Overview
-[One-sentence description of what this change does]
+If the user provided `-m "..."`, use that message instead.
 
-### Change Type
-[feat / fix / refactor / docs / style / test / chore]
+### Step 3: Push and Create PR
 
-### Changes
-- **file_or_module_1**: Description of what changed and why
-- **file_or_module_2**: Description of what changed and why
-  ...
+Run the push script:
 
-### Stats
+```bash
+bash {SKILL_PATH}/scripts/git_push_pr.sh
+```
+
+Optional: `--target <branch>` (same value as Step 1 if used).
+
+Parse the output:
+- `PLATFORM`: `github` or `gitlab`
+- `PR_URL`: The PR/MR link
+- `PR_NUMBER`: For updating title/description later
+- `NEW_BRANCH`: The remote branch created
+- `TARGET_BRANCH`: The merge target
+- `DIFF_FILE`: Path to diff (for generating PR description)
+- `STAT_FILE`: Path to diff stats
+
+### Step 4: AI Update PR — Generate title and description
+
+Read `DIFF_FILE` and `STAT_FILE`, generate a PR summary:
+
+```markdown
+## Summary
+[2-3 sentences: what this PR does and why]
+
+## Changes
+- **module_or_file**: description of what changed
+- ...
+
+## Stats
 [X files changed, Y insertions(+), Z deletions(-)]
 ```
 
-Guidelines for summary generation:
-- Group related file changes together by module/feature
-- Focus on **what** changed and **why**, not line-by-line diffs
-- Keep descriptions concise but informative
-- If diff is too large (>500 lines), summarize by module rather than by file
-- If diff was truncated (indicated by "truncated" in the file), note this in the summary
+Then update the PR automatically:
 
-### Step 3: Present Results to User
-
-Return to the user:
-
-1. **PR/MR Link** — clickable URL
-2. **Title** — the generated Conventional Commits title
-3. **Summary** — the generated summary from Step 2
-
-### Step 4: Update PR Title and Description (CRITICAL - must execute automatically)
-
-After presenting to the user, **automatically update BOTH the PR/MR title and description**.
-
-**For GitHub** (use `--body-file` to avoid shell escaping issues):
+**GitHub:**
 ```bash
-# Write summary to temp file first
-echo "$SUMMARY_MARKDOWN" > /tmp/pr_summary.md
-gh pr edit {PR_NUMBER} --title "{GENERATED_TITLE}" --body-file /tmp/pr_summary.md
+echo "$SUMMARY" > /tmp/pr_summary.md
+gh pr edit {PR_NUMBER} --title "<commit message>" --body-file /tmp/pr_summary.md
 rm -f /tmp/pr_summary.md
 ```
 
-**For GitLab:**
+**GitLab:**
 ```bash
-echo "$SUMMARY_MARKDOWN" > /tmp/mr_summary.md
-glab mr update {PR_NUMBER} --title "{GENERATED_TITLE}" --description "$(cat /tmp/mr_summary.md)"
+echo "$SUMMARY" > /tmp/mr_summary.md
+glab mr update {PR_NUMBER} --title "<commit message>" --description "$(cat /tmp/mr_summary.md)"
 rm -f /tmp/mr_summary.md
 ```
 
-IMPORTANT rules for this step:
-- This MUST happen automatically - never ask the user whether to update
-- Always update BOTH title AND body/description
-- Always use file-based body input (`--body-file`) for GitHub to avoid escaping issues
-- If the update fails, still return the link and summary to the user, and append a note:
-  "Note: PR title/description auto-update failed. You can manually update it with the content above."
+Rules:
+- Always update BOTH title and body automatically — never ask user
+- Use `--body-file` for GitHub to avoid shell escaping issues
+- If update fails, still return the link and note: "PR description auto-update failed. You can manually paste the content above."
 
-### Step 5: Cleanup
+### Step 5: Cleanup and Present
 
-After reading DIFF_FILE and STAT_FILE, clean up the temp files:
-
+Clean up temp files:
 ```bash
 rm -f {DIFF_FILE} {STAT_FILE}
 ```
 
+Return to user:
+1. PR/MR link (clickable)
+2. Commit message used
+3. PR summary generated
+
 ## Error Handling
 
-| Error | Cause | Action |
-|-------|-------|-------|
-| "Not inside a git repository" | User not in a repo dir | Ask user to cd into their repo |
-| "gh/glab CLI not installed" | Missing tool | Provide install instructions from Prerequisites |
-| "gh/glab CLI not authenticated" | Not logged in | Guide user through auth login |
-| "No origin remote detected" | No remote configured | Ask user to add remote |
-| "Cannot detect default branch" | No main/master found | Ask user to specify with --target |
-| "Push failed" | Auth or network issue | Check keys and connectivity |
-| "No changes detected" | Clean working tree | Inform user nothing to submit |
-| "PR title/description update failed" | Network/permission | Return link + summary, suggest manual paste |
-
-On any script failure, the local branch is untouched (commit is soft-reset). The remote branch may need manual deletion if push succeeded but PR creation failed.
+| Error | Action |
+|-------|--------|
+| Not in git repo | Ask user to cd into repo |
+| gh/glab not installed | Show install instructions |
+| gh/glab not authenticated | Guide through auth login |
+| No remote | Ask user to add origin |
+| No default branch | Ask to specify --target |
+| Push failed | Check keys/network |
+| No changes | Inform user, stop |
+| Amend failed | Keep placeholder commit, continue push |
+| PR edit failed | Return link + summary, suggest manual paste |
