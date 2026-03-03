@@ -158,22 +158,20 @@ export class ClaudeEngine {
           if (assistantContent) {
             // content 可能是数组格式，需要提取文本
             const textContent = Array.isArray(assistantContent)
-              ? assistantContent.filter(c => c.type === 'text').map(c => c.text).join('')
+              ? assistantContent.filter(c => c.type === 'text' || c.type === 'thinking').map(c => c.text || c.thinking).join('')
               : String(assistantContent)
             lastAssistantContent = textContent
             console.log('Assistant message:', assistantContent)
           }
         }
       }
-
-      await eventHandlers?.onContentStop?.()
-
       // 如果 result 为空，使用最后一个 assistant 消息
       if (!result.trim() && lastAssistantContent) {
         result = lastAssistantContent
         // 主动触发 onContentDelta，确保飞书能收到这个内容
         await eventHandlers?.onContentDelta?.(result)
       }
+      await eventHandlers?.onContentStop?.()
 
       return result
     } catch (error) {
