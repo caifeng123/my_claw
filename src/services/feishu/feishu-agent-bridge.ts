@@ -112,13 +112,14 @@ export class FeishuAgentBridge {
       message.threadId
     );
 
-    let commitMessage = 'auto: verified restart commit';
+    let commitMessage = '';
     try {
       const diff = execSync('git diff --stat', { encoding: 'utf-8' }).trim();
       const untracked = execSync('git ls-files --others --exclude-standard', { encoding: 'utf-8' }).trim();
       const summary = [diff, untracked ? `新增文件:\n${untracked}` : ''].filter(Boolean).join('\n\n');
 
       if (summary) {
+        commitMessage = 'auto: verified restart commit';
         const result = await this.claudeEngine.executeClaudeQueryRaw(
           '你是一个专业的 Git 提交消息生成器。根据代码变更，生成一个简洁的、符合 Git 提交规范的 commit message。只返回 commit message 本身，不要包含其他说明。',
           `请根据以下代码变更生成一个简洁的 commit message:\n\n${summary}`,
@@ -132,7 +133,7 @@ export class FeishuAgentBridge {
 
     await this.feishuService.sendMessage(
       message.chatId,
-      `📝 变更摘要：${commitMessage}\n\n🚀 正在重启服务，请稍候...`,
+      `${commitMessage ? `📝 变更摘要：${commitMessage}\n\n` : ''}🚀 正在重启服务，请稍候...`,
       message.messageId,
       message.threadId
     );
