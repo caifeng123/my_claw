@@ -140,8 +140,7 @@ if [[ "$PLATFORM" == "github" ]]; then
         --base "$TARGET_BRANCH" \
         --head "$NEW_BRANCH" \
         --title "$PR_TITLE" \
-        --body-file "$BODY_FILE" \
-        --delete-branch 2>&1) || {
+        --body-file "$BODY_FILE" 2>&1) || {
         error "PR creation failed: $PR_URL"
         rm -f "$BODY_FILE"
         exit 1
