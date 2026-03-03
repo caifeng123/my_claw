@@ -51,9 +51,7 @@ async function initializeFeishuService() {
       ...feishuConfig.bridge,
     })
 
-    if (success) {
-      console.log('✅ 飞书Agent桥接服务启动成功')
-    } else {
+    if (!success) {
       console.error('❌ 飞书Agent桥接服务启动失败')
     }
 
