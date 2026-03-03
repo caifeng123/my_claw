@@ -18,7 +18,7 @@ export const DEFAULT_ALLOWED_TOOLS = [
   'NotebookEdit'
 ];
 
-const CUSTOM_TOOLS = [
+const CUSTOM_TOOLS: RegisteredTool[] = [
   calculatorTool, timeTool
 ]
 
@@ -40,22 +40,31 @@ export class ToolManager {
       return
     }
 
-    const tool: RegisteredTool = {
+    const registeredTool: RegisteredTool = {
       name: options.name,
       description: options.description,
       inputSchema: options.inputSchema,
       execute: options.execute,
     }
 
-    this.tools.set(options.name, tool)
+    this.tools.set(options.name, registeredTool)
     console.log(`✅ 工具注册成功: ${options.name}`)
+  }
+
+  /**
+   * 批量注册工具
+   */
+  registerTools(tools: RegisteredTool[]): void {
+    for (const t of tools) {
+      this.registerTool(t)
+    }
   }
 
   /**
    * 获取MCP工具配置（参考官方写法）
    */
   async getTools() {
-    CUSTOM_TOOLS.forEach(tool => this.registerTool(tool))
+    CUSTOM_TOOLS.forEach(t => this.registerTool(t))
     // 1. 注册内部工具
     const internalTools = Array.from(this.tools.values()).map((handler) => {
       return tool(
@@ -110,7 +119,7 @@ export class ToolManager {
    * 获取所有已注册的工具名称（用于Claude Agent SDK的allowedTools）
    */
   getClaudeTools(): string[] {
-    return Array.from(this.tools.values()).map(tool => tool.name)
+    return Array.from(this.tools.values()).map(t => t.name)
   }
 
   /**
@@ -118,9 +127,9 @@ export class ToolManager {
    */
   async executeTool(request: ToolCallRequest): Promise<ToolCallResponse> {
     const startTime = Date.now()
-    const tool = this.tools.get(request.toolName)
+    const registeredTool = this.tools.get(request.toolName)
 
-    if (!tool) {
+    if (!registeredTool) {
       return {
         toolName: request.toolName,
         success: false,
@@ -130,7 +139,7 @@ export class ToolManager {
     }
 
     // 验证输入参数
-    const validation = this.validateInput(tool, request.parameters)
+    const validation = this.validateInput(registeredTool, request.parameters)
     if (!validation.isValid) {
       return {
         toolName: request.toolName,
@@ -148,7 +157,7 @@ export class ToolManager {
         parameters: request.parameters,
       }
 
-      const result = await tool.execute(context)
+      const result = await registeredTool.execute(context)
 
       return {
         toolName: request.toolName,
@@ -172,14 +181,14 @@ export class ToolManager {
   /**
    * 验证输入参数
    */
-  private validateInput(tool: RegisteredTool, parameters: Record<string, any>): ToolValidationResult {
+  private validateInput(registeredTool: RegisteredTool, parameters: Record<string, any>): ToolValidationResult {
     const errors: { field: string; message: string }[] = []
 
     // 检查参数类型（简单验证）
     for (const [key, value] of Object.entries(parameters)) {
-      if (!tool.inputSchema[key]) continue
+      if (!registeredTool.inputSchema[key]) continue
       try {
-        tool.inputSchema[key]?.parse(value)
+        registeredTool.inputSchema[key]?.parse(value)
       } catch (error) {
         errors.push({
           field: key,
