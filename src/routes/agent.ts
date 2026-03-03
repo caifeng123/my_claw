@@ -1,8 +1,7 @@
 import { Hono } from 'hono'
-import { AgentEngine } from '../core/agent'
+import { agentEngine } from '../core/agent/index.js'
 
 const agentRouter = new Hono()
-const agentEngine = new AgentEngine()
 
 // 创建新会话
 agentRouter.post('/sessions', async (c) => {

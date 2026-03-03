@@ -7,6 +7,7 @@ import type {
   ToolValidationResult,
 } from '../types/tools'
 import { calculatorTool, timeTool } from '../tools/calculator';
+import { createTavilyTools } from '../tools/tavily-tools.js';
 
 export const DEFAULT_ALLOWED_TOOLS = [
   'Bash',
@@ -65,6 +66,8 @@ export class ToolManager {
    */
   async getTools() {
     CUSTOM_TOOLS.forEach(t => this.registerTool(t))
+    // 注册 Tavily 工具
+    createTavilyTools().forEach(t => this.registerTool(t))
     // 1. 注册内部工具
     const internalTools = Array.from(this.tools.values()).map((handler) => {
       return tool(
