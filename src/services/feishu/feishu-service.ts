@@ -144,13 +144,14 @@ export class FeishuService implements FeishuConnection {
         const chunks = this.splitAtParagraphs(processedText, CARD_MD_LIMIT);
         for (let i = 0; i < chunks.length; i++) {
           const chunk = chunks[i];
-          // 如果是第一个消息，可能作为新消息发送，后续消息作为回复
+          // 如果是第一个消息，作为新消息发送（如果有messageId则回复原消息）
+          // 后续消息也作为回复发送，保持消息的连续性
           if (i === 0) {
             await this.sendInteractiveCardMessage(chatId, chunk!, messageId, threadId);
           } else {
-            // 后续消息作为回复发送，但这里我们简单发送新消息，因为飞书回复链可能会很长
-            // 为了避免回复链过长，我们选择发送新消息
-            await this.sendInteractiveCardMessage(chatId, chunk!, undefined, threadId);
+            // 后续消息也回复原消息，确保在话题群中保持在话题内
+            // 对于话题群，threadId 会自动关联；对于普通群，保持回复关系
+            await this.sendInteractiveCardMessage(chatId, chunk!, messageId, threadId);
           }
         }
       }
@@ -396,8 +397,8 @@ private extractMessageContent(messageType: string, content: string, createTime: 
         const chunks = this.splitAtParagraphs(text, TEXT_MSG_LIMIT);
         for (let i = 0; i < chunks.length; i++) {
           const chunk = chunks[i];
-          // 第一条消息作为回复（如果有replyMessageId），否则作为新消息
-          if (i === 0 && replyMessageId) {
+          // 所有片段都作为回复发送（如果有replyMessageId），保持在话题群中的一致性
+          if (replyMessageId) {
             await this.client.im.message.reply({
               path: { message_id: replyMessageId },
               data: {
@@ -406,7 +407,7 @@ private extractMessageContent(messageType: string, content: string, createTime: 
               },
             });
           } else {
-            // 后续消息作为新消息发送
+            // 没有replyMessageId时，作为新消息发送
             await this.client.im.message.create({
               params: { receive_id_type: 'chat_id' },
               data: {
