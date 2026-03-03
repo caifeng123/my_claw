@@ -25,9 +25,9 @@ export class ClaudeEngine {
   }
 
   /**
-   * 发送消息给Claude并获取响应
+   * 发送消息给Claude并获取响应（支持自定义 systemPrompt）
    */
-  async sendMessage(messages: any[]): Promise<AgentResponse> {
+  async sendMessage(messages: any[], systemPrompt?: string): Promise<AgentResponse> {
     try {
       const { model, env } = this.config
       const toolsConfig = await this.toolManager.getTools()
@@ -53,7 +53,7 @@ export class ClaudeEngine {
         prompt: userQuery,
         options: {
           ...toolsConfig,
-          // systemPrompt: this.config.systemPrompt,
+          ...(systemPrompt ? { systemPrompt } : {}),
           model,
           settingSources: ['project'],
           cwd: process.cwd(),
@@ -103,11 +103,12 @@ export class ClaudeEngine {
   }
 
   /**
-   * 流式发送消息给Claude
+   * 流式发送消息给Claude（支持自定义 systemPrompt）
    */
   async sendMessageStream(
     messages: any[],
-    eventHandlers?: EventHandlers
+    eventHandlers?: EventHandlers,
+    systemPrompt?: string,
   ): Promise<string> {
     try {
       await eventHandlers?.onContentStart?.()
@@ -135,7 +136,7 @@ export class ClaudeEngine {
         prompt: userQuery,
         options: {
           ...toolsConfig,
-          // systemPrompt: this.config.systemPrompt,
+          ...(systemPrompt ? { systemPrompt } : {}),
           model,
           settingSources: ['project'],
           cwd: process.cwd(),
@@ -194,7 +195,6 @@ export class ClaudeEngine {
     const { model, env } = this.config
 
     const toolsConfig = await this.toolManager.getTools()
-    // const startTime = Date.now();
     try {
       const response = query({
         prompt: userQuery,
@@ -229,8 +229,22 @@ export class ClaudeEngine {
       return { result, resume };
     } catch (error) {
       throw new Error(`AI查询失败: ${error instanceof Error ? error.message : '未知错误'}`);
-    } finally {
-      // console.log(`Claude API调用耗时: ${(Date.now() - startTime) / 1000}s`);
     }
+  }
+
+  /**
+   * 压缩查询（专为 ContextBuilder 设计的轻量 LLM 调用）
+   */
+  public async compressQuery(params: {
+    systemPrompt: string
+    prompt: string
+    maxTokens: number
+  }): Promise<string> {
+    const { result } = await this.executeClaudeQueryRaw(
+      params.systemPrompt,
+      params.prompt,
+      { maxTokens: params.maxTokens } as any,
+    )
+    return result
   }
 }

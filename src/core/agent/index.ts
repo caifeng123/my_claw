@@ -1,36 +1,77 @@
-import type { SDKMessage } from '@anthropic-ai/claude-agent-sdk'
-import { ClaudeEngine } from './engine/claude-engine'
-import { ToolManager } from './engine/tool-manager'
-import { SessionManager } from './engine/session-manager'
-import { StreamHandler } from './handlers/stream-handler'
-import type{
+/**
+ * AgentEngine V4.1 - 智能分层记忆系统集成
+ * 集成 MemoryDB、ConversationStore、ContextBuilder、SystemPromptBuilder
+ */
+
+import { ClaudeEngine } from './engine/claude-engine.js'
+import { ToolManager } from './engine/tool-manager.js'
+import { SessionManager } from './engine/session-manager.js'
+import { StreamHandler } from './handlers/stream-handler.js'
+import { MemoryDB } from '../memory/memory-db.js'
+import { ConversationStore } from '../memory/conversation-store.js'
+import { SystemPromptBuilder } from './engine/system-prompt-builder.js'
+import { ContextBuilder } from './engine/context-builder.js'
+import { createMemoryTools } from './tools/memory-tools.js'
+import type {
   SessionConfig,
   AgentResponse,
   EventHandlers,
   SessionState
-} from './types/agent'
+} from './types/agent.js'
 
 interface SimpleMessage {
   role: 'user' | 'assistant'
   content: string
 }
+
 export class AgentEngine {
   private claudeEngine: ClaudeEngine
   private toolManager: ToolManager
   private sessionManager: SessionManager
   private streamHandler: StreamHandler
+  private memoryDb: MemoryDB
+  private conversationStore: ConversationStore
+  private contextBuilder: ContextBuilder
 
   constructor() {
+    // 1. 初始化记忆数据库（SQLite + FTS5）
+    this.memoryDb = new MemoryDB()
+
+    // 2. 初始化对话持久化
+    this.conversationStore = new ConversationStore()
+
+    // 3. 初始化 System Prompt 构建器（注入 MemoryDB）
+    const systemPromptBuilder = new SystemPromptBuilder(this.memoryDb)
+
+    // 4. 初始化上下文构建器
+    this.contextBuilder = new ContextBuilder(this.conversationStore, systemPromptBuilder)
+
+    // 5. 初始化 Claude 引擎
     this.claudeEngine = new ClaudeEngine()
+
+    // 6. 注入压缩查询函数（延迟注入，避免循环依赖）
+    this.contextBuilder.setCompressQuery(
+      this.claudeEngine.compressQuery.bind(this.claudeEngine)
+    )
+
+    // 7. 初始化工具管理器并注册记忆工具
     this.toolManager = new ToolManager()
-    this.sessionManager = new SessionManager()
+    const memoryTools = createMemoryTools(this.memoryDb)
+    this.toolManager.registerTools(memoryTools)
+    // 共享 ToolManager 给 ClaudeEngine
+    this.claudeEngine.toolManager = this.toolManager
+
+    // 8. 初始化会话管理器（注入 ConversationStore + ContextBuilder）
+    this.sessionManager = new SessionManager(this.conversationStore, this.contextBuilder)
+
+    // 9. 初始化流处理器
     this.streamHandler = new StreamHandler()
 
-    console.log('🤖 Agent引擎初始化完成')
+    console.log('🤖 Agent引擎 V4.1 初始化完成（智能分层记忆系统）')
   }
 
   /**
-   * 发送消息给Agent
+   * 发送消息给Agent（非流式）
    */
   async sendMessage(
     sessionId: string,
@@ -44,19 +85,33 @@ export class AgentEngine {
         session = this.sessionManager.createSession({ sessionId, userId })
       }
 
-      // 添加用户消息到会话
+      // 添加用户消息到会话（持久化到 JSONL）
       const userMessage: SimpleMessage = {
         role: 'user',
         content: message,
       }
       this.sessionManager.addMessage(sessionId, userMessage)
 
-      // 获取会话消息历史
-      const messages = this.sessionManager.getMessages(sessionId)
-      // 发送消息给Claude
-      const response = await this.claudeEngine.sendMessage(messages)
+      // 通过 ContextBuilder 构建上下文（FTS5 记忆检索 + 对话压缩）
+      const context = await this.sessionManager.buildContext(sessionId, message)
 
-      // 添加助手响应到会话
+      console.log(`📊 上下文构建完成 [session=${sessionId}]:`, {
+        systemPromptTokens: context.stats.systemPromptTokens,
+        summaryTokens: context.stats.summaryTokens,
+        recentTokens: context.stats.recentTokens,
+        totalTokens: context.stats.totalTokens,
+        compressionTriggered: context.stats.compressionTriggered,
+        totalRounds: context.stats.totalRounds,
+        recentRounds: context.stats.recentRounds,
+      })
+
+      // 发送消息给Claude（带 systemPrompt）
+      const response = await this.claudeEngine.sendMessage(
+        context.messages,
+        context.systemPrompt,
+      )
+
+      // 添加助手响应到会话（持久化）
       const assistantMessage: SimpleMessage = {
         role: 'assistant',
         content: response.content,
@@ -86,28 +141,36 @@ export class AgentEngine {
         session = this.sessionManager.createSession({ sessionId, userId })
       }
 
-      // 添加用户消息到会话
+      // 添加用户消息到会话（持久化到 JSONL）
       const userMessage: SimpleMessage = {
-        role: "user",
+        role: 'user',
         content: message,
       }
       this.sessionManager.addMessage(sessionId, userMessage)
 
-      // 获取会话消息历史
-      const messages = this.sessionManager.getMessages(sessionId)
+      // 通过 ContextBuilder 构建上下文
+      const context = await this.sessionManager.buildContext(sessionId, message)
+
+      console.log(`📊 上下文构建完成(流式) [session=${sessionId}]:`, {
+        systemPromptTokens: context.stats.systemPromptTokens,
+        compressionTriggered: context.stats.compressionTriggered,
+        totalRounds: context.stats.totalRounds,
+        recentRounds: context.stats.recentRounds,
+      })
 
       // 设置流式处理器
       if (eventHandlers) {
         this.streamHandler.setEventHandlers(eventHandlers)
       }
 
-      // 发送流式消息给Claude并获取响应内容
+      // 发送流式消息给Claude（带 systemPrompt）
       const responseContent = await this.claudeEngine.sendMessageStream(
-        messages,
-        eventHandlers || this.streamHandler.getEventHandlers()
+        context.messages,
+        eventHandlers || this.streamHandler.getEventHandlers(),
+        context.systemPrompt,
       )
 
-      // 添加助手响应到会话
+      // 添加助手响应到会话（持久化）
       const assistantMessage: SimpleMessage = {
         role: 'assistant',
         content: responseContent,
@@ -122,12 +185,23 @@ export class AgentEngine {
     }
   }
 
+  // ==================== 工具管理 ====================
+
   /**
    * 注册工具
    */
   registerTool(options: any): void {
     this.toolManager.registerTool(options)
   }
+
+  /**
+   * 获取所有工具名称
+   */
+  getToolNames(): string[] {
+    return this.toolManager.getToolNames()
+  }
+
+  // ==================== 会话管理 ====================
 
   /**
    * 创建会话
@@ -164,19 +238,7 @@ export class AgentEngine {
     return this.sessionManager.cleanupExpiredSessions(maxAge)
   }
 
-  /**
-   * 获取所有工具名称
-   */
-  getToolNames(): string[] {
-    return this.toolManager.getToolNames()
-  }
-
-  // /**
-  //  * 更新Agent配置
-  //  */
-  // updateConfig(c): void {
-  //   this.claudeEngine.updateConfig(config)
-  // }
+  // ==================== 事件处理 ====================
 
   /**
    * 设置流式事件处理器
@@ -199,66 +261,20 @@ export class AgentEngine {
     return this.streamHandler.createHTTPStreamHandler(write)
   }
 
-  // --- 记忆集成功能 ---
+  // ==================== 记忆系统 ====================
 
   /**
-   * 获取用户全局记忆
+   * 获取 MemoryDB 实例（供外部使用，如 CLI、路由）
    */
-  getUserGlobalMemory(userId: string): string | null {
-    return this.sessionManager.getUserGlobalMemory(userId)
+  getMemoryDb(): MemoryDB {
+    return this.memoryDb
   }
 
   /**
-   * 更新用户全局记忆
+   * 获取 ConversationStore 实例
    */
-  updateUserGlobalMemory(userId: string, content: string): boolean {
-    return this.sessionManager.updateUserGlobalMemory(userId, content)
-  }
-
-  /**
-   * 获取项目记忆
-   */
-  getProjectMemory(): string | null {
-    return this.sessionManager.getProjectMemory()
-  }
-
-  /**
-   * 更新项目记忆
-   */
-  updateProjectMemory(content: string): boolean {
-    return this.sessionManager.updateProjectMemory(content)
-  }
-
-  /**
-   * 搜索相关记忆
-   */
-  searchRelevantMemories(query: string, scope?: 'session' | 'user-global' | 'project', limit: number = 5): any[] {
-    return this.sessionManager.searchRelevantMemories(query, scope, limit)
-  }
-
-  /**
-   * 获取会话记忆内容
-   */
-  getSessionMemory(sessionId: string): string | null {
-    const session = this.sessionManager.getSession(sessionId)
-    if (!session) return null
-
-    // 这里可以返回会话的记忆内容，或者从文件系统加载
-    // 目前返回空，后续可以扩展
-    return null
-  }
-
-  /**
-   * 保存会话记忆
-   */
-  saveSessionMemory(sessionId: string): boolean {
-    const session = this.sessionManager.getSession(sessionId)
-    if (!session) return false
-
-    // 调用SessionManager的内部方法保存记忆
-    // 注意：这里需要访问SessionManager的私有方法，可能需要调整
-    // 目前返回false，后续可以扩展
-    return false
+  getConversationStore(): ConversationStore {
+    return this.conversationStore
   }
 }
 

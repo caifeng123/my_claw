@@ -3,10 +3,9 @@ import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { logger } from 'hono/logger'
 import { existsSync, readFileSync, unlinkSync } from 'fs'
-import agentRouter from './routes/agent'
+import agentRouter from './routes/agent.js'
 import feishuRouter from './routes/feishu.js'
 import memoryRouter from './routes/memory.js'
-import { agentEngine } from './core/agent'
 import { getFeishuConfig, validateFeishuConfig } from './config/feishu.js'
 import { startDefaultFeishuBridge, stopDefaultFeishuBridge, getDefaultFeishuAgentBridge } from './services/feishu/feishu-agent-bridge.js'
 
@@ -73,7 +72,6 @@ app.use('*', cors())
 app.get('/', (c) => {
   return c.json({
     message: 'cf_claw API Server',
-    version: '0.1.0',
     status: 'running'
   })
 })

@@ -1,0 +1,266 @@
+/**
+ * ConversationStore - JSONL 对话历史持久化
+ * V4.1 - 支持 rotate、按 token 预算加载、摘要缓存
+ */
+
+import * as fs from 'node:fs'
+import * as path from 'node:path'
+import { MEMORY_CONFIG, estimateTokens } from './config.js'
+
+// ==================== 类型定义 ====================
+
+export interface ConversationEntry {
+  ts: number
+  role: 'user' | 'assistant' | 'system'
+  content: string
+  session_id: string
+  token_est: number
+}
+
+export interface CompressedSummary {
+  session_id: string
+  summary: string
+  covered_until_index: number
+  covered_until_ts: number
+  summary_tokens: number
+  original_tokens: number
+  compression_ratio: number
+  version: number
+  created_at: string
+}
+
+export interface LoadByBudgetResult {
+  entries: ConversationEntry[]
+  truncated: boolean
+  totalRounds: number
+  loadedRounds: number
+}
+
+// ==================== ConversationStore ====================
+
+export class ConversationStore {
+  private basePath: string
+
+  constructor(basePath: string = MEMORY_CONFIG.CONVERSATIONS_PATH) {
+    this.basePath = basePath
+    if (!fs.existsSync(basePath)) {
+      fs.mkdirSync(basePath, { recursive: true })
+    }
+    console.log(`💬 ConversationStore 初始化完成: ${basePath}`)
+  }
+
+  // ==================== 写入 ====================
+
+  /**
+   * 追加一条对话记录
+   */
+  append(sessionId: string, role: 'user' | 'assistant' | 'system', content: string): ConversationEntry {
+    const filePath = this.getFilePath(sessionId)
+    const entry: ConversationEntry = {
+      ts: Date.now(),
+      role,
+      content,
+      session_id: sessionId,
+      token_est: estimateTokens(content),
+    }
+
+    // 检查是否需要 rotate
+    this.rotateIfNeeded(filePath)
+
+    // 确保目录存在
+    const dir = path.dirname(filePath)
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true })
+    }
+
+    fs.appendFileSync(filePath, JSON.stringify(entry) + '\n', 'utf-8')
+    return entry
+  }
+
+  // ==================== 读取 ====================
+
+  /**
+   * 同步加载全部对话历史
+   */
+  loadSync(sessionId: string): ConversationEntry[] {
+    const filePath = this.getFilePath(sessionId)
+    if (!fs.existsSync(filePath)) return []
+
+    const content = fs.readFileSync(filePath, 'utf-8')
+    const entries: ConversationEntry[] = []
+
+    for (const line of content.split('\n')) {
+      if (!line.trim()) continue
+      try {
+        entries.push(JSON.parse(line) as ConversationEntry)
+      } catch {
+        // 跳过损坏行
+        console.warn(`⚠️ 跳过损坏的对话记录行: ${line.slice(0, 50)}...`)
+      }
+    }
+
+    return entries
+  }
+
+  /**
+   * 加载最近 N 条记录
+   */
+  loadRecent(sessionId: string, count: number): ConversationEntry[] {
+    const all = this.loadSync(sessionId)
+    return all.slice(-count)
+  }
+
+  /**
+   * 按 token 预算加载（从后往前填满）
+   */
+  loadByTokenBudget(sessionId: string, budget: number): LoadByBudgetResult {
+    const all = this.loadSync(sessionId)
+    const selected: ConversationEntry[] = []
+    let usedTokens = 0
+
+    for (let i = all.length - 1; i >= 0; i--) {
+      const entry = all[i]!
+      const tokens = entry.token_est || estimateTokens(entry.content)
+      if (usedTokens + tokens > budget && selected.length > 0) break
+      selected.unshift(entry)
+      usedTokens += tokens
+    }
+
+    // 计算轮次（一个 user + assistant 为一轮）
+    const totalRounds = Math.ceil(all.filter(e => e.role === 'user').length)
+    const loadedRounds = Math.ceil(selected.filter(e => e.role === 'user').length)
+
+    return {
+      entries: selected,
+      truncated: selected.length < all.length,
+      totalRounds,
+      loadedRounds,
+    }
+  }
+
+  // ==================== 会话管理 ====================
+
+  /**
+   * 删除会话（包括摘要缓存）
+   */
+  deleteSession(sessionId: string): void {
+    const filePath = this.getFilePath(sessionId)
+    const summaryPath = this.getSummaryPath(sessionId)
+
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath)
+    if (fs.existsSync(summaryPath)) fs.unlinkSync(summaryPath)
+
+    // 删除旧 rotate 文件
+    for (let i = 1; i <= MEMORY_CONFIG.CONVERSATION.MAX_ROTATED_FILES; i++) {
+      const rotatedPath = `${filePath}.${i}`
+      if (fs.existsSync(rotatedPath)) fs.unlinkSync(rotatedPath)
+    }
+
+    console.log(`🗑️ 已删除会话: ${sessionId}`)
+  }
+
+  /**
+   * 列出所有会话 ID
+   */
+  listSessions(): string[] {
+    if (!fs.existsSync(this.basePath)) return []
+
+    return fs.readdirSync(this.basePath)
+      .filter(f => f.endsWith('.jsonl'))
+      .map(f => this.fileNameToSessionId(f))
+  }
+
+  // ==================== 摘要缓存 ====================
+
+  /**
+   * 加载摘要缓存
+   */
+  loadSummaryCache(sessionId: string): CompressedSummary | null {
+    const summaryPath = this.getSummaryPath(sessionId)
+    if (!fs.existsSync(summaryPath)) return null
+
+    try {
+      const content = fs.readFileSync(summaryPath, 'utf-8')
+      return JSON.parse(content) as CompressedSummary
+    } catch {
+      // 缓存损坏，删除
+      console.warn(`⚠️ 摘要缓存损坏，已删除: ${summaryPath}`)
+      fs.unlinkSync(summaryPath)
+      return null
+    }
+  }
+
+  /**
+   * 保存摘要缓存
+   */
+  saveSummaryCache(sessionId: string, summary: CompressedSummary): void {
+    const summaryPath = this.getSummaryPath(sessionId)
+    const dir = path.dirname(summaryPath)
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true })
+    }
+    fs.writeFileSync(summaryPath, JSON.stringify(summary, null, 2), 'utf-8')
+  }
+
+  // ==================== 内部方法 ====================
+
+  /**
+   * 获取对话文件路径
+   */
+  private getFilePath(sessionId: string): string {
+    const safeId = this.sanitizeSessionId(sessionId)
+    return path.join(this.basePath, `${safeId}.jsonl`)
+  }
+
+  /**
+   * 获取摘要缓存路径
+   */
+  private getSummaryPath(sessionId: string): string {
+    const safeId = this.sanitizeSessionId(sessionId)
+    return path.join(this.basePath, `${safeId}.summary.json`)
+  }
+
+  /**
+   * 安全化 session ID（去除特殊字符）
+   */
+  private sanitizeSessionId(sessionId: string): string {
+    return sessionId.replace(/[^a-zA-Z0-9_\-:]/g, '_')
+  }
+
+  /**
+   * 文件名还原为 session ID
+   */
+  private fileNameToSessionId(fileName: string): string {
+    return fileName.replace(/\.jsonl$/, '')
+  }
+
+  /**
+   * 文件 rotate：超过大小限制时归档
+   */
+  private rotateIfNeeded(filePath: string): void {
+    if (!fs.existsSync(filePath)) return
+
+    const stat = fs.statSync(filePath)
+    if (stat.size <= MEMORY_CONFIG.CONVERSATION.MAX_FILE_SIZE) return
+
+    // 删除最旧的归档文件
+    const maxRotated = MEMORY_CONFIG.CONVERSATION.MAX_ROTATED_FILES
+    const oldestPath = `${filePath}.${maxRotated}`
+    if (fs.existsSync(oldestPath)) {
+      fs.unlinkSync(oldestPath)
+    }
+
+    // 依次重命名归档文件
+    for (let i = maxRotated - 1; i >= 1; i--) {
+      const from = `${filePath}.${i}`
+      const to = `${filePath}.${i + 1}`
+      if (fs.existsSync(from)) {
+        fs.renameSync(from, to)
+      }
+    }
+
+    // 当前文件归档为 .1
+    fs.renameSync(filePath, `${filePath}.1`)
+    console.log(`📦 对话文件已归档: ${filePath}.1`)
+  }
+}

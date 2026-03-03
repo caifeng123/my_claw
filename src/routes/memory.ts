@@ -1,252 +1,152 @@
-// 记忆管理路由
+/**
+ * 记忆管理路由 V4.1
+ * 新增 SQLite MemoryDB 路由，保留旧文件路由向后兼容
+ */
 
 import { Hono } from 'hono';
 import { z } from 'zod';
-import { MemoryManager } from '../core/memory/memory-manager.js';
-import { MemorySearcher } from '../core/memory/memory-searcher.js';
+import { agentEngine } from '../core/agent/index.js';
 
 const memoryRoutes = new Hono();
-const memoryManager = new MemoryManager();
-const memorySearcher = new MemorySearcher(memoryManager);
 
-// 请求验证模式
-const MemoryFileSchema = z.object({
-  path: z.string().min(1),
-  content: z.string(),
-});
+// ==================== V4.1 新路由：MemoryDB (SQLite + FTS5) ====================
 
-const MemoryGlobalSchema = z.object({
-  content: z.string(),
-});
-
-const MemorySearchSchema = z.object({
-  q: z.string().min(1),
-  limit: z.number().min(1).max(200).optional(),
-  scope: z.enum(['session', 'user-global', 'project']).optional(),
-});
-
-// --- 路由实现 ---
-
-// 获取记忆源列表
-memoryRoutes.get('/sources', (c) => {
-  try {
-    const sources = memoryManager.listMemorySources();
-    return c.json({ sources });
-  } catch (err) {
-    console.error('Failed to list memory sources:', err);
-    return c.json({ error: 'Failed to list memory sources' }, 500);
-  }
-});
-
-// 搜索记忆
-memoryRoutes.get('/search', (c) => {
+// 搜索记忆（FTS5）
+memoryRoutes.get('/v2/search', (c) => {
   const query = c.req.query('q');
   const limitRaw = Number(c.req.query('limit'));
-  const scope = c.req.query('scope') as any;
+  const cat = c.req.query('cat');
 
   if (!query || !query.trim()) {
     return c.json({ error: 'Missing search query' }, 400);
   }
 
-  const limit = Number.isFinite(limitRaw) ? limitRaw : undefined;
+  const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? limitRaw : 20;
 
   try {
-    const hits = memorySearcher.searchMemorySources({
-      keyword: query,
-      limit,
-      scope,
-    });
-    return c.json({ hits });
+    const memoryDb = agentEngine.getMemoryDb();
+    let results = memoryDb.search(query, limit);
+    if (cat) {
+      results = results.filter(r => r.cat === cat);
+    }
+    return c.json({ results, total: results.length });
   } catch (err) {
-    console.error('Failed to search memory sources:', err);
-    return c.json({ error: 'Failed to search memory sources' }, 500);
+    console.error('Failed to search memories:', err);
+    return c.json({ error: 'Failed to search memories' }, 500);
   }
 });
 
-// 高级搜索
-memoryRoutes.post('/search/advanced', async (c) => {
+// 获取记忆统计
+memoryRoutes.get('/v2/stats', (c) => {
+  try {
+    const memoryDb = agentEngine.getMemoryDb();
+    const stats = memoryDb.getStats();
+    return c.json(stats);
+  } catch (err) {
+    console.error('Failed to get memory stats:', err);
+    return c.json({ error: 'Failed to get memory stats' }, 500);
+  }
+});
+
+// 列出记忆
+memoryRoutes.get('/v2/list', (c) => {
+  const cat = c.req.query('cat');
+  const source = c.req.query('source');
+  const limitRaw = Number(c.req.query('limit'));
+  const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? limitRaw : 50;
+
+  try {
+    const memoryDb = agentEngine.getMemoryDb();
+    let entries;
+    if (cat) {
+      entries = memoryDb.getByCategory(cat, limit);
+    } else if (source) {
+      entries = memoryDb.getBySource(source, limit);
+    } else {
+      entries = memoryDb.getTopMemories(limit);
+    }
+    return c.json({ entries, total: entries.length });
+  } catch (err) {
+    console.error('Failed to list memories:', err);
+    return c.json({ error: 'Failed to list memories' }, 500);
+  }
+});
+
+// 添加记忆
+memoryRoutes.post('/v2/add', async (c) => {
   try {
     const body = await c.req.json();
-    const { keywords, operator, scope, limit } = body;
+    const { text, cat, imp, source } = body;
 
-    if (!keywords || !Array.isArray(keywords) || keywords.length === 0) {
-      return c.json({ error: 'Missing or invalid keywords' }, 400);
+    if (!text || !cat || imp === undefined) {
+      return c.json({ error: 'Missing required fields: text, cat, imp' }, 400);
     }
 
-    const hits = await memorySearcher.advancedSearch({
-      keywords,
-      operator: operator || 'AND',
-      scope,
-      limit,
-    });
-
-    return c.json({ hits });
+    const memoryDb = agentEngine.getMemoryDb();
+    const result = memoryDb.insert({ text, cat, imp, source: source || 'USER' });
+    return c.json({ result, message: `Memory ${result}` });
   } catch (err) {
-    console.error('Failed to perform advanced search:', err);
-    return c.json({ error: 'Failed to perform advanced search' }, 500);
+    console.error('Failed to add memory:', err);
+    return c.json({ error: 'Failed to add memory' }, 500);
   }
 });
 
-// 读取记忆文件
-memoryRoutes.get('/file', (c) => {
-  const filePath = c.req.query('path');
-  if (!filePath) {
-    return c.json({ error: 'Missing file path' }, 400);
+// 删除记忆
+memoryRoutes.delete('/v2/:id', (c) => {
+  const id = parseInt(c.req.param('id'));
+  if (isNaN(id)) {
+    return c.json({ error: 'Invalid memory ID' }, 400);
   }
 
   try {
-    const payload = memoryManager.readMemoryFile(filePath);
-    return c.json(payload);
+    const memoryDb = agentEngine.getMemoryDb();
+    memoryDb.deleteById(id);
+    return c.json({ success: true, message: `Memory ${id} deleted` });
   } catch (err) {
-    const message = err instanceof Error ? err.message : 'Failed to read memory file';
-    const status = message.includes('not found') ? 404 : 400;
-    return c.json({ error: message }, status);
+    console.error('Failed to delete memory:', err);
+    return c.json({ error: 'Failed to delete memory' }, 500);
   }
 });
 
-// 写入记忆文件
-memoryRoutes.put('/file', async (c) => {
+// 手动触发淘汰
+memoryRoutes.post('/v2/compact', (c) => {
   try {
-    const body = await c.req.json();
-    const validation = MemoryFileSchema.safeParse(body);
-
-    if (!validation.success) {
-      return c.json(
-        { error: 'Invalid request body', details: validation.error.format() },
-        400,
-      );
-    }
-
-    const { path: filePath, content } = validation.data;
-    const payload = memoryManager.writeMemoryFile(filePath, content);
-    return c.json(payload);
+    const memoryDb = agentEngine.getMemoryDb();
+    const deleted = memoryDb.compact();
+    return c.json({ deleted, message: `Compacted: ${deleted} entries removed` });
   } catch (err) {
-    const message = err instanceof Error ? err.message : 'Failed to write memory file';
-    return c.json({ error: message }, 400);
+    console.error('Failed to compact memories:', err);
+    return c.json({ error: 'Failed to compact memories' }, 500);
   }
 });
 
-// 获取用户全局记忆
-memoryRoutes.get('/global', (c) => {
+// ==================== 对话历史路由 ====================
+
+// 列出所有会话
+memoryRoutes.get('/v2/sessions', (c) => {
   try {
-    const userGlobalPath = 'memory/user-global/CLAUDE.md';
-    const payload = memoryManager.readMemoryFile(userGlobalPath);
-    return c.json(payload);
+    const store = agentEngine.getConversationStore();
+    const sessions = store.listSessions();
+    return c.json({ sessions, total: sessions.length });
   } catch (err) {
-    console.error('Failed to read user global memory:', err);
-    return c.json({ error: 'Failed to read global memory' }, 500);
+    console.error('Failed to list sessions:', err);
+    return c.json({ error: 'Failed to list sessions' }, 500);
   }
 });
 
-// 更新用户全局记忆
-memoryRoutes.put('/global', async (c) => {
-  try {
-    const body = await c.req.json();
-    const validation = MemoryGlobalSchema.safeParse(body);
-
-    if (!validation.success) {
-      return c.json(
-        { error: 'Invalid request body', details: validation.error.format() },
-        400,
-      );
-    }
-
-    const { content } = validation.data;
-    const config = memoryManager.getConfig();
-
-    if (Buffer.byteLength(content, 'utf-8') > config.maxGlobalMemoryLength) {
-      return c.json({ error: 'Global memory is too large' }, 400);
-    }
-
-    const userGlobalPath = 'memory/user-global/CLAUDE.md';
-    const payload = memoryManager.writeMemoryFile(userGlobalPath, content);
-    return c.json(payload);
-  } catch (err) {
-    const message = err instanceof Error ? err.message : 'Failed to write global memory';
-    console.error('Failed to write user global memory:', err);
-    return c.json({ error: message }, 400);
-  }
-});
-
-// 获取项目记忆
-memoryRoutes.get('/project', (c) => {
-  try {
-    const projectPath = 'memory/project/CLAUDE.md';
-    const payload = memoryManager.readMemoryFile(projectPath);
-    return c.json(payload);
-  } catch (err) {
-    console.error('Failed to read project memory:', err);
-    return c.json({ error: 'Failed to read project memory' }, 500);
-  }
-});
-
-// 更新项目记忆
-memoryRoutes.put('/project', async (c) => {
-  try {
-    const body = await c.req.json();
-    const validation = MemoryFileSchema.safeParse(body);
-
-    if (!validation.success) {
-      return c.json(
-        { error: 'Invalid request body', details: validation.error.format() },
-        400,
-      );
-    }
-
-    const { content } = validation.data;
-    const projectPath = 'memory/project/CLAUDE.md';
-    const payload = memoryManager.writeMemoryFile(projectPath, content);
-    return c.json(payload);
-  } catch (err) {
-    const message = err instanceof Error ? err.message : 'Failed to write project memory';
-    console.error('Failed to write project memory:', err);
-    return c.json({ error: message }, 400);
-  }
-});
-
-// 获取会话记忆
-memoryRoutes.get('/session/:sessionId', (c) => {
+// 获取会话对话历史
+memoryRoutes.get('/v2/sessions/:sessionId', (c) => {
   const sessionId = c.req.param('sessionId');
-  if (!sessionId) {
-    return c.json({ error: 'Missing session ID' }, 400);
-  }
+  const limitRaw = Number(c.req.query('limit'));
+  const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? limitRaw : 50;
 
   try {
-    const sessionPath = `sessions/${sessionId}/CLAUDE.md`;
-    const payload = memoryManager.readMemoryFile(sessionPath);
-    return c.json(payload);
+    const store = agentEngine.getConversationStore();
+    const entries = store.loadRecent(sessionId, limit);
+    return c.json({ entries, total: entries.length });
   } catch (err) {
-    const message = err instanceof Error ? err.message : 'Failed to read session memory';
-    const status = message.includes('not found') ? 404 : 400;
-    return c.json({ error: message }, status);
-  }
-});
-
-// 更新会话记忆
-memoryRoutes.put('/session/:sessionId', async (c) => {
-  const sessionId = c.req.param('sessionId');
-  if (!sessionId) {
-    return c.json({ error: 'Missing session ID' }, 400);
-  }
-
-  try {
-    const body = await c.req.json();
-    const validation = MemoryFileSchema.safeParse(body);
-
-    if (!validation.success) {
-      return c.json(
-        { error: 'Invalid request body', details: validation.error.format() },
-        400,
-      );
-    }
-
-    const { content } = validation.data;
-    const sessionPath = `sessions/${sessionId}/CLAUDE.md`;
-    const payload = memoryManager.writeMemoryFile(sessionPath, content);
-    return c.json(payload);
-  } catch (err) {
-    const message = err instanceof Error ? err.message : 'Failed to write session memory';
-    return c.json({ error: message }, 400);
+    console.error('Failed to get session history:', err);
+    return c.json({ error: 'Failed to get session history' }, 500);
   }
 });
 

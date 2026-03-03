@@ -1,6 +1,6 @@
 {
   "name": "cf_claw",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A single-user AI Agent system based on Claude Agent SDK with layered memory and Feishu integration",
   "module": "src/index.ts",
   "type": "module",
@@ -10,14 +10,22 @@
     "start": "tsx src/index.ts",
     "build": "tsc src/index.ts --outdir dist",
     "launcher": "tsx scripts/launcher.ts",
-    "launcher:debug": "DEBUG=1 tsx scripts/launcher.ts"
+    "launcher:debug": "DEBUG=1 tsx scripts/launcher.ts",
+    "memory": "tsx scripts/memory-cli.ts",
+    "memory:list": "tsx scripts/memory-cli.ts list",
+    "memory:search": "tsx scripts/memory-cli.ts search",
+    "memory:stats": "tsx scripts/memory-cli.ts stats",
+    "memory:dump": "tsx scripts/memory-cli.ts dump"
   },
   "devDependencies": {
-    "tsx": "^4.21.0"
+    "@types/better-sqlite3": "^7.6.8",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.2.62",
     "@larksuiteoapi/node-sdk": "^1.59.0",
+    "better-sqlite3": "9.6.0",
     "dotenv": "^17.3.1",
     "hono": "^4.12.3",
     "mime": "^4.1.0",
