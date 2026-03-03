@@ -158,7 +158,7 @@ export class ClaudeEngine {
           if (assistantContent) {
             // content 可能是数组格式，需要提取文本
             const textContent = Array.isArray(assistantContent)
-              ? assistantContent.filter(c => c.type === 'text').map(c => c.text).join('')
+              ? assistantContent.filter(c => c.type === 'text' || c.type === 'thinking').map(c => c.text || c.thinking).join('')
               : String(assistantContent)
             lastAssistantContent = textContent
             console.log('Assistant message:', assistantContent)
