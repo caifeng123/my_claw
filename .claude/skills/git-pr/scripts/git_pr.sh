@@ -4,11 +4,12 @@
 # Local branch stays untouched. No checkout, no local branch creation.
 #
 # Usage:
-#   bash git_pr.sh [--target <branch>] [--message <commit_msg>]
+#   bash git_pr.sh [--target <branch>] [--message <commit_msg>] [--analyze-only]
 #
 # Options:
-#   --target   Target branch (optional, auto-detects main/master)
-#   --message  Commit message (optional, auto-generated from diff)
+#   --target       Target branch (optional, auto-detects main/master)
+#   --message      Commit message (optional, auto-generated from diff)
+#   --analyze-only Only analyze changes and output diff files, don't commit/push
 #
 set -euo pipefail
 
@@ -21,11 +22,13 @@ ok()    { echo "[OK] $*"; }
 # ========== Argument parsing ==========
 TARGET_BRANCH=""
 COMMIT_MSG=""
+ANALYZE_ONLY=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --target)  TARGET_BRANCH="$2"; shift 2 ;;
-        --message) COMMIT_MSG="$2"; shift 2 ;;
+        --target)       TARGET_BRANCH="$2"; shift 2 ;;
+        --message)      COMMIT_MSG="$2"; shift 2 ;;
+        --analyze-only) ANALYZE_ONLY=true; shift ;;
         *) error "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -123,37 +126,19 @@ else
     info "Changes: $STAGED_COUNT staged, $UNSTAGED_COUNT unstaged, $UNTRACKED_COUNT untracked"
 fi
 
-# ========== Stage and commit (on current branch) ==========
+# ========== Stage changes (for diff generation) ==========
 
 if [[ "$TOTAL_CHANGES" -gt 0 ]]; then
     git add -A
 fi
 
-# Generate diff BEFORE committing (from staged changes)
+# ========== Generate diff ==========
 DIFF_OUTPUT=""
 DIFF_DETAIL=""
 
 if [[ "$TOTAL_CHANGES" -gt 0 ]]; then
     DIFF_OUTPUT=$(git diff --cached --stat 2>/dev/null || echo "")
     DIFF_DETAIL=$(git diff --cached 2>/dev/null || echo "")
-fi
-
-# Smart commit message
-if [[ -z "$COMMIT_MSG" ]]; then
-    TOP_DIR=$(echo "$DIFF_OUTPUT" | head -20 | grep -oE '^ [^ ]+' | sed 's|^ ||' | \
-        awk -F'/' '{if(NF>1) print $1; else print "(root)"}' | \
-        sort | uniq -c | sort -rn | head -1 | awk '{print $2}' || echo "")
-    FILE_COUNT=$(echo "$DIFF_OUTPUT" | tail -1 | grep -oE '[0-9]+ file' | grep -oE '[0-9]+' || echo "several")
-
-    if [[ -n "$TOP_DIR" && "$TOP_DIR" != "(root)" ]]; then
-        COMMIT_MSG="auto: update ${TOP_DIR} (${FILE_COUNT} file(s)) via git-pr"
-    else
-        COMMIT_MSG="auto: update ${FILE_COUNT} file(s) via git-pr"
-    fi
-fi
-
-if [[ "$TOTAL_CHANGES" -gt 0 ]]; then
-    git commit -m "$COMMIT_MSG"
 fi
 
 # Fallback diff for unpushed-commits-only case
@@ -163,6 +148,54 @@ if [[ -z "$DIFF_OUTPUT" ]]; then
 fi
 
 CHANGED_FILES=$(echo "$DIFF_OUTPUT" | head -30)
+
+# ========== Analyze-only mode (Phase 1) ==========
+if [[ "$ANALYZE_ONLY" == true ]]; then
+    info "Analyze-only mode: collecting diff for AI analysis..."
+
+    # Save diff files
+    MAX_DIFF_LINES=50000
+    DIFF_FILE=$(mktemp /tmp/git_pr_diff_XXXXXX.txt)
+    echo "$DIFF_DETAIL" | head -"$MAX_DIFF_LINES" > "$DIFF_FILE"
+
+    STAT_FILE=$(mktemp /tmp/git_pr_stat_XXXXXX.txt)
+    echo "$DIFF_OUTPUT" > "$STAT_FILE"
+
+    DIFF_LINES=$(echo "$DIFF_DETAIL" | wc -l | tr -d ' ')
+    if [[ "$DIFF_LINES" -gt "$MAX_DIFF_LINES" ]]; then
+        info "Diff truncated: $DIFF_LINES lines -> $MAX_DIFF_LINES lines"
+        echo "" >> "$DIFF_FILE"
+        echo "... (truncated, $DIFF_LINES total lines)" >> "$DIFF_FILE"
+    fi
+
+    # Output structured data for AI to parse
+    echo ""
+    echo "============================================"
+    echo "  GIT-PR ANALYSIS RESULT"
+    echo "============================================"
+    echo ""
+    echo "MODE=analyze"
+    echo "DIFF_FILE=$DIFF_FILE"
+    echo "STAT_FILE=$STAT_FILE"
+    echo "TARGET_BRANCH=$TARGET_BRANCH"
+    echo "PLATFORM=$PLATFORM"
+    echo "CHANGES_INFO=$CHANGED_FILES"
+    echo ""
+    echo "============================================"
+    echo ""
+    info "Please analyze the diff files and provide a commit message with --message option."
+    exit 0
+fi
+
+# ========== Commit (Phase 2) ==========
+
+if [[ "$TOTAL_CHANGES" -gt 0 ]]; then
+    if [[ -z "$COMMIT_MSG" ]]; then
+        error "Commit message required. Use --message option or run with --analyze-only first."
+        exit 1
+    fi
+    git commit -m "$COMMIT_MSG"
+fi
 
 # ========== Push to NEW remote branch (local branch stays) ==========
 

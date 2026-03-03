@@ -45,34 +45,70 @@ Push uses the default remote transport (typically key-based auth). `gh`/`glab` C
 
 ## Workflow
 
-1. Run `scripts/git_pr.sh` in the user's repo directory
-2. Read the diff output files produced by the script
-3. Generate a professional PR/MR title and summary based on the diff
-4. Present the PR/MR link and summary to the user
-5. Update PR/MR title and description with the AI-generated content
+This skill uses a **two-phase workflow** to ensure semantic commit messages:
 
-### Step 1: Execute the Script
+**Phase 1 (Analyze)**: Collect diff → AI generates commit message
+**Phase 2 (Execute)**: Commit with AI message → Push → Create PR → Update PR description
 
-Run the script from the user's current working directory (must be inside a git repo):
+### Step 1: Phase 1 - Analyze Changes
+
+Run the script with `--analyze-only` flag to collect changes without committing:
 
 ```bash
-bash {SKILL_PATH}/scripts/git_pr.sh
+bash {SKILL_PATH}/scripts/git_pr.sh --analyze-only
 ```
 
-Optional parameters:
-- `--target <branch>`: Override target branch (default: auto-detect main/master)
-- `--message <msg>`: Override commit message (default: auto-generated)
-
-The script outputs structured key-value pairs. Parse these from the output:
-- `PLATFORM`: "github" or "gitlab"
-- `PR_URL`: The created PR/MR link
-- `PR_NUMBER`: The PR/MR number (for updating title/description later)
-- `NEW_BRANCH`: The new branch name (auto-pr-{timestamp})
-- `TARGET_BRANCH`: The target branch
+The script outputs structured key-value pairs:
+- `MODE`: "analyze" (indicates Phase 1)
 - `DIFF_FILE`: Path to temp file with full diff content
 - `STAT_FILE`: Path to temp file with diff stats
+- `TARGET_BRANCH`: The target branch (main/master)
+- `PLATFORM`: "github" or "gitlab"
+- `CHANGES_INFO`: Summary of changed files
 
-### Step 2: Read Diff and Generate Title + Summary
+### Step 2: Read Diff and Generate Commit Message
+
+Read `DIFF_FILE` and `STAT_FILE` to generate a **Conventional Commits** style message:
+
+```
+<type>(<scope>): <short description>
+```
+
+Rules:
+- `type`: feat / fix / refactor / docs / style / test / chore / build / ci / perf
+- `scope`: the primary module, directory, or component affected (optional but preferred)
+- `short description`: imperative mood, lowercase, no period, max 72 chars
+
+Examples:
+- `feat(auth): add JWT token validation middleware`
+- `fix(api): resolve timeout on large payload requests`
+- `refactor(memory): migrate to SQLite FTS5 for persistent storage`
+- `docs(readme): update installation instructions for Linux`
+
+### Step 3: Phase 2 - Execute with Commit Message
+
+Run the script again with the generated commit message:
+
+```bash
+bash {SKILL_PATH}/scripts/git_pr.sh --message "<GENERATED_COMMIT_MESSAGE>"
+```
+
+The script will:
+1. Commit changes with the provided message
+2. Push to a new remote branch (auto-pr-{timestamp})
+3. Create PR/MR
+4. Output the PR URL and metadata
+
+Parse these outputs:
+- `PLATFORM`: "github" or "gitlab"
+- `PR_URL`: The created PR/MR link
+- `PR_NUMBER`: The PR/MR number (for updating description later)
+- `NEW_BRANCH`: The new branch name
+- `TARGET_BRANCH`: The target branch
+- `DIFF_FILE`: Path to temp file with diff (re-use from Phase 1 or regenerate)
+- `STAT_FILE`: Path to temp file with stats
+
+### Step 4: Generate PR Summary
 
 After the script succeeds, read `DIFF_FILE` and `STAT_FILE` to generate BOTH a title and a summary.
 
@@ -128,7 +164,7 @@ Guidelines for summary generation:
 - If diff is too large (>500 lines), summarize by module rather than by file
 - If diff was truncated (indicated by "truncated" in the file), note this in the summary
 
-### Step 3: Present Results to User
+### Step 5: Present Results to User
 
 Return to the user:
 
@@ -136,7 +172,7 @@ Return to the user:
 2. **Title** — the generated Conventional Commits title
 3. **Summary** — the generated summary from Step 2
 
-### Step 4: Update PR Title and Description (CRITICAL - must execute automatically)
+### Step 6: Update PR Title and Description (CRITICAL - must execute automatically)
 
 After presenting to the user, **automatically update BOTH the PR/MR title and description**.
 
@@ -162,7 +198,7 @@ IMPORTANT rules for this step:
 - If the update fails, still return the link and summary to the user, and append a note:
   "Note: PR title/description auto-update failed. You can manually update it with the content above."
 
-### Step 5: Cleanup
+### Step 7: Cleanup
 
 After reading DIFF_FILE and STAT_FILE, clean up the temp files:
 
