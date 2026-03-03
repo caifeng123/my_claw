@@ -13,9 +13,7 @@ dist
 coverage
 *.lcov
 
-data/memory.db*
-data/conversations/*.jsonl
-data/conversations/*.json
+data/*
 !data/.gitkeep
 !data/conversations/.gitkeep
 !data/README.md
