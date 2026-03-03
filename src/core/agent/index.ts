@@ -1,6 +1,6 @@
 /**
- * AgentEngine V4.1 - 智能分层记忆系统集成
- * 集成 MemoryDB、ConversationStore、ContextBuilder、SystemPromptBuilder
+ * AgentEngine V4.2 - 智能分层记忆系统 + CronJob 定时任务
+ * 集成 MemoryDB、ConversationStore、ContextBuilder、SystemPromptBuilder、CronScheduler
  */
 
 import { ClaudeEngine } from './engine/claude-engine.js'
@@ -12,6 +12,8 @@ import { ConversationStore } from '../memory/conversation-store.js'
 import { SystemPromptBuilder } from './engine/system-prompt-builder.js'
 import { ContextBuilder } from './engine/context-builder.js'
 import { createMemoryTools } from './tools/memory-tools.js'
+import { CronScheduler } from '../cronjob/cron-scheduler.js'
+import { createCronjobTools } from './tools/cronjob-tools.js'
 import type {
   SessionConfig,
   AgentResponse,
@@ -32,6 +34,7 @@ export class AgentEngine {
   private memoryDb: MemoryDB
   private conversationStore: ConversationStore
   private contextBuilder: ContextBuilder
+  private cronScheduler: CronScheduler
 
   constructor() {
     // 1. 初始化记忆数据库（SQLite + FTS5）
@@ -67,7 +70,13 @@ export class AgentEngine {
     // 9. 初始化流处理器
     this.streamHandler = new StreamHandler()
 
-    console.log('🤖 Agent引擎 V4.1 初始化完成（智能分层记忆系统）')
+    // 10. 初始化 CronJob 调度器并注册工具
+    this.cronScheduler = new CronScheduler()
+    const cronjobTools = createCronjobTools(this.cronScheduler)
+    this.toolManager.registerTools(cronjobTools)
+    this.cronScheduler.start()
+
+    console.log('🤖 Agent引擎 V4.2 初始化完成（智能分层记忆 + CronJob）')
   }
 
   /**
@@ -275,6 +284,15 @@ export class AgentEngine {
    */
   getConversationStore(): ConversationStore {
     return this.conversationStore
+  }
+
+  // ==================== CronJob ====================
+
+  /**
+   * 获取 CronScheduler 实例
+   */
+  getCronScheduler(): CronScheduler {
+    return this.cronScheduler
   }
 }
 

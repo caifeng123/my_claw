@@ -15,9 +15,8 @@ export class ClaudeEngine {
       ...process.env,
       ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL,
       ANTHROPIC_AUTH_TOKEN: process.env.ANTHROPIC_API_KEY || '1',
-      http_proxy: '',
-      https_proxy: '',
     }
+    
     this.config = {
       model: process.env.CLAUDE_MODEL || '',
       env,

@@ -77,7 +77,6 @@ export class ToolManager {
         async (args) => {
           try {
             const result = await handler.execute(args)
-            console.log(`✅ 工具执行成功: ${handler.name}`)
             return {
               content: [{
                 type: "text",
