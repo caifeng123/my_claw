@@ -1,5 +1,5 @@
 /**
- * AgentEngine V4.2 - 智能分层记忆系统 + CronJob 定时任务
+ * AgentEngine V4.3 - 智能分层记忆系统 + CronJob 定时任务
  * 集成 MemoryDB、ConversationStore、ContextBuilder、SystemPromptBuilder、CronScheduler
  */
 
@@ -14,6 +14,9 @@ import { ContextBuilder } from './engine/context-builder.js'
 import { createMemoryTools } from './tools/memory-tools.js'
 import { CronScheduler } from '../cronjob/cron-scheduler.js'
 import { createCronjobTools } from './tools/cronjob-tools.js'
+import { calculatorTool, timeTool } from './tools/calculator.js'
+import { createTavilyTools } from './tools/tavily-tools.js'
+import { registerAgentEngine } from '../agent-registry.js'
 import type {
   SessionConfig,
   AgentResponse,
@@ -37,46 +40,52 @@ export class AgentEngine {
   private cronScheduler: CronScheduler
 
   constructor() {
-    // 1. 初始化记忆数据库（SQLite + FTS5）
+    // 存储层
     this.memoryDb = new MemoryDB()
-
-    // 2. 初始化对话持久化
     this.conversationStore = new ConversationStore()
 
-    // 3. 初始化 System Prompt 构建器（注入 MemoryDB）
+    // 上下文层
     const systemPromptBuilder = new SystemPromptBuilder(this.memoryDb)
-
-    // 4. 初始化上下文构建器
     this.contextBuilder = new ContextBuilder(this.conversationStore, systemPromptBuilder)
 
-    // 5. 初始化 Claude 引擎
+    // Claude 引擎层
     this.claudeEngine = new ClaudeEngine()
-
-    // 6. 注入压缩查询函数（延迟注入，避免循环依赖）
+    // 注入压缩查询函数（延迟注入，避免循环依赖）
     this.contextBuilder.setCompressQuery(
       this.claudeEngine.compressQuery.bind(this.claudeEngine)
     )
 
-    // 7. 初始化工具管理器并注册记忆工具
-    this.toolManager = new ToolManager()
-    const memoryTools = createMemoryTools(this.memoryDb)
-    this.toolManager.registerTools(memoryTools)
-    // 共享 ToolManager 给 ClaudeEngine
-    this.claudeEngine.toolManager = this.toolManager
-
-    // 8. 初始化会话管理器（注入 ConversationStore + ContextBuilder）
+    // 初始化会话管理器（注入 ConversationStore + ContextBuilder）
     this.sessionManager = new SessionManager(this.conversationStore, this.contextBuilder)
-
-    // 9. 初始化流处理器
+    // 初始化流处理器
     this.streamHandler = new StreamHandler()
 
-    // 10. 初始化 CronJob 调度器并注册工具
-    this.cronScheduler = new CronScheduler()
-    const cronjobTools = createCronjobTools(this.cronScheduler)
-    this.toolManager.registerTools(cronjobTools)
-    this.cronScheduler.start()
+    // 注册到 registry（必须在 CronScheduler 之前，因为 tick 会 getAgentEngine()）
+    registerAgentEngine(this)
 
-    console.log('🤖 Agent引擎 V4.2 初始化完成（智能分层记忆 + CronJob）')
+    // 定时任务（构造即启动 tick，tick 中会 getAgentEngine()）
+    this.cronScheduler = new CronScheduler()
+
+    // 工具层（统一注册，依赖 cronScheduler 实例）
+    this.toolManager = new ToolManager()
+    this.registerBuiltinTools()
+    this.claudeEngine.toolManager = this.toolManager
+
+    console.log('🤖 Agent引擎 V4.3 初始化完成（智能分层记忆 + CronJob）')
+  }
+
+  /**
+   * 统一注册所有内置工具
+   */
+  private registerBuiltinTools(): void {
+    // 自定义工具
+    this.toolManager.registerTools([calculatorTool, timeTool])
+    // Tavily 工具
+    this.toolManager.registerTools(createTavilyTools())
+    // 内存工具
+    this.toolManager.registerTools(createMemoryTools(this.memoryDb))
+    // CronJob 工具
+    this.toolManager.registerTools(createCronjobTools(this.cronScheduler))
   }
 
   /**

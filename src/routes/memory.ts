@@ -4,8 +4,7 @@
  */
 
 import { Hono } from 'hono';
-import { z } from 'zod';
-import { agentEngine } from '../core/agent/index.js';
+import { getAgentEngine } from '../core/agent-registry.js';
 
 const memoryRoutes = new Hono();
 
@@ -24,7 +23,7 @@ memoryRoutes.get('/v2/search', (c) => {
   const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? limitRaw : 20;
 
   try {
-    const memoryDb = agentEngine.getMemoryDb();
+    const memoryDb = getAgentEngine().getMemoryDb();
     let results = memoryDb.search(query, limit);
     if (cat) {
       results = results.filter(r => r.cat === cat);
@@ -39,7 +38,7 @@ memoryRoutes.get('/v2/search', (c) => {
 // 获取记忆统计
 memoryRoutes.get('/v2/stats', (c) => {
   try {
-    const memoryDb = agentEngine.getMemoryDb();
+    const memoryDb = getAgentEngine().getMemoryDb();
     const stats = memoryDb.getStats();
     return c.json(stats);
   } catch (err) {
@@ -56,7 +55,7 @@ memoryRoutes.get('/v2/list', (c) => {
   const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? limitRaw : 50;
 
   try {
-    const memoryDb = agentEngine.getMemoryDb();
+    const memoryDb = getAgentEngine().getMemoryDb();
     let entries;
     if (cat) {
       entries = memoryDb.getByCategory(cat, limit);
@@ -82,7 +81,7 @@ memoryRoutes.post('/v2/add', async (c) => {
       return c.json({ error: 'Missing required fields: text, cat, imp' }, 400);
     }
 
-    const memoryDb = agentEngine.getMemoryDb();
+    const memoryDb = getAgentEngine().getMemoryDb();
     const result = memoryDb.insert({ text, cat, imp, source: source || 'USER' });
     return c.json({ result, message: `Memory ${result}` });
   } catch (err) {
@@ -99,7 +98,7 @@ memoryRoutes.delete('/v2/:id', (c) => {
   }
 
   try {
-    const memoryDb = agentEngine.getMemoryDb();
+    const memoryDb = getAgentEngine().getMemoryDb();
     memoryDb.deleteById(id);
     return c.json({ success: true, message: `Memory ${id} deleted` });
   } catch (err) {
@@ -111,7 +110,7 @@ memoryRoutes.delete('/v2/:id', (c) => {
 // 手动触发淘汰
 memoryRoutes.post('/v2/compact', (c) => {
   try {
-    const memoryDb = agentEngine.getMemoryDb();
+    const memoryDb = getAgentEngine().getMemoryDb();
     const deleted = memoryDb.compact();
     return c.json({ deleted, message: `Compacted: ${deleted} entries removed` });
   } catch (err) {
@@ -125,7 +124,7 @@ memoryRoutes.post('/v2/compact', (c) => {
 // 列出所有会话
 memoryRoutes.get('/v2/sessions', (c) => {
   try {
-    const store = agentEngine.getConversationStore();
+    const store = getAgentEngine().getConversationStore();
     const sessions = store.listSessions();
     return c.json({ sessions, total: sessions.length });
   } catch (err) {
@@ -141,7 +140,7 @@ memoryRoutes.get('/v2/sessions/:sessionId', (c) => {
   const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? limitRaw : 50;
 
   try {
-    const store = agentEngine.getConversationStore();
+    const store = getAgentEngine().getConversationStore();
     const entries = store.loadRecent(sessionId, limit);
     return c.json({ entries, total: entries.length });
   } catch (err) {

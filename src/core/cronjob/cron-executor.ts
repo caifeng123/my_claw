@@ -7,9 +7,9 @@
  * 3. 将结果发送到飞书 chatId（直接发到 chat 顶层，不回话题）
  */
 
-import type { CronJob, CronJobLog } from './types.js'
+import type { CronJob } from './types.js'
 import type { CronStore } from './cron-store.js'
-import { agentEngine } from '../agent/index.js'
+import { getAgentEngine } from '../agent-registry.js'
 import { getDefaultFeishuAgentBridge } from '../../services/feishu/feishu-agent-bridge.js'
 import { execSync } from 'child_process'
 
@@ -102,13 +102,14 @@ export class CronExecutor {
     const timeStr = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })
     const enrichedPrompt = `[系统：这是定时任务「${job.name}」的自动执行，当前时间 ${timeStr}]\n\n${config.prompt}`
 
-    const response = await agentEngine.sendMessage(sessionId, enrichedPrompt)
+    const engine = getAgentEngine()
+    const response = await engine.sendMessage(sessionId, enrichedPrompt)
 
     // 推送结果到飞书
     await this.notify(job.notifyChatId, response.content)
 
     // 清理临时 session
-    agentEngine.deleteSession(sessionId)
+    engine.deleteSession(sessionId)
 
     return response.content
   }
@@ -124,12 +125,13 @@ export class CronExecutor {
       // 动态模式：让 Agent 生成消息
       const sessionId = `cron_notify_${job.id}_${Date.now()}`
       const timeStr = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })
-      const response = await agentEngine.sendMessage(
+      const engine = getAgentEngine()
+      const response = await engine.sendMessage(
         sessionId,
         `[系统：这是定时通知任务「${job.name}」，当前时间 ${timeStr}]\n\n${config.agentPrompt}`
       )
       message = response.content
-      agentEngine.deleteSession(sessionId)
+      engine.deleteSession(sessionId)
     } else if (config.messageTemplate) {
       // 静态模板
       message = this.renderTemplate(config.messageTemplate)

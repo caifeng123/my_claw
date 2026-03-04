@@ -6,8 +6,6 @@ import type {
   ToolCallResponse,
   ToolValidationResult,
 } from '../types/tools'
-import { calculatorTool, timeTool } from '../tools/calculator';
-import { createTavilyTools } from '../tools/tavily-tools.js';
 
 export const DEFAULT_ALLOWED_TOOLS = [
   'Bash',
@@ -18,10 +16,6 @@ export const DEFAULT_ALLOWED_TOOLS = [
   'TodoWrite', 'ToolSearch', 'Skill',
   'NotebookEdit'
 ];
-
-const CUSTOM_TOOLS: RegisteredTool[] = [
-  calculatorTool, timeTool
-]
 
 export class ToolManager {
   private tools: Map<string, RegisteredTool>
@@ -63,12 +57,9 @@ export class ToolManager {
 
   /**
    * 获取MCP工具配置（参考官方写法）
+   * 纯转换：将已注册的工具转为 Claude Agent SDK 格式，不再自行注册工具
    */
   async getTools() {
-    CUSTOM_TOOLS.forEach(t => this.registerTool(t))
-    // 注册 Tavily 工具
-    createTavilyTools().forEach(t => this.registerTool(t))
-    // 1. 注册内部工具
     const internalTools = Array.from(this.tools.values()).map((handler) => {
       return tool(
         handler.name,
@@ -97,10 +88,9 @@ export class ToolManager {
       )
     })
 
-    // 2. 注册外部 MCP 工具（暂时为空，可根据需要扩展）
+    // 外部 MCP 工具（暂时为空，可根据需要扩展）
     const externalMcpTools: any[] = []
 
-    // 3. 合并所有工具
     const allTools = [...internalTools, ...externalMcpTools]
 
     const allowedTools = allTools.map((t) => `mcp__${this.toolPrefix}__${t.name}`)
