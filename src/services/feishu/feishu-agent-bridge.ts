@@ -5,7 +5,7 @@
 
 import { FeishuService } from './feishu-service.js';
 import type { FeishuConnectionConfig, FeishuMessage, ThreadContext } from './types.js';
-import { agentEngine } from '../../core/agent/index.js';
+import { getAgentEngine } from '../../core/agent-registry.js';
 import type { EventHandlers } from '@/core/agent/types/agent.js';
 import { writeFileSync } from 'fs';
 import { execSync } from 'child_process';
@@ -276,8 +276,10 @@ export class FeishuAgentBridge {
       },
     };
 
-    // V4.1: agentEngine.sendMessageStream 内部自动处理上下文构建（FTS5 记忆检索 + 对话压缩）
-    await agentEngine.sendMessageStream(sessionId, message.content, message.senderId, eventHandlers);
+    // 注入飞书上下文，让 Agent 知道当前 chatId（用于 create_cronjob 等工具）
+    const enrichedContent = `[系统上下文: 当前飞书会话 chatId=${message.chatId}]\n\n${message.content}`;
+
+    await getAgentEngine().sendMessageStream(sessionId, enrichedContent, message.senderId, eventHandlers);
   }
 
   /**
@@ -285,8 +287,9 @@ export class FeishuAgentBridge {
    * V4.1: 直接传消息内容，AgentEngine 内部处理上下文构建
    */
   private async handleRegularResponse(sessionId: string, message: FeishuMessage): Promise<void> {
-    // V4.1: agentEngine.sendMessage 内部自动处理上下文构建
-    const response = await agentEngine.sendMessage(sessionId, message.content, message.senderId);
+    // 注入飞书上下文，让 Agent 知道当前 chatId（用于 create_cronjob 等工具）
+    const enrichedContent = `[系统上下文: 当前飞书会话 chatId=${message.chatId}]\n\n${message.content}`;
+    const response = await getAgentEngine().sendMessage(sessionId, enrichedContent, message.senderId);
 
     const replyMessageId = message.threadId ? message.messageId : undefined;
 
@@ -323,7 +326,7 @@ export class FeishuAgentBridge {
     this.chatToSessionMap.set(sessionKey, sessionId);
 
     // 创建新会话（AgentEngine 内部会恢复已有历史）
-    agentEngine.createSession({
+    getAgentEngine().createSession({
       sessionId,
       userId: chatId,
     });

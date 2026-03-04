@@ -23,6 +23,7 @@ export class CronScheduler {
   constructor() {
     this.store = new CronStore()
     this.executor = new CronExecutor(this.store)
+    this.start()
   }
 
   /**
@@ -113,7 +114,7 @@ export class CronScheduler {
   }
 
   /**
-   * 手动触发一次任务（用于调试和 manage_cronjob trigger）
+   * 手动触发一次任务
    */
   async triggerJob(jobId: string): Promise<void> {
     const job = this.store.getJob(jobId)

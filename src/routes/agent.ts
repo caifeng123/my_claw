@@ -1,5 +1,5 @@
 import { Hono } from 'hono'
-import { agentEngine } from '../core/agent/index.js'
+import { getAgentEngine } from '../core/agent-registry.js'
 
 const agentRouter = new Hono()
 
@@ -12,6 +12,7 @@ agentRouter.post('/sessions', async (c) => {
       return c.json({ error: 'sessionId is required' }, 400)
     }
 
+    const agentEngine = getAgentEngine()
     const session = agentEngine.getSession(sessionId)
     if (session) {
       return c.json({
@@ -42,6 +43,8 @@ agentRouter.post('/sessions/:sessionId/messages', async (c) => {
     if (!message) {
       return c.json({ error: 'message is required' }, 400)
     }
+
+    const agentEngine = getAgentEngine()
 
     if (stream) {
       // 流式响应
@@ -83,7 +86,7 @@ agentRouter.post('/sessions/:sessionId/messages', async (c) => {
 agentRouter.get('/sessions/:sessionId', async (c) => {
   try {
     const sessionId = c.req.param('sessionId')
-    const session = agentEngine.getSession(sessionId)
+    const session = getAgentEngine().getSession(sessionId)
 
     if (!session) {
       return c.json({ error: 'Session not found' }, 404)
@@ -100,7 +103,7 @@ agentRouter.get('/sessions/:sessionId', async (c) => {
 agentRouter.delete('/sessions/:sessionId', async (c) => {
   try {
     const sessionId = c.req.param('sessionId')
-    const deleted = agentEngine.deleteSession(sessionId)
+    const deleted = getAgentEngine().deleteSession(sessionId)
 
     if (!deleted) {
       return c.json({ error: 'Session not found' }, 404)
@@ -116,7 +119,7 @@ agentRouter.delete('/sessions/:sessionId', async (c) => {
 // 获取会话统计
 agentRouter.get('/sessions', async (c) => {
   try {
-    const stats = agentEngine.getSessionStats()
+    const stats = getAgentEngine().getSessionStats()
     return c.json({ stats })
   } catch (error) {
     console.error('Stats retrieval error:', error)
@@ -128,8 +131,7 @@ agentRouter.get('/sessions', async (c) => {
 agentRouter.post('/tools', async (c) => {
   try {
     const toolOptions = await c.req.json()
-    agentEngine.registerTool(toolOptions)
-
+    getAgentEngine().registerTool(toolOptions)
     return c.json({ message: 'Tool registered successfully' })
   } catch (error) {
     console.error('Tool registration error:', error)
@@ -140,7 +142,7 @@ agentRouter.post('/tools', async (c) => {
 // 获取工具列表
 agentRouter.get('/tools', async (c) => {
   try {
-    const toolNames = agentEngine.getToolNames()
+    const toolNames = getAgentEngine().getToolNames()
     return c.json({ tools: toolNames })
   } catch (error) {
     console.error('Tools retrieval error:', error)
