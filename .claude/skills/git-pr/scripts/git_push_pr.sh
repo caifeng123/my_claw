@@ -120,9 +120,7 @@ if ! git push origin "HEAD:refs/heads/$NEW_BRANCH" 2>&1; then
     exit 1
 fi
 
-# Reset local — changes are on remote only
-git reset --soft HEAD~"$UNPUSHED"
-info "Local branch reset. Changes preserved as unstaged."
+info "Local commits preserved. Run 'git pull' after PR is merged."
 
 # ========== Create PR/MR ==========
 PR_TITLE="$COMMIT_MSG"
