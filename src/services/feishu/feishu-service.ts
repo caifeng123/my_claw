@@ -12,6 +12,49 @@ import type {
 } from './types.js';
 import { fileURLToPath } from 'url';
 
+// AI 修复重试配置
+const AI_FIX_MAX_RETRIES = 2; // AI 修复最大重试次数
+
+/**
+ * 飞书消息发送错误（包含飞书 API 返回的详细信息）
+ */
+export class FeishuSendError extends Error {
+  /** 飞书业务错误码，如 230028 表示内容审核不通过 */
+  code: number;
+  /** 飞书返回的错误描述 */
+  feishuMsg: string;
+  /** 原始发送的文本内容 */
+  originalContent: string;
+
+  constructor(code: number, feishuMsg: string, originalContent: string) {
+    super(`Feishu send failed [${code}]: ${feishuMsg}`);
+    this.name = 'FeishuSendError';
+    this.code = code;
+    this.feishuMsg = feishuMsg;
+    this.originalContent = originalContent;
+  }
+}
+
+/**
+ * 从 Axios 错误中提取飞书 API 的业务错误信息
+ */
+function extractFeishuError(error: any): { code: number; msg: string } | null {
+  try {
+    // 飞书 SDK 抛出的 Axios 错误，response.data 中包含业务错误
+    const data = error?.response?.data;
+    if (data && typeof data.code === 'number' && typeof data.msg === 'string') {
+      return { code: data.code, msg: data.msg };
+    }
+    // 有些 SDK 版本会将错误信息放在 error.data
+    if (error?.data && typeof error.data.code === 'number') {
+      return { code: error.data.code, msg: error.data.msg || '' };
+    }
+  } catch {
+    // 解析失败，返回 null
+  }
+  return null;
+}
+
 // 飞书消息类型
 const MESSAGE_TYPE_TEXT = 'text';
 const MESSAGE_TYPE_POST = 'post';
@@ -160,6 +203,10 @@ export class FeishuService implements FeishuConnection {
     } catch (error) {
       console.error('Failed to send Feishu message:', error);
       clearAckReaction();
+      // 向上抛出 FeishuSendError，让 bridge 层有机会进行 AI 修复
+      if (error instanceof FeishuSendError) {
+        throw error;
+      }
     }
   }
 
@@ -444,7 +491,14 @@ private extractMessageContent(messageType: string, content: string, createTime: 
         }
       }
     } catch (error) {
-      console.warn('Plain text message failed, trying fallback:', error);
+      // 解析飞书 API 的业务错误并抛出结构化的 FeishuSendError
+      const feishuErr = extractFeishuError(error);
+      if (feishuErr) {
+        console.warn(`Plain text message rejected by Feishu [${feishuErr.code}]: ${feishuErr.msg}`);
+        throw new FeishuSendError(feishuErr.code, feishuErr.msg, text);
+      }
+      // 非业务错误（网络超时等），尝试 fallback
+      console.warn('Plain text message failed (non-Feishu-API error), trying fallback:', error);
       await this.sendFallbackMessage(chatId, text, replyMessageId, threadId);
     }
   }
@@ -480,8 +534,15 @@ private extractMessageContent(messageType: string, content: string, createTime: 
         });
       }
     } catch (error) {
-      console.warn('Interactive card message failed, fallback to plain text:', error);
-      // 降级为纯文本
+      // 检查是否是内容审核等业务错误
+      const feishuErr = extractFeishuError(error);
+      if (feishuErr) {
+        // 内容审核类错误（如敏感数据），换格式发也会失败，直接抛出让上层 AI 修复
+        console.warn(`Interactive card rejected by Feishu [${feishuErr.code}]: ${feishuErr.msg}`);
+        throw new FeishuSendError(feishuErr.code, feishuErr.msg, text);
+      }
+      // 非内容审核错误（可能是卡片格式问题），降级为纯文本
+      console.warn('Interactive card message failed (non-content error), fallback to plain text:', error);
       await this.sendPlainTextMessage(chatId, text, replyMessageId, threadId);
     }
   }
