@@ -11,8 +11,6 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { uploadImage } from './upload.js';
 
-writeFileSync('/tmp/skill_env.json', JSON.stringify(process.env, null, 2));
-
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
