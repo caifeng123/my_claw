@@ -17,6 +17,7 @@ data/*
 !data/.gitkeep
 !data/conversations/.gitkeep
 !data/README.md
+!data/CLAUDE.md
 
 # logs
 logs
