@@ -196,6 +196,35 @@ export class FeishuAgentBridge {
     );
   }
 
+  /**
+   * 处理 /stop 指令 - 中断当前 session 正在进行的请求
+   */
+  private async handleStopCommand(message: FeishuMessage): Promise<void> {
+    console.log('⏹️ 收到 /stop 指令，中断当前会话');
+
+    const sessionId = this.getOrCreateSessionId(message.chatId, message.threadId);
+    const agentEngine = getAgentEngine();
+
+    // 尝试中断当前正在执行的请求
+    const aborted = agentEngine.abortSession(sessionId);
+
+    if (aborted) {
+      await this.feishuService.sendMessage(
+        message.chatId,
+        '⏹️ 已中断当前对话，你可以继续发送新消息。',
+        message.messageId,
+        message.threadId
+      );
+    } else {
+      await this.feishuService.sendMessage(
+        message.chatId,
+        '💡 当前没有正在进行的请求。',
+        message.messageId,
+        message.threadId
+      );
+    }
+  }
+
     /**
    * 获取会话统计信息
    */
@@ -229,6 +258,11 @@ export class FeishuAgentBridge {
 
     if (trimmedContent === '/new') {
       await this.handleNewCommand(message);
+      return;
+    }
+
+    if (trimmedContent === '/stop') {
+      await this.handleStopCommand(message);
       return;
     }
 

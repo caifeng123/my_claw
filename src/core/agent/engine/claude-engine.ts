@@ -108,7 +108,9 @@ export class ClaudeEngine {
     messages: any[],
     eventHandlers?: EventHandlers,
     systemPrompt?: string,
+    abortController?: AbortController,
   ): Promise<string> {
+    let result = ''
     try {
       await eventHandlers?.onContentStart?.()
       const toolsConfig = await this.toolManager.getTools()
@@ -136,6 +138,7 @@ export class ClaudeEngine {
         options: {
           ...toolsConfig,
           ...(systemPrompt ? { systemPrompt } : {}),
+          ...(abortController ? { abortController } : {}),
           model,
           settingSources: ['project'],
           cwd: process.cwd(),
@@ -143,10 +146,9 @@ export class ClaudeEngine {
         },
       })
 
-      let result = ''
       let lastAssistantContent = ''  // 临时存储最后一个 assistant 消息
 
-      // 处理AI响应流
+      // 处理AI响应流（abortController.abort() 会中断此循环）
       for await (const message of response) {
         if (message.type === 'result') {
           const messageResult = (message as any).result
@@ -175,6 +177,12 @@ export class ClaudeEngine {
 
       return result
     } catch (error) {
+      // 如果是用户主动中断（AbortController.abort），静默处理
+      if (abortController?.signal.aborted) {
+        console.log('⏹️ Claude 流式请求已被用户中断')
+        await eventHandlers?.onContentStop?.()
+        return result
+      }
       console.error('Claude流式引擎错误:', error)
       await eventHandlers?.onError?.(`Claude流式API调用失败: ${error instanceof Error ? error.message : '未知错误'}`)
       throw error

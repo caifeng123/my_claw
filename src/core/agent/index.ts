@@ -38,6 +38,7 @@ export class AgentEngine {
   private conversationStore: ConversationStore
   private contextBuilder: ContextBuilder
   private cronScheduler: CronScheduler
+  private abortControllers: Map<string, AbortController> = new Map()
 
   constructor() {
     // 存储层
@@ -152,6 +153,10 @@ export class AgentEngine {
     userId?: string,
     eventHandlers?: EventHandlers
   ): Promise<void> {
+    // 创建 AbortController 用于支持 /stop 中断
+    const abortController = new AbortController()
+    this.abortControllers.set(sessionId, abortController)
+
     try {
       // 获取或创建会话
       let session = this.sessionManager.getSession(sessionId)
@@ -181,11 +186,12 @@ export class AgentEngine {
         this.streamHandler.setEventHandlers(eventHandlers)
       }
 
-      // 发送流式消息给Claude（带 systemPrompt）
+      // 发送流式消息给Claude（带 systemPrompt + abortController）
       const responseContent = await this.claudeEngine.sendMessageStream(
         context.messages,
         eventHandlers || this.streamHandler.getEventHandlers(),
         context.systemPrompt,
+        abortController,
       )
 
       // 添加助手响应到会话（持久化）
@@ -195,11 +201,18 @@ export class AgentEngine {
       }
       this.sessionManager.addMessage(sessionId, assistantMessage)
     } catch (error) {
+      // 如果是主动中断，不当作错误处理
+      if (abortController.signal.aborted) {
+        console.log(`⏹️ 会话 ${sessionId} 已被用户中断`)
+        return
+      }
       console.error('Agent流式消息处理错误:', error)
       this.streamHandler.handleEvent({
         type: 'error',
         error: `Agent流式处理失败: ${error instanceof Error ? error.message : '未知错误'}`
       })
+    } finally {
+      this.abortControllers.delete(sessionId)
     }
   }
 
@@ -240,6 +253,20 @@ export class AgentEngine {
    */
   deleteSession(sessionId: string): boolean {
     return this.sessionManager.deleteSession(sessionId)
+  }
+
+  /**
+   * 中断会话的当前请求
+   */
+  abortSession(sessionId: string): boolean {
+    const controller = this.abortControllers.get(sessionId)
+    if (controller) {
+      controller.abort()
+      this.abortControllers.delete(sessionId)
+      console.log(`⏹️ 已中断会话: ${sessionId}`)
+      return true
+    }
+    return false
   }
 
   /**
