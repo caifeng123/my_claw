@@ -163,6 +163,40 @@ export class FeishuAgentBridge {
   }
 
   /**
+   * 处理 /new 指令 - 清空当前 session，开启新对话
+   * 复用同一个 sessionId，只清空消息历史和上下文
+   */
+  private async handleNewCommand(message: FeishuMessage): Promise<void> {
+    console.log('🆕 收到 /new 指令，重置当前会话');
+
+    // 1. 获取当前 sessionId（复用原有映射，不创建新 ID）
+    const sessionId = this.getOrCreateSessionId(message.chatId, message.threadId);
+    const agentEngine = getAgentEngine();
+
+    // 2. 清空该 session 的消息历史（JSONL 文件 + 摘要缓存）
+    agentEngine.getConversationStore().deleteSession(sessionId);
+
+    // 3. 从 SessionManager 中删除旧 session 内存状态
+    agentEngine.deleteSession(sessionId);
+
+    // 4. 重新创建同名 session（干净的上下文）
+    agentEngine.createSession({
+      sessionId,
+      userId: message.chatId,
+    });
+
+    console.log(`✅ 会话已重置: ${sessionId}`);
+
+    // 5. 回复用户
+    await this.feishuService.sendMessage(
+      message.chatId,
+      '✅ 已开启新会话，之前的对话上下文已清除。请开始新的对话吧！',
+      message.messageId,
+      message.threadId
+    );
+  }
+
+    /**
    * 获取会话统计信息
    */
   getSessionStats(): any {
@@ -190,6 +224,11 @@ export class FeishuAgentBridge {
     const trimmedContent = message.content.trim();
     if (trimmedContent === '/restart') {
       await this.handleRestartCommand(message);
+      return;
+    }
+
+    if (trimmedContent === '/new') {
+      await this.handleNewCommand(message);
       return;
     }
 
