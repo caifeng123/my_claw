@@ -4,14 +4,15 @@
  * 智能任务执行器 — 编排 TASK_LIST 并驱动远程沙箱执行
  *
  * 职责：
- *   1. 读取 TASK_LIST.md
- *   2. 检测 {IMAGE_URL} 占位符 → 自动查找最新图片 → 上传 CDN → 替换
- *   3. 调用 task.go 将任务发送到远程沙箱
+ *   1. 加载 .env 环境变量（项目根目录）
+ *   2. 读取 TASK_LIST.md
+ *   3. 检测 {IMAGE_URL} 占位符 → 自动查找最新图片 → 上传 CDN → 替换
+ *   4. 调用 task.go 将任务发送到远程沙箱
  *
  * 用法：
  *   node task_runner.js <path/to/TASK_LIST.md>
  *
- * 零第三方依赖（Node.js 22+）
+ * 零第三方依赖（Node.js 22+，使用内置 .env 加载）
  */
 
 import { readdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
@@ -24,6 +25,50 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 const TASK_GO = resolve(__dirname, 'task.go');
+
+// ─── .env 加载 ────────────────────────────────────────────
+
+/**
+ * 手动解析 .env 文件并注入 process.env（不覆盖已有值）。
+ * 不引入第三方依赖，保持零依赖原则。
+ */
+function loadEnvFile(envPath) {
+  if (!existsSync(envPath)) {
+    console.log(`ℹ️  未找到 .env 文件: ${envPath}，跳过`);
+    return;
+  }
+
+  const content = readFileSync(envPath, 'utf-8');
+  let loaded = 0;
+
+  for (const line of content.split('\n')) {
+    const trimmed = line.trim();
+    // 跳过空行和注释
+    if (!trimmed || trimmed.startsWith('#')) continue;
+
+    const eqIndex = trimmed.indexOf('=');
+    if (eqIndex === -1) continue;
+
+    const key = trimmed.slice(0, eqIndex).trim();
+    let value = trimmed.slice(eqIndex + 1).trim();
+
+    // 去除引号包裹
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+
+    // 不覆盖已有环境变量（系统/CI 优先）
+    if (!(key in process.env)) {
+      process.env[key] = value;
+      loaded++;
+    }
+  }
+
+  console.log(`✅ 从 .env 加载了 ${loaded} 个环境变量`);
+}
 
 // ─── 图片查找 ─────────────────────────────────────────────
 
@@ -157,6 +202,9 @@ async function main() {
 
   const taskListFile = resolve(args[0]);
   const projectRoot = findProjectRoot();
+
+  // ── 加载 .env（在一切业务逻辑之前） ──
+  loadEnvFile(resolve(projectRoot, '.env'));
 
   // 前置校验
   const checks = [

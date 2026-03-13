@@ -13,17 +13,32 @@ import (
 	"code.byted.org/iaasng/lumi-cua-go-sdk/src/lumi_cua_sdk"
 )
 
-// ─── 配置常量 ─────────────────────────────────────────────
+// ─── 配置 ─────────────────────────────────────────────────
+// 所有敏感/可变配置通过环境变量注入（由上层 task_runner.js 从 .env 加载）
 
 const (
-	managerURL = "https://iaas-cua-devbox-ecs-manager-v2.byted.org/mgr"
-	plannerURL = "https://iaas-cua-devbox-planner-agent.byted.org/planner"
-	apiKey     = "aa65501b-e033-49c5-9ff4-b03eeaf3baeb"
+	defaultManagerURL = "https://iaas-cua-devbox-ecs-manager-v2.byted.org/mgr"
+	defaultPlannerURL = "https://iaas-cua-devbox-planner-agent.byted.org/planner"
 
 	taskTimeoutSeconds = 300
 	idlePollInterval   = 5 * time.Second
 	maxIdleWaitTime    = 90 * time.Second
 )
+
+func envOrDefault(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func envRequired(key string) string {
+	v := os.Getenv(key)
+	if v == "" {
+		log.Fatalf("❌ 缺少必需的环境变量: %s（请在项目根目录 .env 中配置）", key)
+	}
+	return v
+}
 
 func main() {
 	if len(os.Args) < 3 {
@@ -31,6 +46,11 @@ func main() {
 	}
 	taskListFile := os.Args[1]
 	projectDir := os.Args[2]
+
+	// ── 从环境变量读取配置（由 task_runner.js 透传 process.env） ──
+	managerURL := envOrDefault("LUMI_MANAGER_URL", defaultManagerURL)
+	plannerURL := envOrDefault("LUMI_PLANNER_URL", defaultPlannerURL)
+	apiKey := envRequired("LUMI_API_KEY")
 
 	// ── 读取任务列表 ──
 	taskBytes, err := os.ReadFile(taskListFile)
