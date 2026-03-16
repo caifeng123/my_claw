@@ -1,6 +1,6 @@
 /**
  * Memory Tools - Claude 工具定义 + 执行器
- * V4.1 - save/search/delete 三个工具
+ * V5.3 - save 新增 keywords 字段，LLM 保存时生成同义词索引
  */
 
 import z from 'zod'
@@ -10,7 +10,15 @@ import type { RegisteredTool, ToolExecutionResult } from '../types/tools.js'
 // ==================== 工具 Schema ====================
 
 const saveMemorySchema = {
-  text: z.string().min(1, '记忆内容不能为空').describe('记忆内容（自然语言）'),
+  text: z.string().min(1, '记忆内容不能为空').describe(
+    '记忆内容（自然语言，保持简洁，一句话概括核心信息）'
+  ),
+  keywords: z.string().optional().default('').describe(
+    '搜索索引关键词（空格分隔）。为这条记忆生成 5-15 个同义词、别名、相关术语，覆盖用户可能的不同问法。' +
+    '例如记忆"不要使用emoji"→ keywords 填"表情 表情符号 颜文字 emoticon smiley 图标 icon 小表情 表情包"。' +
+    '例如记忆"项目用 TypeScript"→ keywords 填"TS 语言 编程语言 前端 后端 类型系统 技术栈 tech stack"。' +
+    '注意：只填关键词，不要写句子。覆盖中英文、缩写、口语化表达。'
+  ),
   cat: z.enum(['preference', 'decision', 'context', 'correction', 'instruction', 'knowledge']).describe('记忆分类'),
   imp: z.number().min(1).max(5).describe('重要性 1-5'),
   source: z.enum(['USER', 'PROJECT', 'GLOBAL']).optional().default('USER').describe('来源'),
@@ -36,17 +44,21 @@ const deleteMemorySchema = {
 export function createMemoryTools(memoryDb: MemoryDB): RegisteredTool[] {
   const saveMemoryTool: RegisteredTool = {
     name: 'save_memory',
-    description: '保存一条记忆。发现用户偏好、重要决定、纠正、指令等信息时主动调用。',
+    description:
+      '保存一条记忆。发现用户偏好、重要决定、纠正、指令等信息时主动调用。' +
+      '务必同时填写 keywords 字段，生成 5-15 个同义词/别名/相关术语作为搜索索引，覆盖用户未来可能的不同问法。',
     inputSchema: saveMemorySchema,
     execute: async (args: Record<string, unknown>): Promise<ToolExecutionResult> => {
       try {
         const text = args.text as string
+        const keywords = (args.keywords as string) || ''
         const cat = args.cat as string
         const imp = args.imp as number
         const source = (args.source as string) || 'USER'
 
         const result = memoryDb.insert({
           text,
+          keywords,
           cat: cat as 'preference' | 'decision' | 'context' | 'correction' | 'instruction' | 'knowledge',
           imp,
           source: source as 'USER' | 'PROJECT' | 'GLOBAL',
@@ -55,9 +67,10 @@ export function createMemoryTools(memoryDb: MemoryDB): RegisteredTool[] {
         // 每次写入后触发淘汰检查
         memoryDb.compact()
 
+        const kwPreview = keywords ? ` [kw: ${keywords.slice(0, 40)}${keywords.length > 40 ? '...' : ''}]` : ''
         return {
           success: true,
-          output: `Memory ${result}: "${text.slice(0, 50)}${text.length > 50 ? '...' : ''}"`,
+          output: `Memory ${result}: "${text.slice(0, 50)}${text.length > 50 ? '...' : ''}"${kwPreview}`,
         }
       } catch (error) {
         return {
@@ -70,7 +83,7 @@ export function createMemoryTools(memoryDb: MemoryDB): RegisteredTool[] {
 
   const searchMemoryTool: RegisteredTool = {
     name: 'search_memory',
-    description: '搜索已保存的记忆。需要回忆用户偏好、历史决定等信息时调用。',
+    description: `搜索已保存的记忆。注意：system prompt 中 Active Memories 已包含所有imp≥4 的高优记忆，如果答案已在其中则无需调用此工具。仅当需要查找 Active Memories 中没有的低优先级记忆时才调用。`,
     inputSchema: searchMemorySchema,
     execute: async (args: Record<string, unknown>): Promise<ToolExecutionResult> => {
       try {

@@ -8,9 +8,9 @@ import { getAgentEngine } from '../core/agent-registry.js';
 
 const memoryRoutes = new Hono();
 
-// ==================== V4.1 新路由：MemoryDB (SQLite + FTS5) ====================
+// ==================== V5.0 路由：MemoryDB (Markdown) ====================
 
-// 搜索记忆（FTS5）
+// 搜索记忆（关键词）
 memoryRoutes.get('/v2/search', (c) => {
   const query = c.req.query('q');
   const limitRaw = Number(c.req.query('limit'));
@@ -75,14 +75,14 @@ memoryRoutes.get('/v2/list', (c) => {
 memoryRoutes.post('/v2/add', async (c) => {
   try {
     const body = await c.req.json();
-    const { text, cat, imp, source } = body;
+    const { text, cat, imp, source, keywords } = body;
 
-    if (!text || !cat || imp === undefined) {
-      return c.json({ error: 'Missing required fields: text, cat, imp' }, 400);
+    if (!text || !cat || imp === undefined || !keywords) {
+      return c.json({ error: 'Missing required fields: text, cat, imp, keywords' }, 400);
     }
 
     const memoryDb = getAgentEngine().getMemoryDb();
-    const result = memoryDb.insert({ text, cat, imp, source: source || 'USER' });
+    const result = memoryDb.insert({ text, cat, imp, source: source || 'USER', keywords: body.keywords || [] });
     return c.json({ result, message: `Memory ${result}` });
   } catch (err) {
     console.error('Failed to add memory:', err);

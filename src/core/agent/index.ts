@@ -111,7 +111,7 @@ export class AgentEngine {
       }
       this.sessionManager.addMessage(sessionId, userMessage)
 
-      // 通过 ContextBuilder 构建上下文（FTS5 记忆检索 + 对话压缩）
+      // 通过 ContextBuilder 构建上下文（关键词记忆检索 + 对话压缩）
       const context = await this.sessionManager.buildContext(sessionId, message)
 
       console.log(`📊 上下文构建完成 [session=${sessionId}]:`, {

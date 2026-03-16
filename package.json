@@ -18,14 +18,12 @@
     "memory:dump": "tsx scripts/memory-cli.ts dump"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.8",
     "tsx": "^4.21.0",
     "typescript": "^5.9.3"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.2.62",
     "@larksuiteoapi/node-sdk": "^1.59.0",
-    "better-sqlite3": "9.6.0",
     "cron-parser": "^4.9.0",
     "dotenv": "^17.3.1",
     "hono": "^4.12.3",
