@@ -102,9 +102,11 @@ Read `DIFF_FILE` and `STAT_FILE`, generate a PR summary:
 
 ```markdown
 ## Summary
+> use chinese language
 [2-3 sentences: what this PR does and why]
 
 ## Changes
+> use chinese language
 - **module_or_file**: description of what changed
 - ...
 
