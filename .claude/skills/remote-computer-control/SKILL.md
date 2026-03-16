@@ -26,6 +26,7 @@ remote-computer-control/
 运行时产出路径：
 - `<PROJECT_ROOT>/data/temp/TASK_LIST.md` — 当次任务列表
 - `<PROJECT_ROOT>/data/temp/final_screenshot.png` — 执行完成后的桌面截图
+- `<PROJECT_ROOT>/data/temp/last_live_url.txt` — 上次使用的直播地址（自动记忆）
 
 ---
 

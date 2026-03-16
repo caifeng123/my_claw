@@ -170,6 +170,3 @@ switch (command) {
     printHelp()
     break
 }
-
-// 关闭数据库
-db.close()

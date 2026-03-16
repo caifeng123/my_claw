@@ -89,7 +89,7 @@ export class SessionManager {
 
   /**
    * 构建上下文（核心方法，取代原有 getMessages）
-   * 通过 ContextBuilder 智能构建：FTS5 记忆检索 + 对话压缩 + 保鲜区
+   * 通过 ContextBuilder 智能构建：关键词记忆检索 + 对话压缩 + 保鲜区
    */
   async buildContext(sessionId: string, userMessage: string): Promise<ContextBuildResult> {
     return this.contextBuilder.build(sessionId, userMessage)

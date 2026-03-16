@@ -4,7 +4,7 @@
  */
 
 import { ConversationStore, type ConversationEntry, type CompressedSummary } from '../../memory/conversation-store.js'
-import { SystemPromptBuilder, type SystemPromptResult } from './system-prompt-builder.js'
+import { SystemPromptBuilder } from './system-prompt-builder.js'
 import { MEMORY_CONFIG, estimateTokens, COMPRESS_SYSTEM_PROMPT } from '../../memory/config.js'
 
 // ==================== 类型定义 ====================
@@ -68,8 +68,8 @@ export class ContextBuilder {
     const allHistory = this.conversationStore.loadSync(sessionId)
     const totalHistoryTokens = allHistory.reduce((sum, e) => sum + e.token_est, 0)
 
-    // 2. 构建 system prompt（直接传 userMessage 给 FTS5 检索记忆）
-    const systemPromptResult = this.systemPromptBuilder.build(userMessage, totalHistoryTokens)
+    // 2. 构建 system prompt（纯静态层）
+    const systemPromptResult = this.systemPromptBuilder.build()
     const systemTokens = estimateTokens(systemPromptResult.text)
 
     // 3. 计算可用预算

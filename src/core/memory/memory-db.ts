@@ -1,9 +1,11 @@
 /**
- * MemoryDB - SQLite + FTS5 记忆存储引擎
- * V4.1 - 支持全文搜索、自动去重、容量淘汰
+ * MemoryDB - JSONL 明文记忆存储引擎
+ * V5.3 - keywords 索引分离：text 保持简洁，keywords 存同义词/别名用于搜索扩召回
+ *
+ * 存储格式（data/memory.jsonl）:
+ * {"id":1,"source":"USER","cat":"preference","imp":4,"text":"不要使用emoji","keywords":"表情 表情符号 颜文字 emoticon","created_at":"...","updated_at":"..."}
  */
 
-import Database from 'better-sqlite3'
 import * as fs from 'node:fs'
 import * as path from 'node:path'
 import { MEMORY_CONFIG } from './config.js'
@@ -16,14 +18,15 @@ export interface MemoryEntry {
   source: MemorySource
   cat: MemoryCat
   imp: number       // 重要性 1-5
-  text: string      // 记忆内容（自然语言）
+  text: string      // 记忆内容（自然语言，简洁）
+  keywords: string  // 同义词/别名索引（空格分隔，仅搜索用，不注入 prompt）
   created_at: string
   updated_at: string
 }
 
 export interface SearchResult extends MemoryEntry {
   score: number     // 综合得分
-  fts_rank: number  // FTS5 匹配排名
+  fts_rank: number  // 兼容字段，匹配命中数
 }
 
 export interface MemoryStats {
@@ -32,78 +35,80 @@ export interface MemoryStats {
   bySource: Record<string, number>
 }
 
-export interface DedupLogEntry {
-  cat: string
-  kept_id: number
-  removed_ids: number[]
-  merged_text: string
-  timestamp: string
+// ==================== 搜索辅助函数 ====================
+
+/**
+ * 提取搜索 token：空格分词 + N-gram 双策略
+ *
+ * 1. 先按空格/标点切分
+ * 2. 对每个切分片段：
+ *    - 英文/数字片段保留原样
+ *    - 中文片段生成 2-gram 和 3-gram
+ * 3. 去重后返回
+ */
+function extractSearchTokens(text: string): string[] {
+  const trimmed = text.slice(0, 100).toLowerCase()
+
+  const segments = trimmed
+    .split(/[\s,;.!?，。；！？、\n:：()\[\]{}""''「」【】]+/)
+    .filter(s => s.length > 0)
+
+  const tokens = new Set<string>()
+
+  for (const seg of segments) {
+    const hasCJK = /[\u4e00-\u9fff\u3400-\u4dbf]/.test(seg)
+
+    if (!hasCJK) {
+      if (seg.length > 1) tokens.add(seg)
+    } else {
+      // 英文部分作为整体 token
+      const engParts = seg.match(/[a-z0-9]+/gi)
+      if (engParts) {
+        for (const ep of engParts) {
+          if (ep.length > 1) tokens.add(ep.toLowerCase())
+        }
+      }
+
+      // CJK 连续片段做 N-gram
+      const cjkParts = seg.match(/[\u4e00-\u9fff\u3400-\u4dbf]+/g)
+      if (cjkParts) {
+        for (const part of cjkParts) {
+          if (part.length <= 3) {
+            if (part.length >= 2) tokens.add(part)
+            continue
+          }
+          for (let i = 0; i <= part.length - 2; i++) {
+            tokens.add(part.slice(i, i + 2))
+          }
+          for (let i = 0; i <= part.length - 3; i++) {
+            tokens.add(part.slice(i, i + 3))
+          }
+        }
+      }
+    }
+  }
+
+  return [...tokens]
 }
-
-// ==================== Schema SQL ====================
-
-const SCHEMA_SQL = `
--- 启用 WAL 模式（并发安全）
-PRAGMA journal_mode = WAL;
-PRAGMA busy_timeout = 5000;
-
--- 主表：存储记忆元数据
-CREATE TABLE IF NOT EXISTS memories (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  source TEXT NOT NULL DEFAULT 'USER',
-  cat TEXT NOT NULL,
-  imp INTEGER NOT NULL DEFAULT 3 CHECK(imp BETWEEN 1 AND 5),
-  text TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
--- FTS5 全文搜索虚拟表
-CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
-  text,
-  content='memories',
-  content_rowid='id',
-  tokenize='unicode61'
-);
-
--- 同步触发器：主表增删改自动同步到 FTS 索引
-CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
-  INSERT INTO memories_fts(rowid, text) VALUES (new.id, new.text);
-END;
-
-CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
-  INSERT INTO memories_fts(memories_fts, rowid, text) VALUES ('delete', old.id, old.text);
-END;
-
-CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
-  INSERT INTO memories_fts(memories_fts, rowid, text) VALUES ('delete', old.id, old.text);
-  INSERT INTO memories_fts(rowid, text) VALUES (new.id, new.text);
-END;
-
--- 索引
-CREATE INDEX IF NOT EXISTS idx_memories_cat ON memories(cat);
-CREATE INDEX IF NOT EXISTS idx_memories_imp ON memories(imp DESC);
-CREATE INDEX IF NOT EXISTS idx_memories_source ON memories(source);
-CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at);
-`
 
 // ==================== MemoryDB 类 ====================
 
 export class MemoryDB {
-  private db: Database.Database
+  private filePath: string
+  private entries: MemoryEntry[] = []
+  private nextId: number = 1
 
-  constructor(dbPath: string = MEMORY_CONFIG.DB_PATH) {
-    // 确保目录存在
-    const dir = path.dirname(dbPath)
+  constructor(dbPath?: string) {
+    const rawPath = dbPath || MEMORY_CONFIG.DB_PATH
+    this.filePath = rawPath.replace(/\.(db|md)$/, '.jsonl')
+
+    const dir = path.dirname(this.filePath)
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true })
     }
 
-    this.db = new Database(dbPath)
-    this.db.pragma('journal_mode = WAL')
-    this.db.pragma('busy_timeout = 5000')
-    this.initSchema()
-    console.log(`💾 MemoryDB 初始化完成: ${dbPath}`)
+    this.load()
+    console.log(`📝 MemoryDB (JSONL) 初始化完成: ${this.filePath} (${this.entries.length} entries)`)
   }
 
   // ==================== 写入 ====================
@@ -119,51 +124,69 @@ export class MemoryDB {
       return 'skipped'
     }
 
+    const now = new Date().toISOString().replace('T', ' ').slice(0, 19)
+
     if (duplicateCheck.action === 'merge' && duplicateCheck.existingId !== undefined) {
-      this.db.prepare(`
-        UPDATE memories SET text = ?, imp = MAX(imp, ?), updated_at = datetime('now')
-        WHERE id = ?
-      `).run(entry.text, entry.imp, duplicateCheck.existingId)
+      const existing = this.entries.find(e => e.id === duplicateCheck.existingId)
+      if (existing) {
+        existing.text = entry.text
+        existing.keywords = entry.keywords || existing.keywords
+        existing.imp = Math.max(existing.imp, entry.imp)
+        existing.updated_at = now
+        this.rewrite()
+      }
       return 'merged'
     }
 
-    this.db.prepare(`
-      INSERT INTO memories (source, cat, imp, text) VALUES (?, ?, ?, ?)
-    `).run(entry.source, entry.cat, entry.imp, entry.text)
+    const newEntry: MemoryEntry = {
+      id: this.nextId++,
+      source: entry.source,
+      cat: entry.cat,
+      imp: entry.imp,
+      text: entry.text,
+      keywords: entry.keywords || '',
+      created_at: now,
+      updated_at: now,
+    }
+    this.entries.push(newEntry)
+    this.appendOne(newEntry)
     return 'added'
   }
 
   /**
    * 更新指定记忆
    */
-  update(id: number, fields: Partial<Pick<MemoryEntry, 'text' | 'imp' | 'cat'>>): void {
-    const sets: string[] = []
-    const values: unknown[] = []
+  update(id: number, fields: Partial<Pick<MemoryEntry, 'text' | 'imp' | 'cat' | 'keywords'>>): void {
+    const entry = this.entries.find(e => e.id === id)
+    if (!entry) return
 
-    if (fields.text !== undefined) { sets.push('text = ?'); values.push(fields.text) }
-    if (fields.imp !== undefined) { sets.push('imp = ?'); values.push(fields.imp) }
-    if (fields.cat !== undefined) { sets.push('cat = ?'); values.push(fields.cat) }
+    if (fields.text !== undefined) entry.text = fields.text
+    if (fields.imp !== undefined) entry.imp = fields.imp
+    if (fields.cat !== undefined) entry.cat = fields.cat
+    if (fields.keywords !== undefined) entry.keywords = fields.keywords
+    entry.updated_at = new Date().toISOString().replace('T', ' ').slice(0, 19)
 
-    if (sets.length === 0) return
-
-    sets.push("updated_at = datetime('now')")
-    values.push(id)
-
-    this.db.prepare(`UPDATE memories SET ${sets.join(', ')} WHERE id = ?`).run(...values)
+    this.rewrite()
   }
 
   /**
    * 按 ID 删除
    */
   deleteById(id: number): void {
-    this.db.prepare('DELETE FROM memories WHERE id = ?').run(id)
+    this.entries = this.entries.filter(e => e.id !== id)
+    this.rewrite()
   }
 
   // ==================== 搜索 ====================
 
   /**
-   * FTS5 全文搜索 + 重要性加权排序
-   * 直接接受用户消息作为搜索词，FTS5 unicode61 自动分词
+   * N-gram + 关键词搜索 + 重要性加权排序
+   *
+   * 搜索策略：
+   * 1. 从 query 中提取 token（英文保留原词，中文生成 2/3-gram）
+   * 2. 对每条记忆同时匹配 text 和 keywords 两个字段
+   * 3. text 命中权重 1.0，keywords 命中权重 0.6（避免同义词膨胀导致分数反超）
+   * 4. 综合得分 = imp × 2 + normalizedMatch × 3
    */
   search(query: string, limit: number = 20): SearchResult[] {
     if (!query || !query.trim()) {
@@ -174,133 +197,151 @@ export class MemoryDB {
       }))
     }
 
-    const ftsQuery = this.buildFtsQuery(query)
+    const tokens = extractSearchTokens(query)
 
-    try {
-      return this.db.prepare(`
-        SELECT
-          m.*,
-          fts.rank as fts_rank,
-          (m.imp * 2.0 + ABS(fts.rank) * 3.0) as score
-        FROM memories_fts fts
-        JOIN memories m ON m.id = fts.rowid
-        WHERE memories_fts MATCH ?
-        ORDER BY score DESC
-        LIMIT ?
-      `).all(ftsQuery, limit) as SearchResult[]
-    } catch {
-      // FTS 查询语法错误时回退到 LIKE 模糊搜索
-      return this.db.prepare(`
-        SELECT *, imp * 2.0 as score, 0 as fts_rank
-        FROM memories
-        WHERE text LIKE ?
-        ORDER BY score DESC
-        LIMIT ?
-      `).all(`%${query.slice(0, 50)}%`, limit) as SearchResult[]
+    if (tokens.length === 0) {
+      return this.getTopMemories(limit).map(e => ({
+        ...e,
+        score: e.imp * 2.0,
+        fts_rank: 0,
+      }))
     }
+
+    const scored: SearchResult[] = []
+
+    for (const entry of this.entries) {
+      const textLower = entry.text.toLowerCase()
+      const kwLower = (entry.keywords || '').toLowerCase()
+
+      let weightedMatch = 0
+      let rawMatchCount = 0
+
+      for (const token of tokens) {
+        const inText = textLower.includes(token)
+        const inKw = kwLower.includes(token)
+
+        if (inText || inKw) {
+          rawMatchCount++
+          // text 命中权重 1.0，keywords 命中权重 0.6，两者都命中取 1.0
+          weightedMatch += inText ? 1.0 : 0.6
+        }
+      }
+
+      if (rawMatchCount > 0) {
+        const normalizedMatch = (weightedMatch / tokens.length) * Math.min(tokens.length, 10)
+        scored.push({
+          ...entry,
+          fts_rank: rawMatchCount,
+          score: entry.imp * 2.0 + normalizedMatch * 3.0,
+        })
+      }
+    }
+
+    scored.sort((a, b) => b.score - a.score)
+    return scored.slice(0, limit)
   }
 
   /**
    * 按分类筛选
    */
   getByCategory(cat: string, limit: number = 50): MemoryEntry[] {
-    return this.db.prepare(`
-      SELECT * FROM memories WHERE cat = ?
-      ORDER BY imp DESC, created_at DESC LIMIT ?
-    `).all(cat, limit) as MemoryEntry[]
+    return this.entries
+      .filter(e => e.cat === cat)
+      .sort((a, b) => b.imp - a.imp || b.created_at.localeCompare(a.created_at))
+      .slice(0, limit)
   }
 
   /**
    * 按来源筛选
    */
   getBySource(source: string, limit: number = 50): MemoryEntry[] {
-    return this.db.prepare(`
-      SELECT * FROM memories WHERE source = ?
-      ORDER BY imp DESC, created_at DESC LIMIT ?
-    `).all(source, limit) as MemoryEntry[]
+    return this.entries
+      .filter(e => e.source === source)
+      .sort((a, b) => b.imp - a.imp || b.created_at.localeCompare(a.created_at))
+      .slice(0, limit)
   }
 
   /**
-   * 获取最高重要性记忆（无关键词时的兜底）
+   * 获取最高重要性记忆
    */
   getTopMemories(limit: number = 50): MemoryEntry[] {
-    return this.db.prepare(`
-      SELECT * FROM memories
-      ORDER BY imp DESC, updated_at DESC LIMIT ?
-    `).all(limit) as MemoryEntry[]
+    return [...this.entries]
+      .sort((a, b) => b.imp - a.imp || b.updated_at.localeCompare(a.updated_at))
+      .slice(0, limit)
   }
 
   /**
    * 获取全部记忆
    */
   getAll(): MemoryEntry[] {
-    return this.db.prepare('SELECT * FROM memories ORDER BY created_at').all() as MemoryEntry[]
+    return [...this.entries].sort((a, b) => a.created_at.localeCompare(b.created_at))
   }
 
   /**
    * 统计信息
    */
   getStats(): MemoryStats {
-    const total = (this.db.prepare('SELECT COUNT(*) as cnt FROM memories').get() as { cnt: number }).cnt
-    const byCat = this.db.prepare('SELECT cat, COUNT(*) as cnt FROM memories GROUP BY cat').all() as { cat: string; cnt: number }[]
-    const bySrc = this.db.prepare('SELECT source, COUNT(*) as cnt FROM memories GROUP BY source').all() as { source: string; cnt: number }[]
+    const byCategory: Record<string, number> = {}
+    const bySource: Record<string, number> = {}
+
+    for (const entry of this.entries) {
+      byCategory[entry.cat] = (byCategory[entry.cat] || 0) + 1
+      bySource[entry.source] = (bySource[entry.source] || 0) + 1
+    }
 
     return {
-      total,
-      byCategory: Object.fromEntries(byCat.map(r => [r.cat, r.cnt])),
-      bySource: Object.fromEntries(bySrc.map(r => [r.source, r.cnt])),
+      total: this.entries.length,
+      byCategory,
+      bySource,
     }
   }
 
   // ==================== 删除 ====================
 
-  /**
-   * 安全删除：支持精确匹配 + dry_run 预览
-   */
   delete(query: string, options: { exact_match?: boolean; dry_run?: boolean } = {}): {
     count: number
     entries: MemoryEntry[]
   } {
     const { exact_match = false, dry_run = false } = options
 
-    let entries: MemoryEntry[]
+    let matched: MemoryEntry[]
     if (exact_match) {
-      entries = this.db.prepare('SELECT * FROM memories WHERE text = ?').all(query) as MemoryEntry[]
+      matched = this.entries.filter(e => e.text === query)
     } else {
-      entries = this.db.prepare('SELECT * FROM memories WHERE text LIKE ?').all(`%${query}%`) as MemoryEntry[]
+      matched = this.entries.filter(e => e.text.includes(query))
     }
 
-    if (!dry_run && entries.length > 0) {
-      const ids = entries.map(e => e.id)
-      this.db.prepare(`DELETE FROM memories WHERE id IN (${ids.map(() => '?').join(',')})`).run(...ids)
+    if (!dry_run && matched.length > 0) {
+      const ids = new Set(matched.map(e => e.id))
+      this.entries = this.entries.filter(e => !ids.has(e.id))
+      this.rewrite()
     }
 
-    return { count: entries.length, entries }
+    return { count: matched.length, entries: matched }
   }
 
   // ==================== 淘汰 ====================
 
-  /**
-   * 容量淘汰：指数衰减评分，超阈值时淘汰低分记忆
-   * 评分公式：imp * exp(-ageHours / 720)
-   * 720 小时 = 30 天半衰期
-   */
   compact(
     maxEntries: number = MEMORY_CONFIG.CAPACITY.MAX_ENTRIES,
     keepEntries: number = MEMORY_CONFIG.CAPACITY.KEEP_ENTRIES
   ): number {
-    const count = (this.db.prepare('SELECT COUNT(*) as cnt FROM memories').get() as { cnt: number }).cnt
-    if (count <= maxEntries) return 0
+    if (this.entries.length <= maxEntries) return 0
 
-    const toDelete = count - keepEntries
+    const toDelete = this.entries.length - keepEntries
+    const now = Date.now()
 
-    this.db.prepare(`
-      DELETE FROM memories WHERE id IN (
-        SELECT id FROM memories
-        ORDER BY imp * EXP(-(julianday('now') - julianday(created_at)) * 24.0 / ${MEMORY_CONFIG.CAPACITY.DECAY_HALF_LIFE_HOURS}.0) ASC
-        LIMIT ?
-      )
-    `).run(toDelete)
+    const scored = this.entries.map(entry => {
+      const createdTime = new Date(entry.created_at).getTime()
+      const ageHours = (now - createdTime) / (1000 * 60 * 60)
+      const decayScore = entry.imp * Math.exp(-ageHours / MEMORY_CONFIG.CAPACITY.DECAY_HALF_LIFE_HOURS)
+      return { entry, decayScore }
+    })
+
+    scored.sort((a, b) => a.decayScore - b.decayScore)
+    const idsToRemove = new Set(scored.slice(0, toDelete).map(s => s.entry.id))
+    this.entries = this.entries.filter(e => !idsToRemove.has(e.id))
+    this.rewrite()
 
     console.log(`🗑️ MemoryDB compact: 淘汰了 ${toDelete} 条记忆`)
     return toDelete
@@ -308,54 +349,89 @@ export class MemoryDB {
 
   // ==================== 导出 ====================
 
-  /**
-   * 导出全部记忆为 JSONL
-   */
   exportToJsonl(outputPath: string): number {
-    const entries = this.db.prepare('SELECT * FROM memories ORDER BY created_at').all()
-    const lines = entries.map(e => JSON.stringify(e)).join('\n')
+    const lines = this.entries.map(e => JSON.stringify(e)).join('\n')
     if (outputPath === '/dev/stdout') {
       process.stdout.write(lines + '\n')
     } else {
       fs.writeFileSync(outputPath, lines + '\n')
     }
-    return entries.length
+    return this.entries.length
   }
 
-  /**
-   * 数据库备份
-   */
   backup(backupPath: string): void {
     const dir = path.dirname(backupPath)
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true })
     }
-    this.db.backup(backupPath)
-    console.log(`💾 MemoryDB 备份完成: ${backupPath}`)
+    const targetPath = backupPath.replace(/\.(db|md)$/, '.jsonl')
+    fs.copyFileSync(this.filePath, targetPath)
+    console.log(`📝 MemoryDB 备份完成: ${targetPath}`)
   }
 
-  /**
-   * 关闭数据库
-   */
   close(): void {
-    this.db.close()
+    // no-op
   }
 
-  // ==================== 内部方法 ====================
+  // ==================== 内部方法：持久化 ====================
 
-  /**
-   * 写入时轻量去重：精确匹配 + Jaccard 相似度
-   */
+  private load(): void {
+    if (!fs.existsSync(this.filePath)) {
+      this.entries = []
+      this.nextId = 1
+      return
+    }
+
+    const content = fs.readFileSync(this.filePath, 'utf-8')
+    this.entries = []
+    let maxId = 0
+
+    for (const line of content.split('\n')) {
+      if (!line.trim()) continue
+      try {
+        const raw = JSON.parse(line) as Record<string, unknown>
+        // 兼容旧数据：没有 keywords 字段的补空字符串
+        const entry: MemoryEntry = {
+          id: raw.id as number,
+          source: raw.source as MemorySource,
+          cat: raw.cat as MemoryCat,
+          imp: raw.imp as number,
+          text: raw.text as string,
+          keywords: (raw.keywords as string) || '',
+          created_at: raw.created_at as string,
+          updated_at: raw.updated_at as string,
+        }
+        this.entries.push(entry)
+        if (entry.id !== undefined && entry.id > maxId) {
+          maxId = entry.id
+        }
+      } catch {
+        console.warn(`⚠️ 跳过损坏的记忆行: ${line.slice(0, 80)}...`)
+      }
+    }
+
+    this.nextId = maxId + 1
+  }
+
+  private appendOne(entry: MemoryEntry): void {
+    fs.appendFileSync(this.filePath, JSON.stringify(entry) + '\n', 'utf-8')
+  }
+
+  private rewrite(): void {
+    const lines = this.entries.map(e => JSON.stringify(e)).join('\n')
+    fs.writeFileSync(this.filePath, lines ? lines + '\n' : '', 'utf-8')
+  }
+
+  // ==================== 内部方法：去重 ====================
+
   private checkDuplicate(text: string, cat: string): {
     action: 'add' | 'merge' | 'skip'
     existingId?: number
   } {
-    // 1. 精确匹配
-    const exact = this.db.prepare('SELECT id FROM memories WHERE text = ? LIMIT 1').get(text) as { id: number } | undefined
+    const exact = this.entries.find(e => e.text === text)
     if (exact) return { action: 'skip' }
 
-    // 2. 同分类下的模糊匹配
-    const sameCat = this.db.prepare('SELECT id, text FROM memories WHERE cat = ?').all(cat) as MemoryEntry[]
+    const sameCat = this.entries.filter(e => e.cat === cat)
     for (const entry of sameCat) {
       if (this.jaccardSimilarity(text, entry.text) > MEMORY_CONFIG.DEDUP.JACCARD_THRESHOLD) {
         return { action: 'merge', existingId: entry.id }
@@ -365,9 +441,6 @@ export class MemoryDB {
     return { action: 'add' }
   }
 
-  /**
-   * Jaccard 相似度计算
-   */
   private jaccardSimilarity(a: string, b: string): number {
     const tokenize = (s: string) => new Set(
       s.toLowerCase()
@@ -379,26 +452,5 @@ export class MemoryDB {
     const intersection = new Set([...setA].filter(x => setB.has(x)))
     const union = new Set([...setA, ...setB])
     return union.size === 0 ? 0 : intersection.size / union.size
-  }
-
-  /**
-   * 构建 FTS5 查询语法
-   * 截取前 100 字符，分词后用 OR 连接，支持前缀匹配
-   */
-  private buildFtsQuery(query: string): string {
-    const trimmed = query.slice(0, 100)
-    const tokens = trimmed
-      .split(/[\s,;.!?，。；！？、\n]+/)
-      .filter(t => t.length > 1)
-      .slice(0, 10)             // 最多 10 个关键词
-      .map(t => `"${t}"*`)      // 前缀匹配
-    return tokens.length > 0 ? tokens.join(' OR ') : `"${trimmed}"*`
-  }
-
-  /**
-   * 初始化数据库 Schema
-   */
-  private initSchema(): void {
-    this.db.exec(SCHEMA_SQL)
   }
 }

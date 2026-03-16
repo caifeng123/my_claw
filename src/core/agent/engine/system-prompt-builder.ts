@@ -1,11 +1,11 @@
 /**
- * SystemPromptBuilder - 组装 systemPrompt（静态层 + 动态记忆）
- * V4.1 - 用户消息直传 FTS5 搜索，自适应 Budget
+ * SystemPromptBuilder - 组装 systemPrompt（静态层 + Top-N 常驻记忆）
+ * V5.4 - 按重要性注入高优记忆，不做搜索，零匹配开销
  */
 
 import * as fs from 'node:fs'
 import { MemoryDB, type MemoryEntry } from '../../memory/memory-db.js'
-import { MEMORY_CONFIG, estimateTokens, getDynamicMemoryBudget } from '../../memory/config.js'
+import { MEMORY_CONFIG, estimateTokens } from '../../memory/config.js'
 
 // ==================== 类型定义 ====================
 
@@ -13,10 +13,8 @@ export interface BuildStats {
   soulTokens: number
   claudeTokens: number
   memoryTokens: number
-  totalTokens: number
   memoryCount: number
-  searchQuery: string
-  fallbackUsed: boolean
+  totalTokens: number
 }
 
 export interface SystemPromptResult {
@@ -34,49 +32,32 @@ export class SystemPromptBuilder {
   }
 
   /**
-   * 构建完整 System Prompt
-   * @param userMessage 当前用户消息，用于 FTS5 检索相关记忆
-   * @param conversationTokens 当前对话已用 token（用于自适应 budget）
+   * 构建 System Prompt
+   * SOUL.md + CLAUDE.md + imp≥4 的常驻记忆（按重要性降序，受 budget 截断）
    */
-  build(userMessage: string, conversationTokens: number = 0): SystemPromptResult {
+  build(): SystemPromptResult {
     const { SOUL, CLAUDE } = MEMORY_CONFIG.TOKEN_BUDGET
 
-    // 1. 读取 SOUL.md（截断至预算）
     const soul = this.loadAndTruncate('./data/SOUL.md', SOUL)
-
-    // 2. 读取 CLAUDE.md（截断至预算）
     const claude = this.loadAndTruncate('./data/CLAUDE.md', CLAUDE)
 
-    // 3. 用户消息直传 FTS5 搜索相关记忆
-    const searchQuery = userMessage.slice(0, 100)
-    let memories = this.memoryDb.search(searchQuery, 50)
-    let fallbackUsed = false
+    // 取 imp≥4 的记忆，按 imp 降序
+    const topMemories = this.memoryDb.getTopMemories(50)
+      .filter(e => e.imp >= 4)
 
-    // 4. 如果 FTS5 没命中，回退到 Top 重要性
-    if (memories.length === 0) {
-      memories = this.memoryDb.getTopMemories(50).map((e: MemoryEntry) => ({
-        ...e,
-        score: e.imp * 2.0,
-        fts_rank: 0,
-      }))
-      fallbackUsed = true
-    }
+    // 格式化，受 budget 截断
+    const dynamicBudget = MEMORY_CONFIG.TOKEN_BUDGET.DYNAMIC_DEFAULT
+    const { content: memoryContent, count: memoryCount } = this.formatMemories(topMemories, dynamicBudget)
 
-    // 5. 格式化记忆，按 budget 截断
-    const dynamicBudget = getDynamicMemoryBudget(conversationTokens)
-    const dynamicContent = this.formatMemories(memories, dynamicBudget)
-
-    // 6. 组装
     const parts: string[] = []
     if (soul) parts.push(soul)
     if (claude) parts.push(claude)
-    if (dynamicContent) parts.push(`\n## Active Memories\n${dynamicContent}`)
+    if (memoryContent) parts.push(`\n## Active Memories\n${memoryContent}`)
     const text = parts.join('\n\n')
 
-    // 7. 统计
     const soulTokens = estimateTokens(soul)
     const claudeTokens = estimateTokens(claude)
-    const memoryTokens = estimateTokens(dynamicContent)
+    const memoryTokens = estimateTokens(memoryContent)
 
     return {
       text,
@@ -84,17 +65,12 @@ export class SystemPromptBuilder {
         soulTokens,
         claudeTokens,
         memoryTokens,
+        memoryCount,
         totalTokens: soulTokens + claudeTokens + memoryTokens,
-        memoryCount: memories.length,
-        searchQuery,
-        fallbackUsed,
       },
     }
   }
 
-  /**
-   * 读取文件并按 token 预算截断
-   */
   private loadAndTruncate(filePath: string, maxTokens: number): string {
     try {
       if (!fs.existsSync(filePath)) return ''
@@ -102,7 +78,6 @@ export class SystemPromptBuilder {
       const tokens = estimateTokens(content)
       if (tokens <= maxTokens) return content
 
-      // 按比例截断
       const ratio = maxTokens / tokens
       const maxChars = Math.floor(content.length * ratio)
       return content.slice(0, maxChars) + '\n\n[... 内容已截断以适配 token 预算]'
@@ -113,9 +88,9 @@ export class SystemPromptBuilder {
   }
 
   /**
-   * 格式化记忆条目，按 budget 截断
+   * 格式化记忆条目（只用 text，不含 keywords），受 budget 截断
    */
-  private formatMemories(entries: MemoryEntry[], budget: number): string {
+  private formatMemories(entries: MemoryEntry[], budget: number): { content: string; count: number } {
     const lines: string[] = []
     let usedTokens = 0
 
@@ -127,6 +102,6 @@ export class SystemPromptBuilder {
       usedTokens += lineTokens
     }
 
-    return lines.join('\n')
+    return { content: lines.join('\n'), count: lines.length }
   }
 }

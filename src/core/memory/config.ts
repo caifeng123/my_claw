@@ -1,11 +1,11 @@
 /**
  * Memory 系统配置常量
- * V4.1 - 智能分层记忆系统
+ * V5.1 - JSONL 明文存储版本
  */
 
 export const MEMORY_CONFIG = {
-  /** 数据库路径 */
-  DB_PATH: process.env.MEMORY_DB_PATH || './data/memory.db',
+  /** 记忆文件路径（.jsonl）— 兼容旧 DB_PATH 配置名 */
+  DB_PATH: process.env.MEMORY_DB_PATH || './data/memory.jsonl',
   /** 对话历史存储路径 */
   CONVERSATIONS_PATH: process.env.CONVERSATIONS_PATH || './data/conversations',
 
