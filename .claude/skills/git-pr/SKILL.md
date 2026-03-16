@@ -98,7 +98,7 @@ Parse the output:
 
 ### Step 4: AI Update PR — Generate title and description
 
-Read `DIFF_FILE` and `STAT_FILE`, generate a PR summary:
+Read `DIFF_FILE` and `STAT_FILE`, generate a PR summary, all use chinese:
 
 ```markdown
 ## Summary
