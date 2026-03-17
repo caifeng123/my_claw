@@ -119,6 +119,10 @@ export class ClaudeEngine {
     abortController?: AbortController,
   ): Promise<string> {
     let result = ''
+    // [FIX] 追踪是否从 assistant 消息中收到过 text 块内容
+    let hasReceivedTextContent = false
+    // [FIX] 收集所有 thinking 内容，用于在无 text 输出时作为生成回答的上下文
+    let allThinkingContent = ''
     // Token 用量累计（跨多个 assistant 消息）
     const usageAccum: TokenUsageStats = {
       inputTokens: 0,
@@ -187,8 +191,25 @@ export class ClaudeEngine {
           console.log('🔍 [ResultMsg] result(200):', String(resultMsg.result).slice(0, 200))
 
           const messageResult = resultMsg.result
-          result += messageResult
-          await eventHandlers?.onContentDelta?.(messageResult)
+          const stopReason = resultMsg.stop_reason
+          const subtype = resultMsg.subtype
+          console.log('🔍 [ResultMsg] subtype:', subtype, 'stop_reason:', stopReason)
+
+          // [FIX] 智能决策：是否将 result 作为内容增量发送
+          if (hasReceivedTextContent) {
+            // 已从 assistant text 块收到内容 → 不重复发送 result（避免重复/thinking 污染）
+            console.log('🔍 [ResultMsg] Skipping result delta (text already received via assistant blocks)')
+            if (!result.trim()) result = messageResult
+          } else if (messageResult && messageResult.trim()) {
+            // 没收到过 text 内容，result 非空 → 用 result 兜底
+            console.log('🔍 [ResultMsg] Using result as fallback content')
+            result += messageResult
+            await eventHandlers?.onContentDelta?.(messageResult)
+          } else {
+            // result 为空且没收到 text → 模型在最后一轮只输出了 thinking 就停止了
+            // 需要将最后的 thinking 作为上下文，重新请求一次生成回答
+            console.warn('⚠️ [ResultMsg] Empty result AND no text content from assistant! Last thinking may contain the answer context.')
+          }
 
           // 提取 token 用量 — 三种策略
           // 策略 1: usage (BetaUsage 蛇形)
@@ -223,11 +244,11 @@ export class ClaudeEngine {
             usageAccum.totalCostUsd = resultMsg.totalCostUsd
           }
 
-          console.log('📊 [Usage] FINAL: in=' + usageAccum.inputTokens + ' out=' + usageAccum.outputTokens + ' cache=' + usageAccum.cacheReadTokens + ' cost=$' + usageAccum.totalCostUsd)
           await eventHandlers?.onUsageUpdate?.(usageAccum)
 
         } else if (message.type === 'assistant') {
           // ====== assistant 消息：包含 thinking / text / tool_use 块 ======
+          console.log(message)
           const msg = message?.message
           const assistantContent = msg?.content
           const messageId = msg?.id
@@ -237,7 +258,6 @@ export class ClaudeEngine {
             seenMessageIds.add(messageId)
             const stepUsage = (msg as any)?.usage
             if (stepUsage) {
-              console.log('🔍 [AssistantUsage] id=' + messageId + ' usage:', JSON.stringify(stepUsage))
               // 同时兼容蛇形和驼峰
               usageAccum.inputTokens += stepUsage.input_tokens || stepUsage.inputTokens || 0
               usageAccum.outputTokens += stepUsage.output_tokens || stepUsage.outputTokens || 0
@@ -251,9 +271,14 @@ export class ClaudeEngine {
           console.log('Assistant message:', assistantContent)
 
           if (assistantContent && Array.isArray(assistantContent)) {
+            // [FIX] 跟踪本轮 assistant 消息是否包含 thinking 块
+            let hasThinkingInThisMessage = false
+
             for (const block of assistantContent) {
               // --- thinking 块 ---
               if (block.type === 'thinking' && block.thinking) {
+                hasThinkingInThisMessage = true
+                allThinkingContent += block.thinking  // [FIX] 累积所有 thinking 内容
                 await eventHandlers?.onThinkingDelta?.(block.thinking)
               }
 
@@ -269,35 +294,100 @@ export class ClaudeEngine {
               // --- text 块 ---
               if (block.type === 'text' && block.text) {
                 lastAssistantContent = block.text
+                hasReceivedTextContent = true  // [FIX] 标记已从 assistant text 块收到内容
                 // ✅ 触发内容增量事件
                 await eventHandlers?.onContentDelta?.(block.text)
               }
             }
-            // ✅ 所有块处理完成，触发 thinking 结束
-            await eventHandlers?.onThinkingStop?.()
+            // [FIX] 仅在本轮 assistant 消息确实包含 thinking 块时才触发 thinkingStop
+            // 避免工具调用后的后续 assistant 消息误触发 thinkingStop
+            if (hasThinkingInThisMessage) {
+              await eventHandlers?.onThinkingStop?.()
+            }
           }
 
         } else if (message.type === 'user') {
           // ====== user 消息：工具执行结果 ======
+          // [FIX V2] 基于实际日志确认的 SDK 消息结构进行解析
+          // 实际结构: { type: 'user', message: { role: 'user', content: [{ tool_use_id, type: 'tool_result', content: [...] }] } }
           const userMsg = message as any
-          const parentToolUseId = userMsg.parent_tool_use_id
-          const toolUseResult = userMsg.tool_use_result
           const keys = Object.keys(userMsg).join(',')
-          console.log(`🔧 User message: parent_tool_use_id=${parentToolUseId}, has_tool_result=${!!toolUseResult}, keys=${keys}`)
-          // 从 user 消息提取工具执行结果
-          if (parentToolUseId && toolUseResult) {
-            const toolName = toolUseIdToName.get(parentToolUseId) || 'unknown_tool'
-            let resultContent = toolUseResult
-            // 兼容 content 数组格式的结果
-            if (toolUseResult.content && Array.isArray(toolUseResult.content)) {
-              const textParts = toolUseResult.content
-                .filter((b: any) => b.type === 'text')
-                .map((b: any) => b.text)
-              if (textParts.length > 0) {
-                resultContent = textParts.join('\n')
+
+          // [FIX V2] 从 message.content 数组中提取所有 tool_result 条目
+          const messageContent = userMsg.message?.content
+          if (Array.isArray(messageContent)) {
+            // SDK 将工具结果放在 message.content 数组中，每个条目是一个 tool_result
+            for (const entry of messageContent) {
+              if (entry?.type === 'tool_result' && entry?.tool_use_id) {
+                const toolUseId = entry.tool_use_id
+                const toolName = toolUseIdToName.get(toolUseId) || 'unknown_tool'
+
+                // 提取结果文本
+                let resultContent: any
+                if (Array.isArray(entry.content)) {
+                  // content: [{ type: 'text', text: '...' }, ...]
+                  const textParts = entry.content
+                    .filter((b: any) => b.type === 'text')
+                    .map((b: any) => b.text || '')
+                  resultContent = textParts.length > 0
+                    ? textParts.join('\n')
+                    : JSON.stringify(entry.content).slice(0, 500)
+                } else if (typeof entry.content === 'string') {
+                  resultContent = entry.content
+                } else {
+                  resultContent = entry.content
+                    ? JSON.stringify(entry.content).slice(0, 500)
+                    : '(tool executed, no result captured)'
+                }
+
+                await eventHandlers?.onToolUseStop?.(toolName, resultContent)
               }
             }
-            await eventHandlers?.onToolUseStop?.(toolName, resultContent)
+          } else {
+            // [FALLBACK] 旧路径: 尝试从顶层字段获取
+            const parentToolUseId = userMsg.parent_tool_use_id
+              ?? userMsg.message?.parent_tool_use_id
+
+            const toolUseResult = userMsg.tool_use_result
+              ?? userMsg.tool_result
+              ?? userMsg.message?.tool_use_result
+              ?? userMsg.message?.tool_result
+
+            console.log(`🔧 [FALLBACK] User message: parent_tool_use_id=${parentToolUseId}, has_tool_result=${!!toolUseResult}, keys=${keys}`)
+
+            if (parentToolUseId) {
+              const toolName = toolUseIdToName.get(parentToolUseId) || 'unknown_tool'
+              let resultContent: any = toolUseResult ?? '(tool executed, no result captured)'
+
+              if (Array.isArray(resultContent)) {
+                const textParts = resultContent
+                  .filter((b: any) => b.type === 'text' || b.type === 'tool_result')
+                  .map((b: any) => b.text || b.content || JSON.stringify(b))
+                resultContent = textParts.length > 0
+                  ? textParts.join('\n')
+                  : JSON.stringify(resultContent).slice(0, 500)
+              } else if (typeof resultContent === 'object' && resultContent !== null) {
+                if (resultContent.content && Array.isArray(resultContent.content)) {
+                  const textParts = resultContent.content
+                    .filter((b: any) => b.type === 'text')
+                    .map((b: any) => b.text)
+                  resultContent = textParts.length > 0
+                    ? textParts.join('\n')
+                    : JSON.stringify(resultContent).slice(0, 500)
+                } else if (typeof resultContent.text === 'string') {
+                  resultContent = resultContent.text
+                } else {
+                  resultContent = JSON.stringify(resultContent).slice(0, 500)
+                }
+              }
+
+              console.log(`🔧 [FALLBACK] Resolved tool result: name=${toolName}, resultLen=${String(resultContent).length}`)
+              await eventHandlers?.onToolUseStop?.(toolName, resultContent)
+            } else {
+              // 最终兜底: 既没有 message.content 数组，也没有 parent_tool_use_id
+              console.warn(`⚠️ User message has no parseable tool result. keys=${keys}`)
+              console.warn('⚠️ [DEBUG] User message FULL:', JSON.stringify(userMsg).slice(0, 1000))
+            }
           }
         }
         // 其他消息类型暂不处理
@@ -306,6 +396,15 @@ export class ClaudeEngine {
       // 如果 result 为空，使用最后一个 assistant 消息
       if (!result.trim() && lastAssistantContent) {
         result = lastAssistantContent
+      }
+
+      // [FIX] 终极兜底：如果 result 仍为空但有 thinking 内容，
+      // 说明模型在最后一轮只输出了 thinking 没有生成 text 回答（SDK/模型边界情况）
+      // 直接将最后一段 thinking 原文作为降级输出
+      if (!result.trim() && allThinkingContent.trim()) {
+        console.warn('⚠️ [FIX] No text output from model, falling back to last thinking content')
+        result = allThinkingContent
+        await eventHandlers?.onContentDelta?.(allThinkingContent)
       }
 
       await eventHandlers?.onContentStop?.(usageAccum)

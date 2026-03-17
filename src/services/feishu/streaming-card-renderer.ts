@@ -1,7 +1,11 @@
 /**
- * StreamingCardRenderer V2.0
+ * StreamingCardRenderer V2.1
  *
  * 流式飞书卡片渲染器 — 基于「Create + Patch」模式实现实时更新。
+ *
+ * V2.1 修复:
+ *   - onComplete 增加防御性兜底：强制将所有仍在 running 的工具标记为 success
+ *   - 避免因上游 onToolEnd 未触发导致卡片永远显示 "执行中 (0/N)"
  *
  * V2 全新卡片设计（扁平状态栏方案）:
  *   ┌─────────────────────────────────────────────────────┐
@@ -90,7 +94,7 @@ export interface StreamingCardRendererConfig {
   maxToolInputChars?: number
   /** 工具输出截断长度，默认 800 */
   maxToolOutputChars?: number
-  /** 回答内容截断长度，默认 3500 (卡片30KB上限) */
+  /** 回答内容截断长度，默认 Infinity (不做静态截断，由 executePatch 基于 UTF-8 字节数动态缩减) */
   maxContentChars?: number
   /** 最多显示几个工具调用子面板（超出后合并为摘要行），默认 8 */
   maxToolPanels?: number
@@ -141,7 +145,7 @@ export class StreamingCardRenderer {
       maxThinkingChars: config?.maxThinkingChars ?? 2000,
       maxToolInputChars: config?.maxToolInputChars ?? 500,
       maxToolOutputChars: config?.maxToolOutputChars ?? 800,
-      maxContentChars: config?.maxContentChars ?? 3500,
+      maxContentChars: config?.maxContentChars ?? Infinity,
       maxToolPanels: config?.maxToolPanels ?? 8,
     }
 
@@ -169,9 +173,6 @@ export class StreamingCardRenderer {
     if (this.isFallbackMode) return
 
     if (this.state.phase === 'init' || this.state.phase === 'thinking') {
-      if (this.state.phase === 'init') {
-        this.state.stepCount++
-      }
       this.state.phase = 'thinking'
       if (!this.state.thinkingStartTime) {
         this.state.thinkingStartTime = Date.now()
@@ -228,6 +229,18 @@ export class StreamingCardRenderer {
       tool.status = typeof output === 'string' && output.startsWith('Error') ? 'error' : 'success'
       tool.endTime = Date.now()
       tool.output = output
+    } else {
+      // [FIX] 如果按名字找不到 running 的工具（可能 toolName 是 unknown_tool），
+      // 尝试标记任意一个 running 状态的工具为完成
+      const anyRunning = [...this.state.toolCalls]
+        .reverse()
+        .find(t => t.status === 'running')
+      if (anyRunning) {
+        console.log(`⚠️ [StreamCard] onToolEnd: name mismatch (got "${toolName}"), marking "${anyRunning.name}" as success`)
+        anyRunning.status = typeof output === 'string' && output.startsWith('Error') ? 'error' : 'success'
+        anyRunning.endTime = Date.now()
+        anyRunning.output = output
+      }
     }
 
     // 检查是否还有正在运行的工具
@@ -260,6 +273,16 @@ export class StreamingCardRenderer {
 
   /** 完成 */
   async onComplete(usage?: TokenUsageStats): Promise<void> {
+    // [FIX] 防御性兜底：将所有仍在 running 的工具强制标记为 success
+    // 避免因上游 onToolEnd 未正确触发导致卡片永远显示 "执行中 (0/N)"
+    for (const tool of this.state.toolCalls) {
+      if (tool.status === 'running') {
+        console.log(`⚠️ [StreamCard] onComplete: force-completing tool "${tool.name}" (was still running)`)
+        tool.status = 'success'
+        tool.endTime = tool.endTime ?? Date.now()
+      }
+    }
+
     this.state.phase = 'completed'
     this.state.currentAction = ''
     if (usage) this.state.usage = usage
@@ -268,6 +291,14 @@ export class StreamingCardRenderer {
 
   /** 错误 */
   async onError(errorMessage: string): Promise<void> {
+    // [FIX] 错误时也将 running 工具标记为 error
+    for (const tool of this.state.toolCalls) {
+      if (tool.status === 'running') {
+        tool.status = 'error'
+        tool.endTime = tool.endTime ?? Date.now()
+      }
+    }
+
     this.state.phase = 'error'
     this.state.errorMessage = errorMessage
     this.state.currentAction = ''
@@ -282,6 +313,11 @@ export class StreamingCardRenderer {
   /** 获取最终完整回答文本 */
   getFullResponseText(): string {
     return this.state.contentText
+  }
+
+  /** [FIX] 检查回答内容是否因卡片大小限制被截断 */
+  isContentTruncated(): boolean {
+    return this.state.contentText.endsWith('... (已截断)')
   }
 
   // ==================== Card Building ====================
@@ -348,7 +384,7 @@ export class StreamingCardRenderer {
     if (this.state.contentText) {
       elements.push({
         tag: 'markdown',
-        content: this.truncate(this.state.contentText, this.config.maxContentChars),
+        content: this.state.contentText,  // 不在 buildCard 截断，由 executePatch 按字节动态缩减
         text_size: 'normal',
       })
     }
@@ -568,9 +604,10 @@ export class StreamingCardRenderer {
       }
     }
 
-    // 步骤数
-    if (this.state.stepCount > 0) {
-      parts.push(`🔧 ${this.state.stepCount} 步`)
+    // 工具调用次数（仅统计实际工具调用，不含 thinking）
+    const toolCallCount = this.state.toolCalls.length
+    if (toolCallCount > 0) {
+      parts.push(`🔧 ${toolCallCount} 次调用`)
     }
 
     return {
@@ -652,21 +689,66 @@ export class StreamingCardRenderer {
     }
   }
 
+  // [FIX] 飞书卡片 30KB 限制按 UTF-8 字节算，中文 3 bytes/char
+  private static readonly CARD_BYTE_LIMIT = 29 * 1024  // 29KB，留 1KB 安全余量
+
+  private getByteLength(str: string): number {
+    return Buffer.byteLength(str, 'utf8')
+  }
+
   /** 执行 Patch 更新 */
   private async executePatch(): Promise<void> {
     if (!this.messageId || this.isFallbackMode) return
 
     try {
-      const cardJson = JSON.stringify(this.buildCard())
-      if (cardJson.length > 28000) {
-        console.warn(`⚠️ 卡片 JSON 接近上限 (${cardJson.length} bytes)，截断内容`)
-        this.state.thinkingContent = this.truncate(this.state.thinkingContent, 500)
-        this.state.contentText = this.truncate(this.state.contentText, 2000)
-        const trimmedJson = JSON.stringify(this.buildCard())
-        await this.client.patchInteractiveCard(this.messageId, trimmedJson)
-      } else {
-        await this.client.patchInteractiveCard(this.messageId, cardJson)
+      let cardJson = JSON.stringify(this.buildCard())
+      let byteSize = this.getByteLength(cardJson)
+
+      // [FIX] 基于 UTF-8 字节数动态缩减
+      if (byteSize > StreamingCardRenderer.CARD_BYTE_LIMIT) {
+        console.warn(`⚠️ 卡片 JSON 超限 (${byteSize} bytes / ${StreamingCardRenderer.CARD_BYTE_LIMIT} limit)，动态缩减...`)
+
+        // 第1步：缩减思考内容
+        if (this.state.thinkingContent.length > 500) {
+          this.state.thinkingContent = this.truncate(this.state.thinkingContent, 500)
+          cardJson = JSON.stringify(this.buildCard())
+          byteSize = this.getByteLength(cardJson)
+        }
+
+        // 第2步：缩减工具输出
+        if (byteSize > StreamingCardRenderer.CARD_BYTE_LIMIT) {
+          for (const tool of this.state.toolCalls) {
+            if (tool.output && typeof tool.output === 'string' && tool.output.length > 200) {
+              tool.output = tool.output.slice(0, 200) + '...(已截断)'
+            }
+          }
+          cardJson = JSON.stringify(this.buildCard())
+          byteSize = this.getByteLength(cardJson)
+        }
+
+        // 第3步：二分法缩减正文——精确找到最大可容纳长度
+        if (byteSize > StreamingCardRenderer.CARD_BYTE_LIMIT) {
+          const originalContent = this.state.contentText
+          let lo = 0, hi = originalContent.length
+          while (lo < hi) {
+            const mid = Math.ceil((lo + hi) / 2)
+            this.state.contentText = originalContent.slice(0, mid) + '\n... (已截断)'
+            const testJson = JSON.stringify(this.buildCard())
+            if (this.getByteLength(testJson) <= StreamingCardRenderer.CARD_BYTE_LIMIT) {
+              lo = mid
+            } else {
+              hi = mid - 1
+            }
+          }
+          this.state.contentText = lo < originalContent.length
+            ? originalContent.slice(0, lo) + '\n... (已截断)'
+            : originalContent
+          cardJson = JSON.stringify(this.buildCard())
+          console.log(`📋 正文缩减: ${originalContent.length} → ${lo} 字符, 卡片 ${this.getByteLength(cardJson)} bytes`)
+        }
       }
+
+      await this.client.patchInteractiveCard(this.messageId, cardJson)
       this.hasPendingPatch = false
     } catch (error) {
       console.error('❌ Patch 卡片失败:', error)

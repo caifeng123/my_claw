@@ -85,6 +85,12 @@ export class FeishuService implements FeishuConnection {
   private ackReactionByChat = new Map<string, string>(); // 消息确认反应
   private typingReactionByChat = new Map<string, string>(); // 输入状态反应
 
+  // [FIX] 生成考虑 threadId 的存储 key，避免话题群多 thread 共享 chatId 导致 reaction 互相覆盖
+  private getReactionKey(chatId: string, threadId?: string): string {
+    return threadId ? `${chatId}:${threadId}` : chatId;
+  }
+
+
   constructor(config: FeishuConnectionConfig) {
     this.config = config;
   }
@@ -162,16 +168,18 @@ export class FeishuService implements FeishuConnection {
       return;
     }
 
-    // 清理确认反应
+    // [FIX] 使用 threadId-aware key 清理确认反应
+    const ackKey = this.getReactionKey(chatId, threadId);
     const clearAckReaction = () => {
-      const ackStored = this.ackReactionByChat.get(chatId);
+      const ackStored = this.ackReactionByChat.get(ackKey);
       if (ackStored) {
-        const parts = ackStored.split(':');
-        if (parts.length === 2) {
-          const [ackMsgId, ackReactionId] = parts;
-          this.removeReaction(ackMsgId!, ackReactionId!).catch(() => { });
+        const sepIdx = ackStored.indexOf('|');
+        if (sepIdx > 0) {
+          const ackMsgId = ackStored.slice(0, sepIdx);
+          const ackReactionId = ackStored.slice(sepIdx + 1);
+          this.removeReaction(ackMsgId, ackReactionId).catch(() => { });
         }
-        this.ackReactionByChat.delete(chatId);
+        this.ackReactionByChat.delete(ackKey);
       }
     };
 
@@ -222,25 +230,27 @@ export class FeishuService implements FeishuConnection {
 
   async sendTyping(chatId: string, isTyping: boolean, threadId?: string): Promise<void> {
     if (!this.client) return;
-    const lastMsgId = this.lastMessageIdByChat.get(chatId);
+    // [FIX] 使用 threadId-aware key，避免话题群多 thread 共享 chatId 时 reaction 互相覆盖
+    const reactionKey = this.getReactionKey(chatId, threadId);
+    const lastMsgId = this.lastMessageIdByChat.get(reactionKey);
     if (!lastMsgId) return;
-    // Note: threadId is kept for forward compatibility but ignored in implementation
-    // Feishu has no native typing API; we use messageReaction which is bound to message_id, not thread
 
     if (isTyping) {
       const reactionId = await this.addReaction(lastMsgId, 'OnIt');
       if (reactionId) {
-        this.typingReactionByChat.set(chatId, `${lastMsgId}:${reactionId}`);
+        // [FIX] 使用 "|" 分隔符替代 ":"，避免与飞书 message_id 中可能存在的冒号冲突
+        this.typingReactionByChat.set(reactionKey, `${lastMsgId}|${reactionId}`);
       }
     } else {
-      const stored = this.typingReactionByChat.get(chatId);
+      const stored = this.typingReactionByChat.get(reactionKey);
       if (stored) {
-        const parts = stored.split(':');
-        if (parts.length === 2) {
-          const [msgId, reactionId] = parts;
-          await this.removeReaction(msgId!, reactionId!);
+        const sepIdx = stored.indexOf('|');
+        if (sepIdx > 0) {
+          const msgId = stored.slice(0, sepIdx);
+          const reactionId = stored.slice(sepIdx + 1);
+          await this.removeReaction(msgId, reactionId);
         }
-        this.typingReactionByChat.delete(chatId);
+        this.typingReactionByChat.delete(reactionKey);
       }
     }
   }
@@ -318,7 +328,7 @@ export class FeishuService implements FeishuConnection {
       // }
 
       // 记录最后一条消息ID
-      this.lastMessageIdByChat.set(chatId, messageId);
+      this.lastMessageIdByChat.set(this.getReactionKey(chatId, threadId), messageId);
 
       // 构建消息对象
       const feishuMessage: FeishuMessage = {

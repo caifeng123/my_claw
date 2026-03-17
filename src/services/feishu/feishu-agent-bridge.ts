@@ -477,7 +477,6 @@ ${originalContent}
       },
 
       onToolUseStop: async (toolName: string, result: any) => {
-        console.log(`📋 [StreamCard] onToolUseStop: ${toolName}, resultLen=${String(result).length}`)
         await renderer.onToolEnd(toolName, result);
       },
 
@@ -499,6 +498,12 @@ ${originalContent}
           }
         } else {
           await renderer.onComplete(usage);
+
+          // [FIX] 如果卡片内容被截断，追加一条完整消息
+          if (renderer.isContentTruncated() && fullResponse) {
+            console.log(`📋 [StreamCard] Content was truncated (${fullResponse.length} chars), sending full response as follow-up message`)
+            await this.sendMessageWithAIFix(message.chatId, fullResponse, replyMessageId, message.threadId);
+          }
         }
         console.log(`✅ Streaming card response completed: ${fullResponse.length} chars`);
       },
