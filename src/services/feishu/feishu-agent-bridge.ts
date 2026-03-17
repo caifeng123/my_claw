@@ -1,12 +1,14 @@
 /**
- * FeishuAgentBridge V4.1
- * 简化版：去掉手动拼历史逻辑，由 AgentEngine 内部管理上下文
+ * FeishuAgentBridge V4.2
+ * 新增: 流式卡片支持 (Create + Patch 模式)
+ * 基于 V4.1 简化版：去掉手动拼历史逻辑，由 AgentEngine 内部管理上下文
  */
 
 import { FeishuService, FeishuSendError } from './feishu-service.js';
+import { StreamingCardRenderer } from './streaming-card-renderer.js';
 import type { FeishuConnectionConfig, FeishuMessage, ThreadContext } from './types.js';
 import { getAgentEngine } from '../../core/agent-registry.js';
-import type { EventHandlers } from '@/core/agent/types/agent.js';
+import type { EventHandlers, TokenUsageStats } from '@/core/agent/types/agent.js';
 import { writeFileSync } from 'fs';
 import { execSync } from 'child_process';
 import { ClaudeEngine } from '@/core/agent/engine/claude-engine.js';
@@ -30,6 +32,8 @@ export interface FeishuAgentBridgeConfig {
   sessionPrefix?: string;
   enableStreaming?: boolean;
   showTypingIndicator?: boolean;
+  /** 是否启用流式卡片 (Create + Patch)，默认 false */
+  enableStreamingCard?: boolean;
 }
 
 export class FeishuAgentBridge {
@@ -47,6 +51,7 @@ export class FeishuAgentBridge {
       sessionPrefix: 'feishu_',
       enableStreaming: true,
       showTypingIndicator: true,
+      enableStreamingCard: false,
       ...config,
     };
 
@@ -240,8 +245,7 @@ export class FeishuAgentBridge {
 
   /**
    * 处理飞书消息
-   * V4.1: 不再手动拼历史，直接委托 AgentEngine 处理
-   * AgentEngine 内部通过 ConversationStore + ContextBuilder 智能管理上下文
+   * V4.2: 新增流式卡片路由
    */
   private async handleFeishuMessage(message: FeishuMessage): Promise<void> {
     console.log(`📨 Received Feishu message: ${message.senderName} -> ${message.content.substring(0, 50)}...`);
@@ -287,7 +291,10 @@ export class FeishuAgentBridge {
       }
 
       try {
-        if (this.config.enableStreaming) {
+        if (this.config.enableStreamingCard) {
+          // V4.2: 流式卡片模式
+          await this.handleStreamingCardResponse(sessionId, message);
+        } else if (this.config.enableStreaming) {
           await this.handleStreamingResponse(sessionId, message);
         } else {
           await this.handleRegularResponse(sessionId, message);
@@ -423,6 +430,94 @@ ${originalContent}
         }
       }
     }
+  }
+
+  /**
+   * 处理流式卡片回复 (V4.2 新增)
+   *
+   * 使用 Create + Patch 模式实时更新飞书卡片：
+   * 1. 首次 Patch 时创建 interactive 卡片
+   * 2. 通过 im.v1.message.patch 增量更新卡片内容
+   * 3. 若卡片创建失败，自动降级为普通文本消息
+   */
+  private async handleStreamingCardResponse(sessionId: string, message: FeishuMessage): Promise<void> {
+    let fullResponse = '';
+    const replyMessageId = message.threadId ? message.messageId : undefined;
+
+    // 创建渲染器，注入飞书客户端
+    const renderer = new StreamingCardRenderer(
+      {
+        createInteractiveCard: (chatId, cardJson, replyMsgId, threadId) =>
+          this.feishuService.createInteractiveCard(chatId, cardJson, replyMsgId, threadId),
+        patchInteractiveCard: (messageId, cardJson) =>
+          this.feishuService.patchInteractiveCard(messageId, cardJson),
+      },
+      message.chatId,
+      replyMessageId,
+      message.threadId,
+    );
+
+    const eventHandlers: EventHandlers = {
+      onContentStart: async () => {
+        console.log('📋 [StreamCard] onContentStart triggered')
+        // 立即创建初始卡片，让用户看到即时反馈
+        await renderer.init()
+      },
+
+      onThinkingDelta: async (thinkingText: string) => {
+        await renderer.onThinking(thinkingText);
+      },
+
+      onThinkingStop: async () => {
+        await renderer.onThinkingStop();
+      },
+
+      onToolUseStart: async (toolName: string, input?: any) => {
+        await renderer.onToolStart(toolName, input);
+      },
+
+      onToolUseStop: async (toolName: string, result: any) => {
+        console.log(`📋 [StreamCard] onToolUseStop: ${toolName}, resultLen=${String(result).length}`)
+        await renderer.onToolEnd(toolName, result);
+      },
+
+      onContentDelta: async (textDelta: string) => {
+        fullResponse += textDelta;
+        await renderer.onContentDelta(textDelta);
+      },
+
+      onUsageUpdate: async (usage: TokenUsageStats) => {
+        await renderer.onUsageUpdate(usage);
+      },
+
+      onContentStop: async (usage?: TokenUsageStats) => {
+        console.log(`📋 [StreamCard] onContentStop triggered, isFallback=${renderer.isFallback()}, usage=${JSON.stringify(usage)}`)
+        // 如果降级模式，通过普通消息发送完整内容
+        if (renderer.isFallback()) {
+          if (fullResponse) {
+            await this.sendMessageWithAIFix(message.chatId, fullResponse, replyMessageId, message.threadId);
+          }
+        } else {
+          await renderer.onComplete(usage);
+        }
+        console.log(`✅ Streaming card response completed: ${fullResponse.length} chars`);
+      },
+
+      onError: async (error: string) => {
+        console.error('Streaming card response error:', error);
+        if (renderer.isFallback()) {
+          // 降级模式下通过普通消息发送错误
+          await this.sendErrorResponse(message.chatId, new Error(error), replyMessageId, message.threadId);
+        } else {
+          await renderer.onError(error);
+        }
+      },
+    };
+
+    // 注入飞书上下文，让 Agent 知道当前 chatId（用于 create_cronjob 等工具）
+    const enrichedContent = `[系统上下文: 当前飞书会话 chatId=${message.chatId}]\n\n${message.content}`;
+
+    await getAgentEngine().sendMessageStream(sessionId, enrichedContent, message.senderId, eventHandlers);
   }
 
   /**

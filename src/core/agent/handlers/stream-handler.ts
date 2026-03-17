@@ -1,4 +1,4 @@
-import type { StreamEvent, EventHandlers } from '../types/agent'
+import type { StreamEvent, EventHandlers, TokenUsageStats } from '../types/agent'
 
 export class StreamHandler {
   private eventHandlers: EventHandlers
@@ -25,7 +25,7 @@ export class StreamHandler {
         break
 
       case 'tool_use_start':
-        this.eventHandlers.onToolUseStart?.(event.toolName)
+        await this.eventHandlers.onToolUseStart?.(event.toolName)
         break
 
       case 'tool_use_stop':
@@ -69,11 +69,20 @@ export class StreamHandler {
       onContentStop: async () => {
         ws.send(JSON.stringify({ type: 'content_stop' }))
       },
-      onToolUseStart: async (toolName: string) => {
-        ws.send(JSON.stringify({ type: 'tool_use_start', toolName }))
+      onThinkingDelta: async (thinkingText: string) => {
+        ws.send(JSON.stringify({ type: 'thinking_delta', text: thinkingText }))
+      },
+      onThinkingStop: async () => {
+        ws.send(JSON.stringify({ type: 'thinking_stop' }))
+      },
+      onToolUseStart: async (toolName: string, input?: any) => {
+        ws.send(JSON.stringify({ type: 'tool_use_start', toolName, input }))
       },
       onToolUseStop: async (toolName: string, result: any) => {
         ws.send(JSON.stringify({ type: 'tool_use_stop', toolName, result }))
+      },
+      onUsageUpdate: async (usage: TokenUsageStats) => {
+        ws.send(JSON.stringify({ type: 'usage_update', usage }))
       },
       onError: async (error: string) => {
         ws.send(JSON.stringify({ type: 'error', error }))
@@ -95,11 +104,20 @@ export class StreamHandler {
       onContentStop: async () => {
         write('data: ' + JSON.stringify({ type: 'content_stop' }) + '\n\n')
       },
-      onToolUseStart: async (toolName: string) => {
-        write('data: ' + JSON.stringify({ type: 'tool_use_start', toolName }) + '\n\n')
+      onThinkingDelta: async (thinkingText: string) => {
+        write('data: ' + JSON.stringify({ type: 'thinking_delta', text: thinkingText }) + '\n\n')
+      },
+      onThinkingStop: async () => {
+        write('data: ' + JSON.stringify({ type: 'thinking_stop' }) + '\n\n')
+      },
+      onToolUseStart: async (toolName: string, input?: any) => {
+        write('data: ' + JSON.stringify({ type: 'tool_use_start', toolName, input }) + '\n\n')
       },
       onToolUseStop: async (toolName: string, result: any) => {
         write('data: ' + JSON.stringify({ type: 'tool_use_stop', toolName, result }) + '\n\n')
+      },
+      onUsageUpdate: async (usage: TokenUsageStats) => {
+        write('data: ' + JSON.stringify({ type: 'usage_update', usage }) + '\n\n')
       },
       onError: async (error: string) => {
         write('data: ' + JSON.stringify({ type: 'error', error }) + '\n\n')

@@ -89,6 +89,16 @@ export class FeishuService implements FeishuConnection {
     this.config = config;
   }
 
+
+  // ==================== NEW: 暴露 Client 实例 ====================
+
+  /**
+   * 获取飞书 SDK Client 实例
+   */
+  getClient(): lark.Client | null {
+    return this.client;
+  }
+
   async connect(onMessage: (message: FeishuMessage) => void): Promise<boolean> {
     this.onMessageCallback = onMessage;
 
@@ -1030,6 +1040,98 @@ private extractMessageContent(messageType: string, content: string, createTime: 
     } catch (error) {
       console.error('下载飞书图片失败:', error);
       throw error;
+    }
+
+  }
+  // ==================== NEW: Create + Patch 方法 ====================
+
+  /**
+   * 创建交互式卡片消息并返回 message_id
+   * 用于流式卡片的初始创建，后续通过 patchInteractiveCard 更新
+   *
+   * @returns message_id，创建失败返回 null
+   */
+  async createInteractiveCard(
+    chatId: string,
+    cardJson: string,
+    replyMessageId?: string,
+    threadId?: string,
+  ): Promise<string | null> {
+    if (!this.client) {
+      console.warn('Feishu client not initialized');
+      return null;
+    }
+
+    try {
+      let result: any;
+
+      if (replyMessageId) {
+        result = await this.client.im.message.reply({
+          path: { message_id: replyMessageId },
+          data: {
+            msg_type: 'interactive',
+            content: cardJson,
+          },
+        });
+      } else {
+        result = await this.client.im.message.create({
+          params: { receive_id_type: 'chat_id' },
+          data: {
+            receive_id: chatId,
+            msg_type: 'interactive',
+            content: cardJson,
+            ...(threadId ? { thread_id: threadId } : {}),
+          },
+        });
+      }
+
+      const messageId = result?.data?.message_id;
+      if (messageId) {
+        console.log(`📋 Interactive card created: ${messageId}`);
+        return messageId;
+      }
+
+      console.warn('⚠️ createInteractiveCard: no message_id in response');
+      return null;
+    } catch (error) {
+      const feishuErr = extractFeishuError(error);
+      if (feishuErr) {
+        console.error(`❌ createInteractiveCard rejected [${feishuErr.code}]: ${feishuErr.msg}`);
+        throw new FeishuSendError(feishuErr.code, feishuErr.msg, cardJson);
+      }
+      console.error('❌ createInteractiveCard failed:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Patch 更新已有的交互式卡片消息
+   * 使用 im.v1.message.patch API，限制 5 QPS，14 天窗口
+   *
+   * @param messageId 要更新的消息 ID
+   * @param cardJson  新的卡片 JSON
+   * @returns 是否成功
+   */
+  async patchInteractiveCard(
+    messageId: string,
+    cardJson: string,
+  ): Promise<boolean> {
+    if (!this.client) {
+      console.warn('Feishu client not initialized');
+      return false;
+    }
+
+    try {
+      await this.client.im.message.patch({
+        path: { message_id: messageId },
+        data: {
+          content: cardJson,
+        },
+      });
+      return true;
+    } catch (error) {
+      console.error(`❌ patchInteractiveCard failed [${messageId}]:`, error);
+      return false;
     }
   }
 }

@@ -29,6 +29,7 @@ export function getFeishuConfig(): FeishuConfig {
     bridge: {
       sessionPrefix: 'feishu_',
       enableStreaming: true,
+      enableStreamingCard: true,
       showTypingIndicator: true,
     }
   }

@@ -54,12 +54,24 @@ export interface ToolCallResult {
   error?: string
 }
 
+// Token 用量统计
+export interface TokenUsageStats {
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheCreationTokens: number
+  totalCostUsd: number
+}
+
 // 事件处理器
 export interface EventHandlers {
   onContentStart?: () => Promise<void>
   onContentDelta?: (delta: string) => Promise<void>
-  onContentStop?: () => Promise<void>
-  onToolUseStart?: (toolName: string) => Promise<void>
+  onContentStop?: (usage?: TokenUsageStats) => Promise<void>
+  onThinkingDelta?: (thinkingText: string) => Promise<void>
+  onThinkingStop?: () => Promise<void>
+  onToolUseStart?: (toolName: string, input?: any) => Promise<void>
   onToolUseStop?: (toolName: string, result: any) => Promise<void>
+  onUsageUpdate?: (usage: TokenUsageStats) => Promise<void>
   onError?: (error: string) => Promise<void>
 }
