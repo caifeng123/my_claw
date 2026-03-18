@@ -1,7 +1,12 @@
 /**
- * FeishuAgentBridge V4.2
- * 新增: 流式卡片支持 (Create + Patch 模式)
- * 基于 V4.1 简化版：去掉手动拼历史逻辑，由 AgentEngine 内部管理上下文
+ * FeishuAgentBridge V4.3
+ * 新增:
+ *   - 引用消息读取（parent_id → getQuotedMessageContent → enrichedContent）
+ *   - 文件下载迁移到 session 目录（data/sessions/{sessionId}/files/received/）
+ *   - 文件发送能力（uploadAndSendFile）
+ *   - 流式卡片支持 (Create + Patch 模式, 继承 V4.2)
+ *
+ * 基于 V4.2：去掉手动拼历史逻辑，由 AgentEngine 内部管理上下文
  */
 
 import { FeishuService, FeishuSendError } from './feishu-service.js';
@@ -12,6 +17,8 @@ import type { EventHandlers } from '@/core/agent/types/agent.js';
 import { writeFileSync } from 'fs';
 import { execSync } from 'child_process';
 import { ClaudeEngine } from '@/core/agent/engine/claude-engine.js';
+import { getReceivedFilesDir } from '../../utils/paths.js';
+import { relative } from 'path';
 
 // 状态文件路径
 const STATE_FILE = '.restart-state.json';
@@ -104,6 +111,21 @@ export class FeishuAgentBridge {
     await this.feishuService.sendMessage(chatId, text, replyMessageId, threadId);
   }
 
+  // ==================== NEW: 暴露文件发送能力 ====================
+
+  /**
+   * 上传本地文件并发送到飞书聊天
+   */
+  async sendFileToChat(
+    chatId: string,
+    filePath: string,
+    replyMessageId?: string,
+    threadId?: string,
+    fileType?: 'opus' | 'mp4' | 'pdf' | 'doc' | 'xls' | 'ppt' | 'stream',
+  ): Promise<void> {
+    await this.feishuService.uploadAndSendFile(chatId, filePath, replyMessageId, threadId, fileType);
+  }
+
   /**
    * 处理 /restart 指令
    */
@@ -129,7 +151,7 @@ export class FeishuAgentBridge {
           '你是一个专业的 Git 提交消息生成器。根据代码变更，生成一个简洁的、符合 Git 提交规范的 commit message。只返回 commit message 本身，不要包含其他说明。',
           `请根据以下代码变更生成一个简洁的 commit message:\n\n${summary}`,
         );
-        commitMessage = result.result.trim()
+        commitMessage = result.content.trim()
         console.log(`📝 生成的 commit message: ${commitMessage}`);
       }
     } catch (e) {
@@ -169,22 +191,16 @@ export class FeishuAgentBridge {
 
   /**
    * 处理 /new 指令 - 清空当前 session，开启新对话
-   * 复用同一个 sessionId，只清空消息历史和上下文
    */
   private async handleNewCommand(message: FeishuMessage): Promise<void> {
     console.log('🆕 收到 /new 指令，重置当前会话');
 
-    // 1. 获取当前 sessionId（复用原有映射，不创建新 ID）
     const sessionId = this.getOrCreateSessionId(message.chatId, message.threadId);
     const agentEngine = getAgentEngine();
 
-    // 2. 清空该 session 的消息历史（JSONL 文件 + 摘要缓存）
     agentEngine.getConversationStore().deleteSession(sessionId);
-
-    // 3. 从 SessionManager 中删除旧 session 内存状态
     agentEngine.deleteSession(sessionId);
 
-    // 4. 重新创建同名 session（干净的上下文）
     agentEngine.createSession({
       sessionId,
       userId: message.chatId,
@@ -192,7 +208,6 @@ export class FeishuAgentBridge {
 
     console.log(`✅ 会话已重置: ${sessionId}`);
 
-    // 5. 回复用户
     await this.feishuService.sendMessage(
       message.chatId,
       '✅ 已开启新会话，之前的对话上下文已清除。请开始新的对话吧！',
@@ -210,7 +225,6 @@ export class FeishuAgentBridge {
     const sessionId = this.getOrCreateSessionId(message.chatId, message.threadId);
     const agentEngine = getAgentEngine();
 
-    // 尝试中断当前正在执行的请求
     const aborted = agentEngine.abortSession(sessionId);
 
     if (aborted) {
@@ -230,7 +244,7 @@ export class FeishuAgentBridge {
     }
   }
 
-    /**
+  /**
    * 获取会话统计信息
    */
   getSessionStats(): any {
@@ -245,7 +259,7 @@ export class FeishuAgentBridge {
 
   /**
    * 处理飞书消息
-   * V4.2: 新增流式卡片路由
+   * V4.3: 新增引用消息读取 + 文件下载到 session 目录
    */
   private async handleFeishuMessage(message: FeishuMessage): Promise<void> {
     console.log(`📨 Received Feishu message: ${message.senderName} -> ${message.content.substring(0, 50)}...`);
@@ -286,13 +300,113 @@ export class FeishuAgentBridge {
         this.updateThreadActivity(message.threadId, message.chatId);
       }
 
+      // ==================== NEW: 异步获取引用消息内容 ====================
+      let quotedContent: string | null = null;
+      if (message.parentId) {
+        try {
+          const quoted = await this.feishuService.getQuotedMessageContent(message.parentId);
+          quotedContent = quoted.text;
+
+          if (quotedContent) {
+            message.quotedContent = quotedContent;
+          }
+
+          // 引用消息中的图片：下载到 session 目录
+          if (quoted.imageKeys && quoted.imageKeys.length > 0 && quoted.messageId) {
+            const quotedReceivedDir = getReceivedFilesDir(sessionId);
+            for (let i = 0; i < quoted.imageKeys.length; i++) {
+              const imageKey = quoted.imageKeys[i] as string;
+              try {
+                const filePath = await this.feishuService.downloadFile(
+                  quoted.messageId,
+                  imageKey,
+                  `${Date.now()}-quoted-image-${i}`,
+                  'image',
+                  quotedReceivedDir,
+                );
+                // 将引用图片也加入 downloadedPaths，让 AI 能看到
+                if (!message.downloadedPaths) message.downloadedPaths = [];
+                message.downloadedPaths.push(filePath);
+                // 更新引用文本，标注图片路径
+                const relPath = relative(process.cwd(), filePath);
+                const imgRef = `[引用的图片已保存到本地: ${relPath.startsWith('..') ? filePath : relPath}]`;
+                message.quotedContent = message.quotedContent
+                  ? message.quotedContent + '\n' + imgRef
+                  : imgRef;
+              } catch (downloadError) {
+                console.error(`下载引用图片失败: ${imageKey}`, downloadError);
+              }
+            }
+          }
+        } catch (error: any) {
+          console.error(`获取引用消息失败: ${message.parentId}, error=${error?.message || error}`);
+        }
+      }
+
+      // ==================== 不支持的引用消息类型：直接回复提示，不走 AI ====================
+      if (quotedContent === '暂不支持读取卡片详细内容') {
+        await this.feishuService.sendMessage(message.chatId, quotedContent, message.messageId, message.threadId);
+        return;
+      }
+
+      // ==================== NEW: 文件下载到 session 目录 ====================
+      const downloadedPaths: string[] = [];
+      const receivedDir = getReceivedFilesDir(sessionId);
+
+      // 下载图片到 session 目录
+      if (message.imageKeys && message.imageKeys.length > 0) {
+        for (let i = 0; i < message.imageKeys.length; i++) {
+          const imageKey = message.imageKeys[i] as string;
+          try {
+            const filePath = await this.feishuService.downloadFile(
+              message.messageId,
+              imageKey,
+              `${Date.now()}-image-${i}`,
+              'image',
+              receivedDir,  // 使用 session 目录
+            );
+            downloadedPaths.push(filePath);
+            console.log(`📥 图片已下载到 session 目录: ${filePath}`);
+          } catch (downloadError) {
+            console.error(`📥 下载图片失败: ${imageKey}`, downloadError);
+          }
+        }
+      }
+
+      // 下载文件到 session 目录
+      if (message.fileKeys && message.fileKeys.length > 0) {
+        for (let i = 0; i < message.fileKeys.length; i++) {
+          const fileKey = message.fileKeys[i] as string;
+          try {
+            const filePath = await this.feishuService.downloadFile(
+              message.messageId,
+              fileKey,
+              `${Date.now()}-file-${i}`,
+              'file',
+              receivedDir,  // 使用 session 目录
+            );
+            downloadedPaths.push(filePath);
+            console.log(`📥 文件已下载到 session 目录: ${filePath}`);
+          } catch (downloadError) {
+            console.error(`📥 下载文件失败: ${fileKey}`, downloadError);
+          }
+        }
+      }
+
+      // 将下载路径回写到 message 对象
+      if (downloadedPaths.length > 0) {
+        message.downloadedPaths = downloadedPaths;
+
+        // 移除 content 中的文件占位符（路径已通过 downloadedPaths 传递）
+        message.content = message.content.replace(/\{\{FILE:[^}]+\}\}/g, '').trim();
+      }
+
       if (this.config.showTypingIndicator) {
         await this.feishuService.sendTyping(message.chatId, true, message.threadId);
       }
 
       try {
         if (this.config.enableStreamingCard) {
-          // V4.2: 流式卡片模式
           await this.handleStreamingCardResponse(sessionId, message);
         } else if (this.config.enableStreaming) {
           await this.handleStreamingResponse(sessionId, message);
@@ -331,13 +445,11 @@ export class FeishuAgentBridge {
     });
   }
 
-
   // AI 修复重试配置
   private static readonly AI_FIX_MAX_RETRIES = 2;
 
   /**
    * 使用 AI 修复被飞书审核拒绝的消息内容
-   * 将飞书返回的错误信息 + 原始内容交给 Claude，让它生成合规的新内容
    */
   private async fixContentWithAI(
     originalContent: string,
@@ -372,12 +484,11 @@ ${originalContent}
 
     try {
       const result = await this.claudeEngine.executeClaudeQueryRaw(systemPrompt, userQuery);
-      const fixedContent = result.result.trim();
+      const fixedContent = result.content.trim();
       console.log(`✅ AI 修复完成，原内容 ${originalContent.length} 字符 → 修复后 ${fixedContent.length} 字符`);
       return fixedContent;
     } catch (error) {
       console.error('❌ AI 修复失败:', error);
-      // AI 修复失败时，返回一个安全的通用提示
       return '⚠️ 消息内容因包含敏感信息无法发送，请直接联系我获取详细信息。';
     }
   }
@@ -397,7 +508,7 @@ ${originalContent}
     while (retries <= FeishuAgentBridge.AI_FIX_MAX_RETRIES) {
       try {
         await this.feishuService.sendMessage(chatId, currentContent, replyMessageId, threadId);
-        return; // 发送成功，直接返回
+        return;
       } catch (error) {
         if (error instanceof FeishuSendError && retries < FeishuAgentBridge.AI_FIX_MAX_RETRIES) {
           retries++;
@@ -408,10 +519,8 @@ ${originalContent}
             error.feishuMsg,
           );
         } else {
-          // 非 FeishuSendError 或者超过重试次数
           if (error instanceof FeishuSendError) {
             console.error(`❌ AI 修复 ${retries} 次后仍然失败，发送通用提示`);
-            // 最终降级：发送一个安全的通用提示
             try {
               await this.feishuService.sendMessage(
                 chatId,
@@ -423,7 +532,6 @@ ${originalContent}
               console.error('❌ 最终降级消息也发送失败:', finalError);
             }
           } else {
-            // 非飞书内容审核错误，记录后不重试
             console.error('❌ 消息发送失败（非内容审核错误）:', error);
           }
           return;
@@ -432,19 +540,74 @@ ${originalContent}
     }
   }
 
+  // ==================== NEW: 构建 enrichedContent，注入引用上下文 ====================
+
   /**
-   * 处理流式卡片回复 (V4.2 新增)
-   *
-   * 使用 Create + Patch 模式实时更新飞书卡片：
-   * 1. 首次 Patch 时创建 interactive 卡片
-   * 2. 通过 im.v1.message.patch 增量更新卡片内容
-   * 3. 若卡片创建失败，自动降级为普通文本消息
+   * 构建发送给 Agent 的 enrichedContent
+   * 包含：飞书系统上下文 + 引用消息内容 + 用户消息 + 文件路径
+   */
+  private buildEnrichedContent(message: FeishuMessage): string {
+    const parts: string[] = [];
+
+    // 系统上下文
+    parts.push(`[系统上下文: 当前飞书会话 chatId=${message.chatId}]`);
+
+    // 引用消息上下文
+    if (message.quotedContent) {
+      parts.push('');
+      parts.push('[引用消息内容]:');
+      parts.push('> ' + message.quotedContent.split('\n').join('\n> '));
+      parts.push('');
+    }
+
+    // 下载的文件路径（图片 + 其他文件）
+    if (message.downloadedPaths && message.downloadedPaths.length > 0) {
+      const imagePaths: string[] = [];
+      const otherPaths: string[] = [];
+      for (const filePath of message.downloadedPaths) {
+        if (/\.(jpg|jpeg|png|gif|webp|bmp)$/i.test(filePath)) {
+          imagePaths.push(filePath);
+        } else {
+          otherPaths.push(filePath);
+        }
+      }
+      // 将绝对路径转为相对于项目根目录的路径，便于 Read 工具识别
+      const toRelative = (p: string) => {
+        const rel = relative(process.cwd(), p);
+        return rel.startsWith('..') ? p : rel;  // 如果不在项目目录下，保留绝对路径
+      };
+
+      if (imagePaths.length > 0) {
+        parts.push('');
+        parts.push('[用户发送的图片(请使用 read_image 工具读取以下图片路径来查看图片内容)]:');
+        for (const filePath of imagePaths) {
+          parts.push(`- ${toRelative(filePath)}`);
+        }
+        parts.push('');
+      }
+      if (otherPaths.length > 0) {
+        parts.push('');
+        parts.push('[用户发送的文件]:');
+        for (const filePath of otherPaths) {
+          parts.push(`- ${toRelative(filePath)}`);
+        }
+        parts.push('');
+      }
+    }
+
+    // 用户消息
+    parts.push(message.content);
+
+    return parts.join('\n');
+  }
+
+  /**
+   * 处理流式卡片回复 (V4.2 -> V4.3: 使用 buildEnrichedContent)
    */
   private async handleStreamingCardResponse(sessionId: string, message: FeishuMessage): Promise<void> {
     let fullResponse = '';
     const replyMessageId = message.threadId ? message.messageId : undefined;
 
-    // 创建渲染器，注入飞书客户端
     const renderer = new StreamingCardRenderer(
       {
         createInteractiveCard: (chatId, cardJson, replyMsgId, threadId) =>
@@ -459,7 +622,6 @@ ${originalContent}
 
     const eventHandlers: EventHandlers = {
       onContentStart: async () => {
-        // 立即创建初始卡片，让用户看到即时反馈
         await renderer.init()
       },
 
@@ -485,7 +647,6 @@ ${originalContent}
       },
 
       onContentStop: async () => {
-        // 如果降级模式，通过普通消息发送完整内容
         if (renderer.isFallback()) {
           if (fullResponse) {
             await this.sendMessageWithAIFix(message.chatId, fullResponse, replyMessageId, message.threadId);
@@ -493,7 +654,6 @@ ${originalContent}
         } else {
           await renderer.onComplete();
 
-          // [FIX] 如果卡片内容被截断，追加一条完整消息
           if (renderer.isContentTruncated() && fullResponse) {
             await this.sendMessageWithAIFix(message.chatId, fullResponse, replyMessageId, message.threadId);
           }
@@ -502,7 +662,6 @@ ${originalContent}
 
       onError: async (error: string) => {
         if (renderer.isFallback()) {
-          // 降级模式下通过普通消息发送错误
           await this.sendErrorResponse(message.chatId, new Error(error), replyMessageId, message.threadId);
         } else {
           await renderer.onError(error);
@@ -510,15 +669,13 @@ ${originalContent}
       },
     };
 
-    // 注入飞书上下文，让 Agent 知道当前 chatId（用于 create_cronjob 等工具）
-    const enrichedContent = `[系统上下文: 当前飞书会话 chatId=${message.chatId}]\n\n${message.content}`;
+    const enrichedContent = this.buildEnrichedContent(message);
 
     await getAgentEngine().sendMessageStream(sessionId, enrichedContent, message.senderId, eventHandlers);
   }
 
   /**
-   * 处理流式回复
-   * V4.1: 直接传消息内容，AgentEngine 内部处理上下文构建
+   * 处理流式回复 (V4.3: 使用 buildEnrichedContent)
    */
   private async handleStreamingResponse(sessionId: string, message: FeishuMessage): Promise<void> {
     let fullResponse = '';
@@ -541,19 +698,16 @@ ${originalContent}
       },
     };
 
-    // 注入飞书上下文，让 Agent 知道当前 chatId（用于 create_cronjob 等工具）
-    const enrichedContent = `[系统上下文: 当前飞书会话 chatId=${message.chatId}]\n\n${message.content}`;
+    const enrichedContent = this.buildEnrichedContent(message);
 
     await getAgentEngine().sendMessageStream(sessionId, enrichedContent, message.senderId, eventHandlers);
   }
 
   /**
-   * 处理常规回复
-   * V4.1: 直接传消息内容，AgentEngine 内部处理上下文构建
+   * 处理常规回复 (V4.3: 使用 buildEnrichedContent)
    */
   private async handleRegularResponse(sessionId: string, message: FeishuMessage): Promise<void> {
-    // 注入飞书上下文，让 Agent 知道当前 chatId（用于 create_cronjob 等工具）
-    const enrichedContent = `[系统上下文: 当前飞书会话 chatId=${message.chatId}]\n\n${message.content}`;
+    const enrichedContent = this.buildEnrichedContent(message);
     const response = await getAgentEngine().sendMessage(sessionId, enrichedContent, message.senderId);
 
     const replyMessageId = message.threadId ? message.messageId : undefined;
@@ -590,7 +744,6 @@ ${originalContent}
 
     this.chatToSessionMap.set(sessionKey, sessionId);
 
-    // 创建新会话（AgentEngine 内部会恢复已有历史）
     getAgentEngine().createSession({
       sessionId,
       userId: chatId,

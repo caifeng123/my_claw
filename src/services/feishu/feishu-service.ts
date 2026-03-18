@@ -8,7 +8,9 @@ import type {
   FeishuMessage,
   ImageUploadOptions,
   ImageUploadResult,
-  ContentProcessResult
+  FileUploadResult,
+  ContentProcessResult,
+  MessageDetail,
 } from './types.js';
 import { fileURLToPath } from 'url';
 
@@ -59,6 +61,7 @@ function extractFeishuError(error: any): { code: number; msg: string } | null {
 const MESSAGE_TYPE_TEXT = 'text';
 const MESSAGE_TYPE_POST = 'post';
 const MESSAGE_TYPE_IMAGE = 'image';
+const MESSAGE_TYPE_FILE = 'file';
 
 // 消息类型选择阈值
 const PLAIN_TEXT_LIMIT = 200; // 少于200字符使用纯文本
@@ -68,6 +71,9 @@ const TEXT_MSG_LIMIT = 2048; // 飞书纯文本消息限制
 // 消息去重缓存设置
 const MSG_DEDUP_MAX = 1000;
 const MSG_DEDUP_TTL = 30 * 60 * 1000; // 30分钟
+
+// 文件上传大小限制 (30MB)
+const FILE_UPLOAD_MAX_SIZE = 30 * 1024 * 1024;
 
 function getExtFromContentType(contentType: string) {
   const type = contentType.split(';')?.[0]?.trim() || '';
@@ -205,13 +211,9 @@ export class FeishuService implements FeishuConnection {
         const chunks = this.splitAtParagraphs(processedText, CARD_MD_LIMIT);
         for (let i = 0; i < chunks.length; i++) {
           const chunk = chunks[i];
-          // 如果是第一个消息，作为新消息发送（如果有messageId则回复原消息）
-          // 后续消息也作为回复发送，保持消息的连续性
           if (i === 0) {
             await this.sendInteractiveCardMessage(chatId, chunk!, messageId, threadId);
           } else {
-            // 后续消息也回复原消息，确保在话题群中保持在话题内
-            // 对于话题群，threadId 会自动关联；对于普通群，保持回复关系
             await this.sendInteractiveCardMessage(chatId, chunk!, messageId, threadId);
           }
         }
@@ -265,6 +267,14 @@ export class FeishuService implements FeishuConnection {
       const chatId = message.chat_id;
       const messageId = message.message_id;
       const threadId = message.thread_id;
+
+      // ==================== NEW: 提取引用/回复消息 ID ====================
+      // parent_id: 话题群中直接回复的父消息 ID
+      // upper_message_id: 普通群引用(quote)消息的原消息 ID
+      const parentId = message.parent_id || message.upper_message_id || undefined;
+
+      // 调试日志：打印关键字段帮助排查
+
       // 消息去重检查
       if (this.isDuplicate(messageId)) {
         console.debug('Duplicate message, skipping');
@@ -272,7 +282,7 @@ export class FeishuService implements FeishuConnection {
       }
       this.markSeen(messageId);
 
-      // 提取消息内容
+      // 提取消息内容（使用占位符，不再硬编码路径）
       const extracted = this.extractMessageContent(message.message_type, message.content, message.create_time);
       let content = extracted.text;
 
@@ -281,7 +291,7 @@ export class FeishuService implements FeishuConnection {
         return;
       }
 
-      // 下载图片（如果有）
+      // 下载图片（如果有）—— 仍在此处用默认路径，bridge 层会覆盖为 session 路径
       if (extracted.imageKeys && extracted.imageKeys.length > 0) {
         for (let i = 0; i < extracted.imageKeys.length; i++) {
           const imageKey = extracted.imageKeys[i] as string;
@@ -308,38 +318,24 @@ export class FeishuService implements FeishuConnection {
         }
       }
 
-      // // 下载文件（如果有）
-      // if (extracted.fileKeys?.length) {
-      //   console.log(`检测到 ${extracted.fileKeys.length} 个文件，开始下载...`);
-      //   for (let i = 0; i < extracted.fileKeys.length; i++) {
-      //     const fileKey = extracted.fileKeys[i] as string;
-      //     try {
-      //       const filePath = await this.downloadFile(
-      //         messageId,
-      //         fileKey,
-      //         `${message.create_time}-file-${i}`,
-      //         'file'
-      //       );
-      //       console.log(`文件下载成功: ${filePath}`);
-      //     } catch (downloadError) {
-      //       console.error(`下载文件失败: ${fileKey}`, downloadError);
-      //     }
-      //   }
-      // }
-
       // 记录最后一条消息ID
       this.lastMessageIdByChat.set(this.getReactionKey(chatId, threadId), messageId);
 
       // 构建消息对象
       const feishuMessage: FeishuMessage = {
-        messageId,             // IMPORTANT: needed for im.message.reply
+        messageId,
         chatId,
-        threadId,              // NEW: pass through thread ID (undefined for non-thread groups)
+        threadId,
         senderId: data.sender.sender_id?.open_id || '',
         senderName: this.getSenderName(data.sender.sender_id?.open_id || ''),
         content,
         messageType: message.message_type,
         timestamp: new Date(parseInt(message.create_time)).toISOString(),
+
+        // ==================== NEW: 附加字段 ====================
+        parentId,
+        imageKeys: extracted.imageKeys,
+        fileKeys: extracted.fileKeys,
       };
 
       // 回调处理消息
@@ -353,104 +349,365 @@ export class FeishuService implements FeishuConnection {
     }
   }
 
-private extractMessageContent(messageType: string, content: string, createTime: string): { text: string; imageKeys?: string[]; fileKeys?: string[] } {
-  try {
-    const parsed = JSON.parse(content);
+  /**
+   * 提取消息内容
+   * 修改：使用占位符代替硬编码路径，实际路径由 bridge 层在下载后替换
+   */
+  extractMessageContent(messageType: string, content: string, createTime: string): { text: string; imageKeys?: string[]; fileKeys?: string[] } {
+    try {
+      const parsed = JSON.parse(content);
 
-    if (messageType === MESSAGE_TYPE_TEXT) {
-      return { text: parsed.text || '' };
-    }
+      if (messageType === MESSAGE_TYPE_TEXT) {
+        return { text: parsed.text || '' };
+      }
 
-    if (messageType === MESSAGE_TYPE_POST) {
-      const lines: string[] = [];
-      const imageKeys: string[] = [];
-      const fileKeys: string[] = [];
+      if (messageType === MESSAGE_TYPE_POST) {
+        const lines: string[] = [];
+        const imageKeys: string[] = [];
+        const fileKeys: string[] = [];
 
-      const contentArray = parsed.content;
-      if (!Array.isArray(contentArray)) return { text: parsed.title || '' };
+        const contentArray = parsed.content;
+        if (!Array.isArray(contentArray)) return { text: parsed.title || '' };
 
-      let imageIdx = 0;
-      let mediaIdx = 0;
+        let imageIdx = 0;
+        let mediaIdx = 0;
 
-      for (const paragraph of contentArray) {
-        if (!Array.isArray(paragraph)) continue;
+        for (const paragraph of contentArray) {
+          if (!Array.isArray(paragraph)) continue;
 
-        const paragraphTexts: string[] = [];
+          const paragraphTexts: string[] = [];
 
-        for (const segment of paragraph) {
-          if (!segment || !segment.tag) continue;
+          for (const segment of paragraph) {
+            if (!segment || !segment.tag) continue;
 
-          switch (segment.tag) {
-            case 'text':
-              if (segment.text) paragraphTexts.push(segment.text);
-              break;
-            case 'a':
-              paragraphTexts.push(segment.text || segment.href || '');
-              break;
-            case 'at':
-              if (segment.user_id) {
-                paragraphTexts.push(`@${segment.user_name || segment.user_id}`);
-              }
-              break;
-            case 'img':
-              if (segment.image_key) {
-                imageKeys.push(segment.image_key);
-                paragraphTexts.push(`![${createTime}-image-${imageIdx++}](data/lark/images/${createTime}-image-${imageIdx++})`);
-              }
-              break;
-            case 'media':
-              if (segment.file_key) {
-                fileKeys.push(segment.file_key);
-                paragraphTexts.push(`data/lark/files/${createTime}-file-${mediaIdx++}`);
-              }
-              break;
-            case 'emotion':
-              if (segment.emoji_type) paragraphTexts.push(`[表情:${segment.emoji_type}]`);
-              break;
-            case 'code_block':
-              if (segment.text) paragraphTexts.push(`\`\`\`${segment.language || ''}\n${segment.text}\n\`\`\``);
-              break;
-            case 'md':
-              if (segment.text) paragraphTexts.push(segment.text);
-              break;
-            case 'hr':
-              paragraphTexts.push('---');
-              break;
-            default:
-              if (segment.text) paragraphTexts.push(segment.text);
-              break;
+            switch (segment.tag) {
+              case 'text':
+                if (segment.text) paragraphTexts.push(segment.text);
+                break;
+              case 'a':
+                paragraphTexts.push(segment.text || segment.href || '');
+                break;
+              case 'at':
+                if (segment.user_id) {
+                  paragraphTexts.push(`@${segment.user_name || segment.user_id}`);
+                }
+                break;
+              case 'img':
+                if (segment.image_key) {
+                  imageKeys.push(segment.image_key);
+                  // 使用占位符，bridge 层下载后替换为实际路径
+                  paragraphTexts.push(`![image]({{FILE:${createTime}-image-${imageIdx++}}})`);
+                }
+                break;
+              case 'media':
+                if (segment.file_key) {
+                  fileKeys.push(segment.file_key);
+                  paragraphTexts.push(`{{FILE:${createTime}-file-${mediaIdx++}}}`);
+                }
+                break;
+              case 'emotion':
+                if (segment.emoji_type) paragraphTexts.push(`[表情:${segment.emoji_type}]`);
+                break;
+              case 'code_block':
+                if (segment.text) paragraphTexts.push('```' + (segment.language || '') + '\n' + segment.text + '\n```');
+                break;
+              case 'md':
+                if (segment.text) paragraphTexts.push(segment.text);
+                break;
+              case 'hr':
+                paragraphTexts.push('---');
+                break;
+              default:
+                if (segment.text) paragraphTexts.push(segment.text);
+                break;
+            }
           }
+
+          if (paragraphTexts.length > 0) lines.push(paragraphTexts.join(''));
         }
 
-        if (paragraphTexts.length > 0) lines.push(paragraphTexts.join(''));
-      }
+        const title = parsed.title ? `${parsed.title}\n` : '';
 
-      const title = parsed.title ? `${parsed.title}\n` : '';
-
-      return {
-        text: title + lines.join('\n'),
-        imageKeys: imageKeys.length > 0 ? imageKeys : undefined,
-        fileKeys: fileKeys.length > 0 ? fileKeys : undefined,
-      };
-    }
-
-    if (messageType === MESSAGE_TYPE_IMAGE) {
-      const imageKey = parsed.image_key;
-      if (imageKey) {
         return {
-          text: `${createTime}-image-0`,
-          imageKeys: [imageKey],
-          fileKeys: parsed.file_key ? [parsed.file_key] : undefined,
+          text: title + lines.join('\n'),
+          imageKeys: imageKeys.length > 0 ? imageKeys : undefined,
+          fileKeys: fileKeys.length > 0 ? fileKeys : undefined,
         };
       }
+
+      if (messageType === MESSAGE_TYPE_IMAGE) {
+        const imageKey = parsed.image_key;
+        if (imageKey) {
+          return {
+            text: `{{FILE:${createTime}-image-0}}`,
+            imageKeys: [imageKey],
+            fileKeys: parsed.file_key ? [parsed.file_key] : undefined,
+          };
+        }
+      }
+
+      // ==================== NEW: 文件消息类型 ====================
+      if (messageType === MESSAGE_TYPE_FILE) {
+        const fileKey = parsed.file_key;
+        const fileName = parsed.file_name || 'unknown_file';
+        if (fileKey) {
+          return {
+            text: `[文件: ${fileName}] {{FILE:${createTime}-file-0}}`,
+            fileKeys: [fileKey],
+          };
+        }
+      }
+
+      // ==================== interactive 卡片消息 ====================
+      if (messageType === 'interactive') {
+        return { text: '暂不支持读取卡片详细内容' };
+      }
+
+      return { text: '' };
+    } catch (error) {
+      console.warn('Failed to parse message content:', error);
+      return { text: '' };
+    }
+  }
+
+  // ==================== NEW: 获取消息详情（用于读取引用消息） ====================
+
+  /**
+   * 通过 message_id 获取消息详情
+   * 调用飞书 im.v1.message.get API
+   * 频率限制: 1000 次/分钟, 50 次/秒
+   *
+   * @param messageId 消息 ID
+   * @returns 消息详情，失败返回 null
+   */
+  async getMessageDetail(messageId: string): Promise<MessageDetail | null> {
+    if (!this.client) {
+      console.warn('Feishu client not initialized');
+      return null;
     }
 
-    return { text: '' };
-  } catch (error) {
-    console.warn('Failed to parse message content:', error);
-    return { text: '' };
+    try {
+      const response = await this.client.im.message.get({
+        path: { message_id: messageId },
+      });
+
+
+      const items = (response as any)?.data?.items;
+      if (!items || items.length === 0) {
+        // 尝试直接从 response 中查找（某些 SDK 版本可能结构不同）
+        const directItems = (response as any)?.items;
+        if (directItems && directItems.length > 0) {
+          const msg = directItems[0];
+          return {
+            messageId: msg.message_id,
+            parentId: msg.parent_id || undefined,
+            rootId: msg.root_id || undefined,
+            msgType: msg.msg_type,
+            body: {
+              content: msg.body?.content || '{}',
+            },
+            sender: msg.sender ? {
+              senderType: msg.sender.sender_type,
+              senderId: msg.sender.sender_id ? {
+                openId: msg.sender.sender_id.open_id,
+                userId: msg.sender.sender_id.user_id,
+              } : undefined,
+            } : undefined,
+            createTime: msg.create_time,
+            updateTime: msg.update_time,
+          };
+        }
+        return null;
+      }
+
+      const msg = items[0];
+      return {
+        messageId: msg.message_id,
+        parentId: msg.parent_id || undefined,
+        rootId: msg.root_id || undefined,
+        msgType: msg.msg_type,
+        body: {
+          content: msg.body?.content || '{}',
+        },
+        sender: msg.sender ? {
+          senderType: msg.sender.sender_type,
+          senderId: msg.sender.sender_id ? {
+            openId: msg.sender.sender_id.open_id,
+            userId: msg.sender.sender_id.user_id,
+          } : undefined,
+        } : undefined,
+        createTime: msg.create_time,
+        updateTime: msg.update_time,
+      };
+    } catch (error: any) {
+      console.error(`getMessageDetail failed for ${messageId}:`, error?.message || error);
+      return null;
+    }
   }
-}
+
+  /**
+   * 获取引用消息的文本内容
+   * 自动解析消息类型并提取纯文本
+   *
+   * @param messageId 被引用消息的 message_id
+   * @returns 文本内容，失败返回 null
+   */
+  async getQuotedMessageContent(messageId: string): Promise<{
+    text: string | null;
+    imageKeys?: string[];
+    fileKeys?: string[];
+    messageId?: string;
+  }> {
+    const detail = await this.getMessageDetail(messageId);
+    if (!detail) return { text: null };
+
+    try {
+      // 卡片消息：飞书 API 不返回原始卡片内容
+      if (detail.msgType === 'interactive') {
+        return { text: '暂不支持读取卡片详细内容' };
+      }
+
+      const extracted = this.extractMessageContent(detail.msgType, detail.body.content, detail.createTime);
+      return {
+        text: extracted.text || null,
+        imageKeys: extracted.imageKeys,
+        fileKeys: extracted.fileKeys,
+        messageId: detail.messageId,
+      };
+    } catch (error) {
+      console.error(`Failed to extract quoted message content for ${messageId}:`, error);
+      return { text: null };
+    }
+  }
+
+  // ==================== NEW: 文件上传 & 发送 ====================
+
+  /**
+   * 上传文件到飞书（im.v1.file.create）
+   *
+   * @param filePath 本地文件路径
+   * @param fileType 文件类型: opus/mp4/pdf/doc/xls/ppt/stream
+   * @param fileName 显示的文件名（可选，默认从路径提取）
+   * @returns 上传结果，包含 file_key
+   */
+  async uploadFile(
+    filePath: string,
+    fileType: 'opus' | 'mp4' | 'pdf' | 'doc' | 'xls' | 'ppt' | 'stream' = 'stream',
+    fileName?: string,
+  ): Promise<FileUploadResult> {
+    if (!this.client) {
+      return { success: false, error: 'Feishu client not initialized' };
+    }
+
+    try {
+      // 验证文件存在
+      if (!existsSync(filePath)) {
+        return { success: false, error: `File not found: ${filePath}` };
+      }
+
+      // 验证文件大小（30MB 限制）
+      const stats = statSync(filePath);
+      if (stats.size > FILE_UPLOAD_MAX_SIZE) {
+        return { success: false, error: `File too large: ${stats.size} bytes (max: ${FILE_UPLOAD_MAX_SIZE} bytes)` };
+      }
+
+      const actualFileName = fileName || filePath.split('/').pop() || 'file';
+      const fileBuffer = readFileSync(filePath);
+
+      const response = await this.client.im.file.create({
+        data: {
+          file_type: fileType,
+          file_name: actualFileName,
+          file: fileBuffer,
+        },
+      });
+
+      const fileKey = (response as any)?.file_key;
+      if (fileKey) {
+        console.log(`File uploaded successfully: ${filePath} -> ${fileKey}`);
+        return { success: true, fileKey };
+      } else {
+        return { success: false, error: 'Failed to get file_key from response' };
+      }
+    } catch (error) {
+      console.error(`Failed to upload file ${filePath}:`, error);
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /**
+   * 发送文件消息到飞书聊天
+   *
+   * @param chatId 聊天 ID
+   * @param fileKey 已上传文件的 file_key
+   * @param replyMessageId 回复消息 ID（可选）
+   * @param threadId 话题 ID（可选）
+   */
+  async sendFileMessage(
+    chatId: string,
+    fileKey: string,
+    replyMessageId?: string,
+    threadId?: string,
+  ): Promise<void> {
+    if (!this.client) {
+      console.warn('Feishu client not initialized, skipping file send');
+      return;
+    }
+
+    const content = JSON.stringify({ file_key: fileKey });
+
+    try {
+      if (replyMessageId) {
+        await this.client.im.message.reply({
+          path: { message_id: replyMessageId },
+          data: {
+            msg_type: 'file',
+            content,
+          },
+        });
+      } else {
+        await this.client.im.message.create({
+          params: { receive_id_type: 'chat_id' },
+          data: {
+            receive_id: chatId,
+            msg_type: 'file',
+            content,
+            ...(threadId ? { thread_id: threadId } : {}),
+          },
+        });
+      }
+
+      console.log(`File message sent to chat ${chatId}, fileKey=${fileKey}`);
+    } catch (error) {
+      console.error(`Failed to send file message to ${chatId}:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * 一站式：上传本地文件并发送到聊天
+   *
+   * @param chatId 聊天 ID
+   * @param filePath 本地文件路径
+   * @param replyMessageId 回复消息 ID（可选）
+   * @param threadId 话题 ID（可选）
+   * @param fileType 文件类型（可选，默认 stream）
+   */
+  async uploadAndSendFile(
+    chatId: string,
+    filePath: string,
+    replyMessageId?: string,
+    threadId?: string,
+    fileType: 'opus' | 'mp4' | 'pdf' | 'doc' | 'xls' | 'ppt' | 'stream' = 'stream',
+  ): Promise<void> {
+    const uploadResult = await this.uploadFile(filePath, fileType);
+
+    if (!uploadResult.success || !uploadResult.fileKey) {
+      throw new Error(`File upload failed: ${uploadResult.error}`);
+    }
+
+    await this.sendFileMessage(chatId, uploadResult.fileKey, replyMessageId, threadId);
+  }
 
   /**
    * 发送纯文本消息
@@ -464,7 +721,6 @@ private extractMessageContent(messageType: string, content: string, createTime: 
         const chunks = this.splitAtParagraphs(text, TEXT_MSG_LIMIT);
         for (let i = 0; i < chunks.length; i++) {
           const chunk = chunks[i];
-          // 所有片段都作为回复发送（如果有replyMessageId），保持在话题群中的一致性
           if (replyMessageId) {
             await this.client.im.message.reply({
               path: { message_id: replyMessageId },
@@ -474,7 +730,6 @@ private extractMessageContent(messageType: string, content: string, createTime: 
               },
             });
           } else {
-            // 没有replyMessageId时，作为新消息发送
             await this.client.im.message.create({
               params: { receive_id_type: 'chat_id' },
               data: {
@@ -487,9 +742,7 @@ private extractMessageContent(messageType: string, content: string, createTime: 
           }
         }
       } else {
-        // 单条纯文本消息
         if (replyMessageId) {
-          // 作为回复发送（使用im.message.reply自动关联到thread）
           await this.client.im.message.reply({
             path: { message_id: replyMessageId },
             data: {
@@ -498,7 +751,6 @@ private extractMessageContent(messageType: string, content: string, createTime: 
             },
           });
         } else {
-          // 作为新消息发送
           await this.client.im.message.create({
             params: { receive_id_type: 'chat_id' },
             data: {
@@ -511,13 +763,11 @@ private extractMessageContent(messageType: string, content: string, createTime: 
         }
       }
     } catch (error) {
-      // 解析飞书 API 的业务错误并抛出结构化的 FeishuSendError
       const feishuErr = extractFeishuError(error);
       if (feishuErr) {
         console.warn(`Plain text message rejected by Feishu [${feishuErr.code}]: ${feishuErr.msg}`);
         throw new FeishuSendError(feishuErr.code, feishuErr.msg, text);
       }
-      // 非业务错误（网络超时等），尝试 fallback
       console.warn('Plain text message failed (non-Feishu-API error), trying fallback:', error);
       await this.sendFallbackMessage(chatId, text, replyMessageId, threadId);
     }
@@ -533,7 +783,6 @@ private extractMessageContent(messageType: string, content: string, createTime: 
 
     try {
       if (replyMessageId) {
-        // 作为回复发送（使用im.message.reply自动关联到thread）
         await this.client.im.message.reply({
           path: { message_id: replyMessageId },
           data: {
@@ -542,7 +791,6 @@ private extractMessageContent(messageType: string, content: string, createTime: 
           },
         });
       } else {
-        // 作为新消息发送
         await this.client.im.message.create({
           params: { receive_id_type: 'chat_id' },
           data: {
@@ -554,14 +802,11 @@ private extractMessageContent(messageType: string, content: string, createTime: 
         });
       }
     } catch (error) {
-      // 检查是否是内容审核等业务错误
       const feishuErr = extractFeishuError(error);
       if (feishuErr) {
-        // 内容审核类错误（如敏感数据），换格式发也会失败，直接抛出让上层 AI 修复
         console.warn(`Interactive card rejected by Feishu [${feishuErr.code}]: ${feishuErr.msg}`);
         throw new FeishuSendError(feishuErr.code, feishuErr.msg, text);
       }
-      // 非内容审核错误（可能是卡片格式问题），降级为纯文本
       console.warn('Interactive card message failed (non-content error), fallback to plain text:', error);
       await this.sendPlainTextMessage(chatId, text, replyMessageId, threadId);
     }
@@ -611,14 +856,11 @@ private extractMessageContent(messageType: string, content: string, createTime: 
     let remaining = text;
 
     while (remaining.length > maxLen) {
-      // 优先在段落分隔处分割
       let idx = remaining.lastIndexOf('\n\n', maxLen);
       if (idx < maxLen * 0.3) {
-        // 回退到单行分隔
         idx = remaining.lastIndexOf('\n', maxLen);
       }
       if (idx < maxLen * 0.3) {
-        // 硬分割
         idx = maxLen;
       }
       chunks.push(remaining.slice(0, idx).trim());
@@ -634,7 +876,6 @@ private extractMessageContent(messageType: string, content: string, createTime: 
 
     try {
       if (replyMessageId) {
-        // 作为回复发送（使用im.message.reply自动关联到thread）
         await this.client.im.message.reply({
           path: { message_id: replyMessageId },
           data: {
@@ -643,7 +884,6 @@ private extractMessageContent(messageType: string, content: string, createTime: 
           },
         });
       } else {
-        // 作为新消息发送
         await this.client.im.message.create({
           params: { receive_id_type: 'chat_id' },
           data: {
@@ -661,13 +901,11 @@ private extractMessageContent(messageType: string, content: string, createTime: 
 
   private isDuplicate(msgId: string): boolean {
     const now = Date.now();
-    // 清理过期缓存（30分钟）
     for (const [id, ts] of this.messageCache.entries()) {
       if (now - ts > 30 * 60 * 1000) {
         this.messageCache.delete(id);
       }
     }
-    // 限制缓存大小
     if (this.messageCache.size >= 1000) {
       const firstKey = this.messageCache.keys().next().value;
       if (firstKey) this.messageCache.delete(firstKey);
@@ -681,7 +919,6 @@ private extractMessageContent(messageType: string, content: string, createTime: 
   }
 
   private getSenderName(openId: string): string {
-    // 简化实现，实际应该缓存用户信息
     return openId;
   }
 
@@ -728,38 +965,32 @@ private extractMessageContent(messageType: string, content: string, createTime: 
       return { success: false, error: 'Feishu client not initialized' };
     }
 
-    const maxFileSize = options?.maxFileSize || 10 * 1024 * 1024; // 默认10MB
+    const maxFileSize = options?.maxFileSize || 10 * 1024 * 1024;
 
     try {
-      // 验证文件存在性
       if (!existsSync(filePath)) {
         return { success: false, error: `File not found: ${filePath}` };
       }
 
-      // 验证文件大小
       const stats = statSync(filePath);
       if (stats.size > maxFileSize) {
         return { success: false, error: `File too large: ${stats.size} bytes (max: ${maxFileSize} bytes)` };
       }
 
-      // 验证文件类型（通过后缀名）
       const ext = extname(filePath).toLowerCase();
       const allowedExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.svg'];
       if (!allowedExtensions.includes(ext)) {
         return { success: false, error: `Unsupported file type: ${ext}` };
       }
 
-      // 读取文件内容
       const fileBuffer = readFileSync(filePath);
 
-      // 上传图片
       const result = await this.client.im.image.create({
         data: {
           image: fileBuffer,
           image_type: 'message',
         },
       });
-      console.log(JSON.stringify(result, null, 2))
 
       const imageKey = result?.image_key;
       if (imageKey) {
@@ -801,7 +1032,6 @@ private extractMessageContent(messageType: string, content: string, createTime: 
     ];
 
     try {
-      // 超时控制
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), timeout);
 
@@ -820,13 +1050,11 @@ private extractMessageContent(messageType: string, content: string, createTime: 
         return { success: false, error: `HTTP request failed with status: ${response.status}` };
       }
 
-      // 验证 Content-Type
       const contentType = response.headers.get('content-type')?.split(';')[0]?.trim().toLowerCase();
       if (contentType && !allowedContentTypes.includes(contentType)) {
         return { success: false, error: `Unsupported content type: ${contentType}` };
       }
 
-      // 预检 Content-Length
       const contentLength = response.headers.get('content-length');
       if (contentLength && parseInt(contentLength, 10) > maxFileSize) {
         return {
@@ -835,7 +1063,6 @@ private extractMessageContent(messageType: string, content: string, createTime: 
         };
       }
 
-      // 读取为 Buffer
       const arrayBuffer = await response.arrayBuffer();
       const fileBuffer = Buffer.from(arrayBuffer);
 
@@ -850,7 +1077,6 @@ private extractMessageContent(messageType: string, content: string, createTime: 
         return { success: false, error: 'Downloaded file is empty' };
       }
 
-      // 上传到飞书 —— 匹配 @larksuiteoapi/node-sdk 的 im.v1.image.create 签名
       const res = await this.client.im.image.create({
         data: {
           image_type: 'message',
@@ -883,7 +1109,6 @@ private extractMessageContent(messageType: string, content: string, createTime: 
 
     const IMG_EXT = 'jpg|jpeg|png|gif|bmp|webp|svg';
 
-    // ===== 第1步：提取所有图片路径 =====
     const pathPattern = new RegExp(
       `(?:https?|file):\\/\\/[^\\s\\)"'<>]+\\.(?:${IMG_EXT})(?:\\?[^\\s\\)"'<>]*)?` +
       `|[a-zA-Z]:\\\\[^\\s\\)"'<>]+\\.(?:${IMG_EXT})` +
@@ -896,7 +1121,6 @@ private extractMessageContent(messageType: string, content: string, createTime: 
       return { processedText: text, imageKeys: [], errors: [] };
     }
 
-    // ===== 第2步：批量上传，构建替换映射 =====
     const replacements = new Map<string, string>();
 
     await Promise.all(allPaths.map(async (imgPath) => {
@@ -917,38 +1141,32 @@ private extractMessageContent(messageType: string, content: string, createTime: 
       return { processedText: text, imageKeys: [], errors };
     }
 
-    // ===== 第3步：一次性替换 =====
-    // 构建一个大正则，按路径长度降序排列（避免短路径先匹配吃掉长路径的一部分）
     const sorted = [...replacements.keys()]
       .sort((a, b) => b.length - a.length);
 
     const escaped = sorted
       .map(p => p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
 
-    // 统一匹配：![alt](path) 或 <img src="path"> 或 裸路径
     const masterPattern = new RegExp(
-      `(!\\[[^\\]]*\\]\\()` +              // Markdown 前缀: ![alt](
-      `(${escaped.join('|')})` +           // 图片路径（核心捕获）
-      `(\\))` +                            // Markdown 后缀: )
-      `|(<img\\s[^>]*?src=["'])` +         // HTML img 前缀
-      `(${escaped.join('|')})` +           // 图片路径
-      `(["'][^>]*?>)` +                    // HTML img 后缀
-      `|(${escaped.join('|')})`,           // 裸路径
+      `(!\\[[^\\]]*\\]\\()` +
+      `(${escaped.join('|')})` +
+      `(\\))` +
+      `|(<img\\s[^>]*?src=["'])` +
+      `(${escaped.join('|')})` +
+      `(["'][^>]*?>)` +
+      `|(${escaped.join('|')})`,
       'gi'
     );
 
     const processedText = text.replace(masterPattern, (...args) => {
-      // Markdown: ![alt](path)
       if (args[1] && args[2]) {
         const key = replacements.get(args[2]);
         return key ? `${args[1]}${key}${args[3]}` : args[0];
       }
-      // HTML: <img src="path">
       if (args[4] && args[5]) {
         const key = replacements.get(args[5]);
         return key ? `${args[4]}${key}${args[6]}` : args[0];
       }
-      // 裸路径
       if (args[7]) {
         const key = replacements.get(args[7]);
         return key ? `![](${key})` : args[0];
@@ -959,11 +1177,9 @@ private extractMessageContent(messageType: string, content: string, createTime: 
     return { processedText, imageKeys, errors };
   }
 
-  // 统一的路径解析 + 上传
   private async resolveAndUpload(imagePath: string): Promise<ImageUploadResult> {
     if (imagePath.startsWith('file://')) {
-      // file:// 转本地路径
-      const localPath = fileURLToPath(imagePath); // Node.js url 模块
+      const localPath = fileURLToPath(imagePath);
       return this.uploadImage(localPath);
     } else if (imagePath.startsWith('http://') || imagePath.startsWith('https://')) {
       return this.uploadImageFromUrl(imagePath);
@@ -983,29 +1199,29 @@ private extractMessageContent(messageType: string, content: string, createTime: 
     }
 
     try {
-      // 处理内容中的图片
       const processResult = await this.processContentWithImages(text);
 
       if (processResult.errors.length > 0) {
         console.warn('Some images failed to upload:', processResult.errors);
       }
 
-      // 使用处理后的文本发送消息
       await this.sendMessage(chatId, processResult.processedText);
 
       console.log(`Message with processed content sent to chat ${chatId}`);
     } catch (error) {
       console.error('Failed to send message with processed content:', error);
-      // 降级为原始文本发送
       await this.sendMessage(chatId, text);
     }
   }
 
   /**
    * 下载飞书图片/文件
+   *
    * @param messageId 消息ID
    * @param fileKey 文件key（用于messageResource.get API）
    * @param timestamp 时间戳（用于文件名），可选，默认使用当前时间
+   * @param type 文件类型
+   * @param targetDir 目标目录（可选，默认使用旧路径 data/lark/{type}s，bridge 层传入 session 路径）
    * @returns 下载后的本地文件路径
    */
   async downloadFile(
@@ -1013,14 +1229,15 @@ private extractMessageContent(messageType: string, content: string, createTime: 
     fileKey: string,
     timestamp: string,
     type: 'image' | 'file',
+    targetDir?: string,
   ): Promise<string> {
     if (!this.client) {
       throw new Error('Feishu client not initialized');
     }
 
     try {
-      // 确保目录存在
-      const imageDir = join(process.cwd(), 'data', 'lark', `${type}s`);
+      // 确定目标目录：优先使用传入的 targetDir，否则使用旧默认路径
+      const imageDir = targetDir || join(process.cwd(), 'data', 'lark', `${type}s`);
       if (!existsSync(imageDir)) {
         mkdirSync(imageDir, { recursive: true });
       }
@@ -1039,11 +1256,9 @@ private extractMessageContent(messageType: string, content: string, createTime: 
         },
       });
 
-      // 生成文件名
       const fileName = `${timestamp || Date.now()}${getExtFromContentType(response.headers['Content-Type'] || response.headers['content-type'] || '')}`;
       const filePath = join(imageDir, fileName);
 
-      // 获取图片数据 - SDK 返回的是二进制数据
       await response.writeFile(filePath);
 
       return filePath;
@@ -1051,15 +1266,12 @@ private extractMessageContent(messageType: string, content: string, createTime: 
       console.error('下载飞书图片失败:', error);
       throw error;
     }
-
   }
+
   // ==================== NEW: Create + Patch 方法 ====================
 
   /**
    * 创建交互式卡片消息并返回 message_id
-   * 用于流式卡片的初始创建，后续通过 patchInteractiveCard 更新
-   *
-   * @returns message_id，创建失败返回 null
    */
   async createInteractiveCard(
     chatId: string,
@@ -1097,7 +1309,6 @@ private extractMessageContent(messageType: string, content: string, createTime: 
 
       const messageId = result?.data?.message_id;
       if (messageId) {
-        console.log(`📋 Interactive card created: ${messageId}`);
         return messageId;
       }
 
@@ -1116,11 +1327,6 @@ private extractMessageContent(messageType: string, content: string, createTime: 
 
   /**
    * Patch 更新已有的交互式卡片消息
-   * 使用 im.v1.message.patch API，限制 5 QPS，14 天窗口
-   *
-   * @param messageId 要更新的消息 ID
-   * @param cardJson  新的卡片 JSON
-   * @returns 是否成功
    */
   async patchInteractiveCard(
     messageId: string,

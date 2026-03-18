@@ -342,14 +342,21 @@ export class ClaudeEngine {
   /**
    * 压缩查询内容（兼容旧接口）
    */
-  compressQuery(messages: any[]): any[] {
-    return messages
+  async compressQuery(params: { systemPrompt: string; prompt: string; maxTokens: number }): Promise<string> {
+    const result = await this.sendMessage(
+      [{ role: 'user', content: params.prompt }],
+      params.systemPrompt,
+    )
+    return result.content || ''
   }
 
   /**
    * 执行原始Claude查询（兼容旧接口）
    */
-  async executeClaudeQueryRaw(messages: any[], systemPrompt?: string): Promise<any> {
-    return this.sendMessage(messages, systemPrompt)
+  async executeClaudeQueryRaw(systemPrompt: string, prompt: string): Promise<any> {
+    return this.sendMessage(
+      [{ role: 'user', content: prompt }],
+      systemPrompt,
+    )
   }
 }
