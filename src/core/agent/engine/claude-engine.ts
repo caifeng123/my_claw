@@ -14,7 +14,7 @@ export class ClaudeEngine {
     const env = {
       ...process.env,
       ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL,
-      ANTHROPIC_AUTH_TOKEN: process.env.ANTHROPIC_AUTH_TOKEN || process.env.ANTHROPIC_API_KEY,
+      ANTHROPIC_AUTH_TOKEN: process.env.ANTHROPIC_AUTH_TOKEN,
     }
     
     this.config = {
@@ -109,6 +109,11 @@ export class ClaudeEngine {
    *   - 'tool_progress' (SDKToolProgressMessage): 工具执行中进度通知
    *   - 'result' (SDKResultMessage): 最终结果
    *   - 注意: SDK 中不存在 'tool_result' 类型
+   *
+   * result 推送策略:
+   *   SDK 返回的 result.result 是最终完整回答，但流式过程中 text 块已通过
+   *   onContentDelta 推送过部分/全部内容。如果 result 包含未推送过的新内容，
+   *   需要补推以确保卡片展示完整回答。
    */
   async sendMessageStream(
     messages: any[],
@@ -117,10 +122,12 @@ export class ClaudeEngine {
     abortController?: AbortController,
   ): Promise<string> {
     let result = ''
-    // [FIX] 追踪是否从 assistant 消息中收到过 text 块内容
-    let hasReceivedTextContent = false
+    // [FIX] 追踪已通过 onContentDelta 推送到卡片的全部内容
+    let pushedContent = ''
     // [FIX] 收集所有 thinking 内容，用于在无 text 输出时作为生成回答的上下文
     let allThinkingContent = ''
+    // [FIX] 追踪最后一个 thinking 块的内容，用于终极兜底（只返回最后一段 thinking）
+    let lastThinkingContent = ''
     // tool_use_id → tool_name 映射，用于在 user 消息中查找工具名
     const toolUseIdToName = new Map<string, string>()
 
@@ -159,8 +166,6 @@ export class ClaudeEngine {
         },
       })
 
-      let lastAssistantContent = ''  // 临时存储最后一个 assistant 消息
-
       // 处理AI响应流（abortController.abort() 会中断此循环）
       for await (const message of response) {
         if (message.type === 'result') {
@@ -168,14 +173,32 @@ export class ClaudeEngine {
           const resultMsg = message as any
           const messageResult = resultMsg.result
 
-          // [FIX] 智能决策：是否将 result 作为内容增量发送
-          if (hasReceivedTextContent) {
-            // 已从 assistant text 块收到内容 → 不重复发送 result（避免重复/thinking 污染）
-            if (!result.trim()) result = messageResult
-          } else if (messageResult && messageResult.trim()) {
-            // 没收到过 text 内容，result 非空 → 用 result 兜底
-            result += messageResult
-            await eventHandlers?.onContentDelta?.(messageResult)
+          if (messageResult && messageResult.trim()) {
+            result = messageResult
+
+            // [FIX] 检查 result 是否包含尚未推送的内容
+            // 场景：text 块推了一句话"我来查询"，但 result 包含完整回答
+            // 此时需要将 result 中未推送的部分补推到卡片
+            if (pushedContent && messageResult.startsWith(pushedContent)) {
+              // result 以已推送内容为前缀 → 只补推后面的增量
+              const delta = messageResult.slice(pushedContent.length)
+              if (delta.trim()) {
+                await eventHandlers?.onContentDelta?.(delta)
+                pushedContent += delta
+              }
+            } else if (!pushedContent) {
+              // 从未推送过任何内容 → 完整推送 result
+              await eventHandlers?.onContentDelta?.(messageResult)
+              pushedContent = messageResult
+            } else if (messageResult.length > pushedContent.length && messageResult !== pushedContent) {
+              // result 不以已推送内容为前缀，但更长更完整
+              // 说明 result 是重新组织的完整回答，与流式 text 块内容不一致
+              // → 推送完整 result（卡片侧会追加，但这比丢失内容好）
+              const delta = '\n\n' + messageResult
+              await eventHandlers?.onContentDelta?.(delta)
+              pushedContent += delta
+            }
+            // else: result 与已推送内容相同或更短 → 不重复推送
           }
 
         } else if (message.type === 'assistant') {
@@ -192,6 +215,7 @@ export class ClaudeEngine {
               if (block.type === 'thinking' && block.thinking) {
                 hasThinkingInThisMessage = true
                 allThinkingContent += block.thinking  // [FIX] 累积所有 thinking 内容
+                lastThinkingContent = block.thinking  // [FIX] 记录最后一个 thinking 块
                 await eventHandlers?.onThinkingDelta?.(block.thinking)
               }
 
@@ -206,10 +230,9 @@ export class ClaudeEngine {
 
               // --- text 块 ---
               if (block.type === 'text' && block.text) {
-                lastAssistantContent = block.text
-                hasReceivedTextContent = true  // [FIX] 标记已从 assistant text 块收到内容
                 // ✅ 触发内容增量事件
                 await eventHandlers?.onContentDelta?.(block.text)
+                pushedContent += block.text  // [FIX] 追踪已推送的内容
               }
             }
             // [FIX] 仅在本轮 assistant 消息确实包含 thinking 块时才触发 thinkingStop
@@ -294,16 +317,16 @@ export class ClaudeEngine {
         // 其他消息类型暂不处理
       }
 
-      // 如果 result 为空，使用最后一个 assistant 消息
-      if (!result.trim() && lastAssistantContent) {
-        result = lastAssistantContent
+      // [FIX] 终极兜底：如果没有任何 result 也没推送过任何内容，
+      // 但有 thinking 内容 → 使用最后一段 thinking 作为降级回答
+      if (!result.trim() && !pushedContent.trim() && lastThinkingContent.trim()) {
+        result = lastThinkingContent
+        await eventHandlers?.onContentDelta?.(lastThinkingContent)
       }
 
-      // [FIX] 终极兜底：如果 result 仍为空但有 thinking 内容，
-      // 说明模型在最后一轮只输出了 thinking 没有生成 text 回答（SDK/模型边界情况）
-      // 直接将最后一段 thinking 原文作为降级输出
-      if (!result.trim() && allThinkingContent.trim()) {
-        result = allThinkingContent
+      // 确保 result 变量有值（用于返回给调用方）
+      if (!result.trim() && pushedContent.trim()) {
+        result = pushedContent
       }
 
       await eventHandlers?.onContentStop?.()

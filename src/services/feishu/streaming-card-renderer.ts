@@ -1,32 +1,34 @@
 /**
- * StreamingCardRenderer V2.1
+ * StreamingCardRenderer V3.6
  *
  * 流式飞书卡片渲染器 — 基于「Create + Patch」模式实现实时更新。
  *
- * V2.1 修复:
- *   - onComplete 增加防御性兜底：强制将所有仍在 running 的工具标记为 success
- *   - 避免因上游 onToolEnd 未触发导致卡片永远显示 "执行中 (0/N)"
- *
- * V2 全新卡片设计（扁平状态栏方案）:
+ * V3.6 卡片布局:
  *   ┌─────────────────────────────────────────────────────┐
- *   │ 🧠 思考中... / 🔧 tavily_search / 📝 生成中...      │  ← 动态状态栏
+ *   │ ⏳ 思考中...  ⏱ 12.3s                                │  ← 状态标题（带 icon）
  *   ├─────────────────────────────────────────────────────┤
- *   │ > 正在搜索 "xxx" 的相关信息...                       │  ← 当前动作摘要
+ *   │ Show N steps ·                             ▾        │  ← 可折叠步骤面板
+ *   │  🧠 thinking 原文                                    │
+ *   │  ✅ tool_name                                       │
+ *   │  ...                                                │
  *   ├─────────────────────────────────────────────────────┤
- *   │ ⚙️ 执行过程 (collapsible, 默认折叠)                 │  ← 详情面板
- *   │  ├─ 🧠 思考内容                                     │
- *   │  ├─ ✅ tool_1 (0.8s)                                │
- *   │  └─ ✅ tool_2 (1.2s)                                │
+ *   │ 🧠 当前最新 thinking 原文（实时预览，每段覆盖上一段）      │  ← 面板外实时预览
  *   ├─────────────────────────────────────────────────────┤
  *   │ 回答正文（markdown）                                  │  ← 回答内容
- *   ├─────────────────────────────────────────────────────┤
- *   │ ⏱ 12.3s │ 📥 2.1k │ 📤 856 │ 🔧 3 步              │  ← 底部统计
  *   └─────────────────────────────────────────────────────┘
  *
- * 设计原则:
- *   - 状态栏始终可见，无需展开即知当前进度
- *   - 详情面板默认折叠，按需查看
- *   - 底部统计仅完成/错误后展示
+ * 状态标题映射:
+ *   init        → ⏳ 准备中...
+ *   thinking    → 🧠 思考中...
+ *   tool_calling→ 🔧 操作中...
+ *   generating  → ✍️ 生成中...
+ *   completed   → ✅ 已完成
+ *   error       → ❌ 失败
+ *
+ * 面板 expanded 三态策略:
+ *   - 初始创建：expanded = false（默认收起）
+ *   - 中间 patch：不传 expanded 字段 → 飞书保持用户手动展开/收起状态
+ *   - 完成/出错：expanded = false（确保收起）
  *
  * 飞书限制:
  *   - im.v1.message.patch: 5 QPS, 14天窗口, 仅 interactive 类型
@@ -38,15 +40,16 @@
 
 // ==================== Types ====================
 
-/** 工具调用信息 */
-interface ToolCallInfo {
+/** 步骤信息 */
+interface StepInfo {
   id: string
-  name: string
-  input?: any
-  output?: any
-  status: 'pending' | 'running' | 'success' | 'error'
-  startTime: number
-  endTime?: number
+  /** 步骤类型 */
+  type: 'thinking' | 'tool'
+  /** 显示文本（thinking 原文 / 工具名） */
+  label: string
+  /** 工具动作摘要（仅 tool 类型） */
+  actionSummary?: string
+  status: 'running' | 'success' | 'error'
 }
 
 /** 卡片渲染阶段 */
@@ -56,16 +59,12 @@ type CardPhase = 'init' | 'thinking' | 'tool_calling' | 'generating' | 'complete
 interface CardState {
   phase: CardPhase
   startTime: number
-  thinkingContent: string
-  thinkingStartTime?: number
-  thinkingEndTime?: number
-  toolCalls: ToolCallInfo[]
-  /** 当前正在执行的动作描述（展示在状态栏下方） */
-  currentAction: string
+  /** 有序步骤列表（thinking 和 tool 交错排列） */
+  steps: StepInfo[]
+  /** 面板外实时 thinking 预览（只保留最新一段，下一段完全覆盖） */
+  liveThinkingText: string
   contentText: string
   errorMessage?: string
-  /** 总步骤数（thinking + tool calls） */
-  stepCount: number
 }
 
 /** 飞书客户端接口 (仅需 create + patch) */
@@ -75,7 +74,7 @@ export interface FeishuCardClient {
     cardJson: string,
     replyMessageId?: string,
     threadId?: string,
-  ): Promise<string | null>  // 返回 message_id
+  ): Promise<string | null>
   patchInteractiveCard(
     messageId: string,
     cardJson: string,
@@ -86,28 +85,8 @@ export interface FeishuCardClient {
 export interface StreamingCardRendererConfig {
   /** Patch 节流间隔 (ms)，默认 800 */
   throttleMs?: number
-  /** 思考内容最大字符数，默认 2000 */
-  maxThinkingChars?: number
-  /** 工具输入截断长度，默认 500 */
-  maxToolInputChars?: number
-  /** 工具输出截断长度，默认 800 */
-  maxToolOutputChars?: number
-  /** 回答内容截断长度，默认 Infinity (不做静态截断，由 executePatch 基于 UTF-8 字节数动态缩减) */
+  /** 回答内容截断长度，默认 Infinity */
   maxContentChars?: number
-  /** 最多显示几个工具调用子面板（超出后合并为摘要行），默认 8 */
-  maxToolPanels?: number
-}
-
-// ==================== Status Config ====================
-
-/** 各阶段对应的状态栏配置 */
-const PHASE_STATUS: Record<CardPhase, { icon: string; label: string }> = {
-  init:         { icon: '⏳', label: '准备中...' },
-  thinking:     { icon: '🧠', label: '思考中...' },
-  tool_calling: { icon: '🔧', label: '工具调用中' },
-  generating:   { icon: '📝', label: '生成中...' },
-  completed:    { icon: '✅', label: '已完成' },
-  error:        { icon: '❌', label: '执行出错' },
 }
 
 // ==================== Renderer ====================
@@ -123,8 +102,19 @@ export class StreamingCardRenderer {
   private state: CardState
   private patchTimer: ReturnType<typeof setTimeout> | null = null
   private hasPendingPatch = false
-  private toolIdCounter = 0
+  private stepIdCounter = 0
   private isFallbackMode = false
+
+  /**
+   * 标记当前是否为首次创建卡片。
+   * 用于 expanded 三态策略：首次创建时 expanded=false，之后不传该字段。
+   */
+  private isFirstBuild = true
+
+  /** 当前正在累积的 thinking 文本 */
+  private currentThinkingText = ''
+  /** 当前 thinking 步骤的 ID */
+  private currentThinkingStepId: string | null = null
 
   constructor(
     client: FeishuCardClient,
@@ -140,21 +130,15 @@ export class StreamingCardRenderer {
 
     this.config = {
       throttleMs: config?.throttleMs ?? 800,
-      maxThinkingChars: config?.maxThinkingChars ?? 2000,
-      maxToolInputChars: config?.maxToolInputChars ?? 500,
-      maxToolOutputChars: config?.maxToolOutputChars ?? 800,
       maxContentChars: config?.maxContentChars ?? Infinity,
-      maxToolPanels: config?.maxToolPanels ?? 8,
     }
 
     this.state = {
       phase: 'init',
       startTime: Date.now(),
-      thinkingContent: '',
-      toolCalls: [],
-      currentAction: '',
+      steps: [],
+      liveThinkingText: '',
       contentText: '',
-      stepCount: 0,
     }
   }
 
@@ -172,20 +156,52 @@ export class StreamingCardRenderer {
 
     if (this.state.phase === 'init' || this.state.phase === 'thinking') {
       this.state.phase = 'thinking'
-      if (!this.state.thinkingStartTime) {
-        this.state.thinkingStartTime = Date.now()
-      }
     }
-    this.state.thinkingContent += thinkingText
-    // 从思考内容中提取摘要作为当前动作
-    this.state.currentAction = this.extractThinkingSummary(this.state.thinkingContent)
+
+    // 如果当前没有活跃的 thinking 步骤，创建一个新的
+    // 同时清空 liveThinkingText —— 每段新 thinking 完全覆盖上一段
+    if (!this.currentThinkingStepId) {
+      const stepId = `step_${++this.stepIdCounter}`
+      this.currentThinkingStepId = stepId
+      this.currentThinkingText = ''
+      this.state.liveThinkingText = ''  // 新一段 thinking，覆盖上一段预览
+      this.state.steps.push({
+        id: stepId,
+        type: 'thinking',
+        label: '思考中...',
+        status: 'running',
+      })
+    }
+
+    this.currentThinkingText += thinkingText
+
+    // 更新步骤面板内的 label
+    const step = this.state.steps.find(s => s.id === this.currentThinkingStepId)
+    if (step) {
+      step.label = this.currentThinkingText.trim()
+    }
+
+    // 同步更新面板外的实时预览
+    this.state.liveThinkingText = this.currentThinkingText.trim()
+
     await this.schedulePatch()
   }
 
   /** 思考结束 */
   async onThinkingStop(): Promise<void> {
     if (this.isFallbackMode) return
-    this.state.thinkingEndTime = Date.now()
+
+    if (this.currentThinkingStepId) {
+      const step = this.state.steps.find(s => s.id === this.currentThinkingStepId)
+      if (step) {
+        step.status = 'success'
+        step.label = this.currentThinkingText.trim()
+      }
+      this.currentThinkingStepId = null
+      this.currentThinkingText = ''
+      // 注意：这里不清 liveThinkingText，保留预览直到下一段 thinking 覆盖或开始生成回答
+    }
+
     await this.schedulePatch()
   }
 
@@ -193,26 +209,28 @@ export class StreamingCardRenderer {
   async onToolStart(toolName: string, input?: any): Promise<void> {
     if (this.isFallbackMode) return
 
-    if (this.state.phase !== 'tool_calling') {
-      if (!this.state.thinkingEndTime && this.state.thinkingStartTime) {
-        this.state.thinkingEndTime = Date.now()
+    // 如果有未结束的 thinking 步骤，先结束它
+    if (this.currentThinkingStepId) {
+      const thinkingStep = this.state.steps.find(s => s.id === this.currentThinkingStepId)
+      if (thinkingStep) {
+        thinkingStep.status = 'success'
+        thinkingStep.label = this.currentThinkingText.trim()
       }
-      this.state.phase = 'tool_calling'
+      this.currentThinkingStepId = null
+      this.currentThinkingText = ''
     }
 
-    this.state.stepCount++
+    this.state.phase = 'tool_calling'
 
-    const toolCall: ToolCallInfo = {
-      id: `tool_${++this.toolIdCounter}`,
-      name: toolName,
-      input,
+    const stepId = `step_${++this.stepIdCounter}`
+    this.state.steps.push({
+      id: stepId,
+      type: 'tool',
+      label: toolName,
+      actionSummary: this.buildToolActionSummary(toolName, input),
       status: 'running',
-      startTime: Date.now(),
-    }
-    this.state.toolCalls.push(toolCall)
+    })
 
-    // 更新当前动作描述
-    this.state.currentAction = this.buildToolActionSummary(toolName, input)
     await this.schedulePatch()
   }
 
@@ -220,32 +238,18 @@ export class StreamingCardRenderer {
   async onToolEnd(toolName: string, output: any): Promise<void> {
     if (this.isFallbackMode) return
 
-    const tool = [...this.state.toolCalls]
+    const step = [...this.state.steps]
       .reverse()
-      .find(t => t.name === toolName && t.status === 'running')
-    if (tool) {
-      tool.status = typeof output === 'string' && output.startsWith('Error') ? 'error' : 'success'
-      tool.endTime = Date.now()
-      tool.output = output
+      .find(s => s.type === 'tool' && s.label === toolName && s.status === 'running')
+    if (step) {
+      step.status = typeof output === 'string' && output.startsWith('Error') ? 'error' : 'success'
     } else {
-      // [FIX] 如果按名字找不到 running 的工具（可能 toolName 是 unknown_tool），
-      // 尝试标记任意一个 running 状态的工具为完成
-      const anyRunning = [...this.state.toolCalls]
+      const anyRunning = [...this.state.steps]
         .reverse()
-        .find(t => t.status === 'running')
+        .find(s => s.type === 'tool' && s.status === 'running')
       if (anyRunning) {
         anyRunning.status = typeof output === 'string' && output.startsWith('Error') ? 'error' : 'success'
-        anyRunning.endTime = Date.now()
-        anyRunning.output = output
       }
-    }
-
-    // 检查是否还有正在运行的工具
-    const runningTool = this.state.toolCalls.find(t => t.status === 'running')
-    if (runningTool) {
-      this.state.currentAction = this.buildToolActionSummary(runningTool.name, runningTool.input)
-    } else {
-      this.state.currentAction = ''
     }
 
     await this.schedulePatch()
@@ -257,42 +261,37 @@ export class StreamingCardRenderer {
 
     if (this.state.phase !== 'generating') {
       this.state.phase = 'generating'
-      this.state.currentAction = ''
+      // 开始生成回答 → 清除 thinking 预览
+      this.state.liveThinkingText = ''
     }
     this.state.contentText += delta
     await this.schedulePatch()
   }
 
-
   /** 完成 */
   async onComplete(): Promise<void> {
-    // [FIX] 防御性兜底：将所有仍在 running 的工具强制标记为 success
-    // 避免因上游 onToolEnd 未正确触发导致卡片永远显示 "执行中 (0/N)"
-    for (const tool of this.state.toolCalls) {
-      if (tool.status === 'running') {
-        tool.status = 'success'
-        tool.endTime = tool.endTime ?? Date.now()
+    for (const step of this.state.steps) {
+      if (step.status === 'running') {
+        step.status = 'success'
       }
     }
 
     this.state.phase = 'completed'
-    this.state.currentAction = ''
+    this.state.liveThinkingText = ''  // 完成时清除预览
     await this.flushPatch()
   }
 
   /** 错误 */
   async onError(errorMessage: string): Promise<void> {
-    // [FIX] 错误时也将 running 工具标记为 error
-    for (const tool of this.state.toolCalls) {
-      if (tool.status === 'running') {
-        tool.status = 'error'
-        tool.endTime = tool.endTime ?? Date.now()
+    for (const step of this.state.steps) {
+      if (step.status === 'running') {
+        step.status = 'error'
       }
     }
 
     this.state.phase = 'error'
     this.state.errorMessage = errorMessage
-    this.state.currentAction = ''
+    this.state.liveThinkingText = ''  // 出错时清除预览
     await this.flushPatch()
   }
 
@@ -306,7 +305,7 @@ export class StreamingCardRenderer {
     return this.state.contentText
   }
 
-  /** [FIX] 检查回答内容是否因卡片大小限制被截断 */
+  /** 检查回答内容是否因卡片大小限制被截断 */
   isContentTruncated(): boolean {
     return this.state.contentText.endsWith('... (已截断)')
   }
@@ -315,83 +314,41 @@ export class StreamingCardRenderer {
 
   private buildCard(): object {
     const elements: any[] = []
-    const elapsed = this.getElapsed()
     const isFinished = this.state.phase === 'completed' || this.state.phase === 'error'
 
-    // ====== 1. 动态状态栏 ======
-    elements.push(this.buildStatusBar())
+    // ====== 0. 状态标题 ======
+    elements.push(this.buildStatusHeader())
 
-    // ====== 2. 当前动作摘要（进行中时展示） ======
-    if (!isFinished && this.state.currentAction) {
-      elements.push({
-        tag: 'markdown',
-        content: `> ${this.state.currentAction}`,
-        text_size: 'notation',
-      })
+    // ====== 1. 步骤面板 ======
+    if (this.state.steps.length > 0) {
+      elements.push(this.buildStepsPanel(isFinished))
     }
 
-    // ====== 3. 执行过程详情面板（有内容时展示，默认折叠） ======
-    const processElements = this.buildProcessElements()
-    if (processElements.length > 0) {
-      const toolCount = this.state.toolCalls.length
-      const successCount = this.state.toolCalls.filter(t => t.status === 'success').length
-      const errorCount = this.state.toolCalls.filter(t => t.status === 'error').length
-      const runningCount = this.state.toolCalls.filter(t => t.status === 'running').length
-
-      let panelTitle = '⚙️ 执行过程'
-      if (isFinished) {
-        const parts: string[] = []
-        if (this.state.thinkingContent) parts.push('思考')
-        if (toolCount > 0) {
-          let toolSummary = `${toolCount} 次工具调用`
-          if (errorCount > 0) toolSummary += ` (${errorCount} 失败)`
-          parts.push(toolSummary)
-        }
-        panelTitle = `⚙️ ${parts.join(' + ')}`
-      } else {
-        if (runningCount > 0) {
-          panelTitle = `⚙️ 执行中 (${successCount}/${toolCount})`
-        }
-      }
-
-      elements.push({
-        tag: 'collapsible_panel',
-        ...(isFinished ? { expanded: false } : {}),
-        background_color: 'grey',
-        header: {
-          title: {
-            tag: 'plain_text',
-            content: panelTitle,
-          },
-          icon_position: 'right',
-          icon_expanded_angle: 90,
-        },
-        border: { color: 'grey', corner_radius: '8px' },
-        elements: processElements,
-      })
-    }
-
-    // ====== 4. 回答内容 ======
-    if (this.state.contentText) {
+    // ====== 2. 面板外实时 thinking 预览 ======
+    if (this.state.liveThinkingText) {
       elements.push({
         tag: 'markdown',
-        content: this.state.contentText,  // 不在 buildCard 截断，由 executePatch 按字节动态缩减
+        content: `🧠 ${this.state.liveThinkingText}`,
         text_size: 'normal',
       })
     }
 
-    // ====== 5. 错误信息 ======
+    // ====== 3. 回答内容 ======
+    if (this.state.contentText) {
+      elements.push({
+        tag: 'markdown',
+        content: this.state.contentText,
+        text_size: 'normal',
+      })
+    }
+
+    // ====== 4. 错误信息 ======
     if (this.state.phase === 'error' && this.state.errorMessage) {
       elements.push({
         tag: 'markdown',
         content: `**Error**: ${this.truncate(this.state.errorMessage, 500)}`,
         text_size: 'normal',
       })
-    }
-
-    // ====== 6. 底部统计栏（仅完成/错误后展示） ======
-    if (isFinished) {
-      elements.push(this.buildStatsFooter(elapsed))
     }
 
     return {
@@ -416,203 +373,107 @@ export class StreamingCardRenderer {
     }
   }
 
-  // -------- 1. 状态栏 --------
+  // -------- 状态标题 --------
 
-  /** 构建动态状态栏 — 始终显示当前阶段 */
-  private buildStatusBar(): any {
-    const { icon, label } = PHASE_STATUS[this.state.phase]
-    const elapsed = this.getElapsed()
-    const isFinished = this.state.phase === 'completed' || this.state.phase === 'error'
+  /** 根据当前 phase 返回顶部状态标题元素 */
+  private buildStatusHeader(): any {
+    const statusMap: Record<CardPhase, { icon: string; text: string }> = {
+      init:         { icon: '⏳', text: '准备中...' },
+      thinking:     { icon: '🧠', text: '思考中...' },
+      tool_calling: { icon: '🔧', text: '操作中...' },
+      generating:   { icon: '✍️', text: '生成中...' },
+      completed:    { icon: '✅', text: '已完成' },
+      error:        { icon: '❌', text: '失败' },
+    }
 
-    // 进行中：显示阶段图标 + 标签 + 当前工具名
-    // 已完成：显示 ✅ 已完成
-    let statusText = `${icon} **${label}**`
+    const { icon, text } = statusMap[this.state.phase]
 
-    if (!isFinished) {
-      // 如果在工具调用中，显示当前工具名
-      if (this.state.phase === 'tool_calling') {
-        const runningTool = this.state.toolCalls.find(t => t.status === 'running')
-        if (runningTool) {
-          statusText = `🔧 **${runningTool.name}**`
-        }
-      }
-      // 附加运行时间
-      statusText += `  \`${this.formatDuration(elapsed)}\``
+    // 已完成状态追加运行时间
+    let display = `**${icon} ${text}**`
+    if (this.state.phase === 'completed') {
+      const elapsed = this.formatDuration(Date.now() - this.state.startTime)
+      display = `**${icon} ${text} · ⏱ ${elapsed}**`
     }
 
     return {
       tag: 'markdown',
-      content: statusText,
+      content: display,
       text_size: 'heading',
     }
   }
 
-  // -------- 3. 执行过程面板内容 --------
+  // -------- 步骤面板 --------
 
-  /** 构建执行过程详情（面板内的子元素） */
-  private buildProcessElements(): any[] {
-    const elements: any[] = []
+  /**
+   * 构建可折叠步骤面板。
+   *
+   * expanded 三态策略：
+   *   1. 首次创建（isFirstBuild=true）→ expanded=false，默认收起
+   *   2. 中间 patch（isFirstBuild=false, isFinished=false）→ 不传 expanded，
+   *      飞书保持用户手动展开/收起的状态不被覆盖
+   *   3. 完成/出错（isFinished=true）→ expanded=false，确保最终收起
+   */
+  private buildStepsPanel(isFinished: boolean): any {
+    const totalSteps = this.state.steps.length
+    const stepLines = this.state.steps.map(step => this.buildStepLine(step))
 
-    // 3.1 思考内容
-    if (this.state.thinkingContent) {
-      const thinkingDuration = this.state.thinkingEndTime && this.state.thinkingStartTime
-        ? this.state.thinkingEndTime - this.state.thinkingStartTime
-        : (this.state.thinkingStartTime ? Date.now() - this.state.thinkingStartTime : 0)
+    // 面板标题：仅显示步骤数（运行时间已移至顶部状态标题）
+    const panelTitle = `Show ${totalSteps} steps`
 
-      const isThinking = this.state.phase === 'thinking'
-      const isFinished = this.state.phase === 'completed' || this.state.phase === 'error'
-      elements.push({
-        tag: 'collapsible_panel',
-        ...(isFinished ? { expanded: false } : {}),
-        background_color: 'grey',
-        header: {
-          title: {
-            tag: 'plain_text',
-            content: isThinking
-              ? '🧠 思考中...'
-              : `🧠 思考过程 (${this.formatDuration(thinkingDuration)})`,
-          },
-          icon_position: 'right',
-          icon_expanded_angle: 90,
-        },
-        border: { color: 'grey', corner_radius: '8px' },
-        elements: [{
-          tag: 'markdown',
-          content: this.truncate(this.state.thinkingContent, this.config.maxThinkingChars),
-        }],
-      })
-    }
-
-    // 3.2 工具调用列表
-    if (this.state.toolCalls.length > 0) {
-      const toolElements = this.buildToolElements()
-      elements.push(...toolElements)
-    }
-
-    return elements
-  }
-
-  /** 构建工具调用列表 */
-  private buildToolElements(): any[] {
-    const tools = this.state.toolCalls
-
-    // 工具数量过多时，合并早期工具为摘要行
-    if (tools.length > this.config.maxToolPanels) {
-      const collapsed = tools.slice(0, -(this.config.maxToolPanels - 2))
-      const recent = tools.slice(-(this.config.maxToolPanels - 2))
-      const successCount = collapsed.filter(t => t.status === 'success').length
-      const errorCount = collapsed.filter(t => t.status === 'error').length
-      const parts: string[] = []
-      if (successCount > 0) parts.push(`✅${successCount}`)
-      if (errorCount > 0) parts.push(`❌${errorCount}`)
-
-      return [
-        {
-          tag: 'markdown',
-          content: `... 其他 ${collapsed.length} 次调用 (${parts.join(' ')})`,
-          text_size: 'notation',
-        },
-        ...recent.map(t => this.buildSingleToolPanel(t)),
-      ]
-    }
-
-    return tools.map(t => this.buildSingleToolPanel(t))
-  }
-
-  /** 构建单个工具调用面板 */
-  private buildSingleToolPanel(tool: ToolCallInfo): any {
-    const icon = this.getToolStatusIcon(tool.status)
-    const duration = tool.endTime
-      ? ` (${this.formatDuration(tool.endTime - tool.startTime)})`
-      : ''
-    const isRunning = tool.status === 'running'
-
-    const innerElements: any[] = []
-
-    // 输出结果优先
-    if (tool.output && !isRunning) {
-      const outputStr = typeof tool.output === 'string'
-        ? tool.output
-        : JSON.stringify(tool.output, null, 2)
-      innerElements.push({
-        tag: 'markdown',
-        content: `**输出**\n${this.truncate(outputStr, this.config.maxToolOutputChars)}`,
-      })
-    }
-
-    // 输入参数
-    if (tool.input) {
-      const inputStr = typeof tool.input === 'string'
-        ? tool.input
-        : JSON.stringify(tool.input, null, 2)
-      innerElements.push({
-        tag: 'markdown',
-        content: `**输入**\n\`\`\`json\n${this.truncate(inputStr, this.config.maxToolInputChars)}\n\`\`\``,
-      })
-    }
-
-    if (innerElements.length === 0) {
-      innerElements.push({
-        tag: 'markdown',
-        content: isRunning ? '⏳ 执行中...' : '(无详情)',
-      })
-    }
-
-    const isFinished = this.state.phase === 'completed' || this.state.phase === 'error'
-    return {
+    const panel: any = {
       tag: 'collapsible_panel',
-      ...(isFinished ? { expanded: false } : {}),
-      background_color: tool.status === 'error' ? 'red' : 'grey',
+      background_color: 'grey',
       header: {
         title: {
           tag: 'plain_text',
-          content: `${icon} ${tool.name}${duration}`,
+          content: panelTitle,
         },
         icon_position: 'right',
         icon_expanded_angle: 90,
       },
-      border: { color: tool.status === 'error' ? 'red' : 'grey', corner_radius: '8px' },
-      elements: innerElements,
+      border: { color: 'grey', corner_radius: '8px' },
+      elements: stepLines,
     }
+
+    // 仅在首次创建和最终完成时显式设置 expanded
+    // 中间 patch 不传此字段 → 飞书保持用户手动操作的状态
+    if (this.isFirstBuild || isFinished) {
+      panel.expanded = false
+    }
+
+    return panel
   }
 
-  // -------- 6. 底部统计栏 --------
+  private buildStepLine(step: StepInfo): any {
+    const icon = this.getStepIcon(step)
+    let text: string
 
-  /** 构建底部统计（运行时间 | 输入token | 输出token | 步骤数） */
-  private buildStatsFooter(elapsed: number): any {
-    const parts: string[] = []
-
-    // 运行时间
-    parts.push(`⏱ ${this.formatDuration(elapsed)}`)
-
-
-    // 工具调用次数（仅统计实际工具调用，不含 thinking）
-    const toolCallCount = this.state.toolCalls.length
-    if (toolCallCount > 0) {
-      parts.push(`🔧 ${toolCallCount} 次调用`)
+    if (step.type === 'thinking') {
+      text = `${icon}  ${step.label}`
+    } else {
+      text = `${icon}  ${step.label}`
+      if (step.actionSummary) {
+        text += `\n　　${step.actionSummary}`
+      }
     }
 
     return {
-      tag: 'column_set',
-      flex_mode: 'none',
-      background_style: 'default',
-      columns: [{
-        tag: 'column',
-        width: 'weighted',
-        weight: 1,
-        vertical_align: 'center',
-        elements: [{
-          tag: 'markdown',
-          content: parts.join('  |  '),
-          text_size: 'notation',
-        }],
-      }],
+      tag: 'markdown',
+      content: text,
+      text_size: 'notation',
     }
+  }
+
+  private getStepIcon(step: StepInfo): string {
+    if (step.status === 'running') {
+      return step.type === 'thinking' ? '🧠' : '⏳'
+    }
+    if (step.status === 'error') return '❌'
+    return step.type === 'thinking' ? '🧠' : '✅'
   }
 
   // ==================== Patch Scheduling ====================
 
-  /** 节流调度 Patch */
   private async schedulePatch(): Promise<void> {
     this.hasPendingPatch = true
 
@@ -631,7 +492,6 @@ export class StreamingCardRenderer {
     }, this.config.throttleMs)
   }
 
-  /** 立即 flush 所有待更新 */
   private async flushPatch(): Promise<void> {
     if (this.patchTimer) {
       clearTimeout(this.patchTimer)
@@ -645,7 +505,6 @@ export class StreamingCardRenderer {
     await this.executePatch()
   }
 
-  /** 创建初始卡片 */
   private async createInitialCard(): Promise<void> {
     if (this.isFallbackMode) return
 
@@ -660,6 +519,8 @@ export class StreamingCardRenderer {
       if (msgId) {
         this.messageId = msgId
         this.hasPendingPatch = false
+        // 首次创建完成，后续 patch 不再设置 expanded
+        this.isFirstBuild = false
       } else {
         this.isFallbackMode = true
       }
@@ -668,8 +529,8 @@ export class StreamingCardRenderer {
     }
   }
 
-  // [FIX] 飞书卡片 30KB 限制按 UTF-8 字节算，中文 3 bytes/char
-  private static readonly CARD_BYTE_LIMIT = 29 * 1024  // 29KB，留 1KB 安全余量
+  // 飞书卡片 30KB 限制
+  private static readonly CARD_BYTE_LIMIT = 29 * 1024
 
   private getByteLength(str: string): number {
     return Buffer.byteLength(str, 'utf8')
@@ -683,28 +544,31 @@ export class StreamingCardRenderer {
       let cardJson = JSON.stringify(this.buildCard())
       let byteSize = this.getByteLength(cardJson)
 
-      // [FIX] 基于 UTF-8 字节数动态缩减
       if (byteSize > StreamingCardRenderer.CARD_BYTE_LIMIT) {
 
-        // 第1步：缩减思考内容
-        if (this.state.thinkingContent.length > 500) {
-          this.state.thinkingContent = this.truncate(this.state.thinkingContent, 500)
+        // 第 1 步：截断 liveThinkingText
+        if (this.state.liveThinkingText.length > 500) {
+          this.state.liveThinkingText = this.state.liveThinkingText.slice(0, 500) + '...'
           cardJson = JSON.stringify(this.buildCard())
           byteSize = this.getByteLength(cardJson)
         }
 
-        // 第2步：缩减工具输出
+        // 第 2 步：截断过长的 thinking 步骤
         if (byteSize > StreamingCardRenderer.CARD_BYTE_LIMIT) {
-          for (const tool of this.state.toolCalls) {
-            if (tool.output && typeof tool.output === 'string' && tool.output.length > 200) {
-              tool.output = tool.output.slice(0, 200) + '...(已截断)'
+          let needRebuild = false
+          for (const step of this.state.steps) {
+            if (step.type === 'thinking' && step.label.length > 300) {
+              step.label = step.label.slice(0, 300) + '...'
+              needRebuild = true
             }
           }
-          cardJson = JSON.stringify(this.buildCard())
-          byteSize = this.getByteLength(cardJson)
+          if (needRebuild) {
+            cardJson = JSON.stringify(this.buildCard())
+            byteSize = this.getByteLength(cardJson)
+          }
         }
 
-        // 第3步：二分法缩减正文——精确找到最大可容纳长度
+        // 第 3 步：二分法缩减正文
         if (byteSize > StreamingCardRenderer.CARD_BYTE_LIMIT) {
           const originalContent = this.state.contentText
           let lo = 0, hi = originalContent.length
@@ -733,66 +597,38 @@ export class StreamingCardRenderer {
 
   // ==================== Utility ====================
 
-  private getElapsed(): number {
-    return Date.now() - this.state.startTime
-  }
-
-  private formatDuration(ms: number): string {
-    if (ms < 1000) return `${ms}ms`
-    const seconds = ms / 1000
-    if (seconds < 60) return `${seconds.toFixed(1)}s`
-    const minutes = Math.floor(seconds / 60)
-    const secs = Math.round(seconds % 60)
-    return `${minutes}m${secs}s`
-  }
-
   private truncate(text: string, maxLen: number): string {
     if (!text) return ''
     if (text.length <= maxLen) return text
     return text.slice(0, maxLen) + '\n... (已截断)'
   }
 
-  private getToolStatusIcon(status: ToolCallInfo['status']): string {
-    switch (status) {
-      case 'running': return '⏳'
-      case 'success': return '✅'
-      case 'error':   return '❌'
-      case 'pending':  return '⬚'
-    }
+  /** 格式化运行时间：自动选择合适单位 */
+  private formatDuration(ms: number): string {
+    if (ms < 1000) return `${ms}ms`
+    const seconds = ms / 1000
+    if (seconds < 60) return `${seconds.toFixed(1)}s`
+    const minutes = Math.floor(seconds / 60)
+    const remainSec = seconds % 60
+    return `${minutes}m ${remainSec.toFixed(0)}s`
   }
 
-  /** 从思考内容中提取最后一句话作为摘要 */
-  private extractThinkingSummary(text: string): string {
-    if (!text) return ''
-    // 取最后非空行
-    const lines = text.trim().split('\n').filter(l => l.trim())
-    const lastLine = lines[lines.length - 1] || ''
-    // 截断到合理长度
-    if (lastLine.length > 60) {
-      return lastLine.slice(0, 57) + '...'
-    }
-    return lastLine
-  }
-
-  /** 构建工具调用的动作摘要 */
   private buildToolActionSummary(toolName: string, input?: any): string {
-    if (!input) return `正在调用 ${toolName}...`
-
-    // 从 input 中提取关键参数作为描述
-    const inputStr = typeof input === 'string' ? input : ''
-    if (inputStr && inputStr.length < 60) {
-      return `${toolName}: ${inputStr}`
-    }
+    if (!input) return ''
 
     if (typeof input === 'object' && input !== null) {
-      // 提取常见关键参数
       const query = input.query || input.q || input.search || input.keyword || input.command || input.url || input.path
       if (query && typeof query === 'string') {
         const display = query.length > 50 ? query.slice(0, 47) + '...' : query
-        return `${toolName}: ${display}`
+        return display
       }
     }
 
-    return `正在调用 ${toolName}...`
+    const inputStr = typeof input === 'string' ? input : ''
+    if (inputStr && inputStr.length < 60) {
+      return inputStr
+    }
+
+    return ''
   }
 }
