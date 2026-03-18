@@ -1,34 +1,41 @@
 /**
- * StreamingCardRenderer V3.6
+ * StreamingCardRenderer V3.9
  *
  * 流式飞书卡片渲染器 — 基于「Create + Patch」模式实现实时更新。
  *
- * V3.6 卡片布局:
+ * V3.8 变更:
+ *   1. [FIX] 状态标题迁移至卡片 header：使用飞书卡片原生 header，
+ *      配合 template 颜色区分不同阶段（turquoise=进行中, green=已完成, red=错误）
+ *   2. [FIX] 面板标题摘要：完成后面板 header 标题变为摘要统计信息，
+ *      面板始终保留 collapsible_panel 可折叠交互
+ *
+ * V3.7 保留:
+ *   - 步骤标注：区分 skill / tool 类型，格式为 "skill: xxx" 或 "tool: xxx"
+ *
+ * 卡片布局:
  *   ┌─────────────────────────────────────────────────────┐
- *   │ ⏳ 思考中...  ⏱ 12.3s                                │  ← 状态标题（带 icon）
+ *   │ [turquoise] ⏳ 思考中...                             │  ← 卡片 header（带颜色模板）
+ *   │            (完成/失败时标题含耗时)                        │
  *   ├─────────────────────────────────────────────────────┤
  *   │ Show N steps ·                             ▾        │  ← 可折叠步骤面板
- *   │  🧠 thinking 原文                                    │
- *   │  ✅ tool_name                                       │
- *   │  ...                                                │
+ *   │  🧠 thinking 原文                                    │     完成后标题变为摘要
+ *   │  ✅ skill: deep-research                             │
+ *   │  ✅ tool: tavily_search                              │
+ *   │  ✅ tool: Bash                                       │
  *   ├─────────────────────────────────────────────────────┤
  *   │ 🧠 当前最新 thinking 原文（实时预览，每段覆盖上一段）      │  ← 面板外实时预览
  *   ├─────────────────────────────────────────────────────┤
  *   │ 回答正文（markdown）                                  │  ← 回答内容
  *   └─────────────────────────────────────────────────────┘
  *
- * 状态标题映射:
- *   init        → ⏳ 准备中...
- *   thinking    → 🧠 思考中...
- *   tool_calling→ 🔧 操作中...
- *   generating  → ✍️ 生成中...
- *   completed   → ✅ 已完成
- *   error       → ❌ 失败
+ * header 颜色映射:
+ *   init / thinking / tool_calling / generating → turquoise (进行中)
+ *   completed                                   → green     (成功)
+ *   error                                       → red       (错误)
  *
- * 面板 expanded 三态策略:
- *   - 初始创建：expanded = false（默认收起）
- *   - 中间 patch：不传 expanded 字段 → 飞书保持用户手动展开/收起状态
- *   - 完成/出错：expanded = false（确保收起）
+ * 面板策略 (V3.9):
+ *   运行中  → collapsible_panel (expanded=false)，header 显示 "Show N steps"
+ *   完成后  → collapsible_panel (expanded=false)，header 变为摘要统计
  *
  * 飞书限制:
  *   - im.v1.message.patch: 5 QPS, 14天窗口, 仅 interactive 类型
@@ -50,6 +57,13 @@ interface StepInfo {
   /** 工具动作摘要（仅 tool 类型） */
   actionSummary?: string
   status: 'running' | 'success' | 'error'
+  /**
+   * V3.7: 工具分类标签 —— "skill" 或 "tool"
+   * 仅 type='tool' 时有值。
+   * - "skill"：Claude 通过 Skill 工具调用 .claude/skills/ 下的技能
+   * - "tool"：SDK 内置工具（Bash/Read/WebSearch 等）或自定义 MCP 工具
+   */
+  category?: 'skill' | 'tool'
 }
 
 /** 卡片渲染阶段 */
@@ -107,7 +121,7 @@ export class StreamingCardRenderer {
 
   /**
    * 标记当前是否为首次创建卡片。
-   * 用于 expanded 三态策略：首次创建时 expanded=false，之后不传该字段。
+   * 仅用于追踪生命周期，不影响渲染逻辑。
    */
   private isFirstBuild = true
 
@@ -222,13 +236,17 @@ export class StreamingCardRenderer {
 
     this.state.phase = 'tool_calling'
 
+    // V3.7: 解析工具分类和显示名
+    const { category, displayName } = this.resolveToolInfo(toolName, input)
+
     const stepId = `step_${++this.stepIdCounter}`
     this.state.steps.push({
       id: stepId,
       type: 'tool',
-      label: toolName,
+      label: displayName,
       actionSummary: this.buildToolActionSummary(toolName, input),
       status: 'running',
+      category,
     })
 
     await this.schedulePatch()
@@ -238,9 +256,13 @@ export class StreamingCardRenderer {
   async onToolEnd(toolName: string, output: any): Promise<void> {
     if (this.isFallbackMode) return
 
+    console.log('[card-renderer] ✅ onToolEnd:', toolName)
+    // V3.7: onToolEnd 的 toolName 匹配逻辑需兼容新的 displayName
+    const { displayName } = this.resolveToolInfo(toolName)
+
     const step = [...this.state.steps]
       .reverse()
-      .find(s => s.type === 'tool' && s.label === toolName && s.status === 'running')
+      .find(s => s.type === 'tool' && (s.label === toolName || s.label === displayName) && s.status === 'running')
     if (step) {
       step.status = typeof output === 'string' && output.startsWith('Error') ? 'error' : 'success'
     } else {
@@ -316,9 +338,6 @@ export class StreamingCardRenderer {
     const elements: any[] = []
     const isFinished = this.state.phase === 'completed' || this.state.phase === 'error'
 
-    // ====== 0. 状态标题 ======
-    elements.push(this.buildStatusHeader())
-
     // ====== 1. 步骤面板 ======
     if (this.state.steps.length > 0) {
       elements.push(this.buildStepsPanel(isFinished))
@@ -353,6 +372,7 @@ export class StreamingCardRenderer {
 
     return {
       schema: '2.0',
+      header: this.buildCardHeader(),
       config: {
         update_multi: true,
         style: {
@@ -373,55 +393,68 @@ export class StreamingCardRenderer {
     }
   }
 
-  // -------- 状态标题 --------
+  // -------- 卡片 Header --------
 
-  /** 根据当前 phase 返回顶部状态标题元素 */
-  private buildStatusHeader(): any {
-    const statusMap: Record<CardPhase, { icon: string; text: string }> = {
-      init:         { icon: '⏳', text: '准备中...' },
-      thinking:     { icon: '🧠', text: '思考中...' },
-      tool_calling: { icon: '🔧', text: '操作中...' },
-      generating:   { icon: '✍️', text: '生成中...' },
-      completed:    { icon: '✅', text: '已完成' },
-      error:        { icon: '❌', text: '失败' },
+  /**
+   * V3.8: 构建卡片原生 header，取代之前 body 中的 markdown 状态标题。
+   *
+   * 颜色映射:
+   *   init / thinking / tool_calling / generating → turquoise (进行中)
+   *   completed                                   → green     (成功)
+   *   error                                       → red       (错误)
+   */
+  private buildCardHeader(): object {
+    const phaseConfig: Record<CardPhase, { template: string; icon: string; text: string }> = {
+      init:         { template: 'turquoise', icon: '⏳', text: '准备中...' },
+      thinking:     { template: 'turquoise', icon: '🧠', text: '思考中...' },
+      tool_calling: { template: 'turquoise', icon: '🔧', text: '操作中...' },
+      generating:   { template: 'turquoise', icon: '✍️', text: '生成中...' },
+      completed:    { template: 'green',     icon: '✅', text: '已完成' },
+      error:        { template: 'red',       icon: '❌', text: '失败' },
     }
 
-    const { icon, text } = statusMap[this.state.phase]
+    const { template, icon, text } = phaseConfig[this.state.phase]
 
-    // 已完成状态追加运行时间
-    let display = `**${icon} ${text}**`
-    if (this.state.phase === 'completed') {
+    // 已完成/失败时，耗时直接拼在大标题后面
+    let titleContent = `${icon} ${text}`
+    if (this.state.phase === 'completed' || this.state.phase === 'error') {
       const elapsed = this.formatDuration(Date.now() - this.state.startTime)
-      display = `**${icon} ${text} · ⏱ ${elapsed}**`
+      titleContent = `${icon} ${text} · ⏱ ${elapsed}`
     }
 
     return {
-      tag: 'markdown',
-      content: display,
-      text_size: 'heading',
+      template,
+      title: {
+        tag: 'plain_text',
+        content: titleContent,
+      },
     }
   }
 
   // -------- 步骤面板 --------
 
   /**
-   * 构建可折叠步骤面板。
+   * 构建步骤区域。
    *
-   * expanded 三态策略：
-   *   1. 首次创建（isFirstBuild=true）→ expanded=false，默认收起
-   *   2. 中间 patch（isFirstBuild=false, isFinished=false）→ 不传 expanded，
-   *      飞书保持用户手动展开/收起的状态不被覆盖
-   *   3. 完成/出错（isFinished=true）→ expanded=false，确保最终收起
+   * V3.9 策略：始终使用 collapsible_panel，完成后将 header 标题替换为摘要信息。
+   *   运行中 → header: "Show N steps"
+   *   完成后 → header: "N steps · X thinking, Y tool, Z skill"
+   *
+   * expanded 始终为 false（飞书 patch 无法强制覆盖客户端展开状态，
+   * 但初始创建时 false 可保证默认收起）。
    */
   private buildStepsPanel(isFinished: boolean): any {
     const totalSteps = this.state.steps.length
     const stepLines = this.state.steps.map(step => this.buildStepLine(step))
 
-    // 面板标题：仅显示步骤数（运行时间已移至顶部状态标题）
-    const panelTitle = `Show ${totalSteps} steps`
+    // 面板标题：运行中用简单计数，完成后用摘要统计
+    const panelTitle = isFinished
+      ? this.buildStepsSummaryTitle(totalSteps)
+      : `Show ${totalSteps} steps`
 
-    const panel: any = {
+    return {
       tag: 'collapsible_panel',
+      expanded: false,
       background_color: 'grey',
       header: {
         title: {
@@ -434,16 +467,42 @@ export class StreamingCardRenderer {
       border: { color: 'grey', corner_radius: '8px' },
       elements: stepLines,
     }
-
-    // 仅在首次创建和最终完成时显式设置 expanded
-    // 中间 patch 不传此字段 → 飞书保持用户手动操作的状态
-    if (this.isFirstBuild || isFinished) {
-      panel.expanded = false
-    }
-
-    return panel
   }
 
+  /**
+   * V3.9: 构建面板 header 摘要标题（纯文本字符串）。
+   * 完成后显示为 "5 steps · 2 thinking, 2 tool, 1 skill"
+   * 有 error 时追加 " · 1 error"
+   */
+  private buildStepsSummaryTitle(totalSteps: number): string {
+    let thinkingCount = 0
+    let toolCount = 0
+    let skillCount = 0
+    let errorCount = 0
+    for (const step of this.state.steps) {
+      if (step.status === 'error') errorCount++
+      if (step.type === 'thinking') thinkingCount++
+      else if (step.category === 'skill') skillCount++
+      else toolCount++
+    }
+
+    const parts: string[] = []
+    if (thinkingCount > 0) parts.push(`${thinkingCount} thinking`)
+    if (toolCount > 0) parts.push(`${toolCount} tool`)
+    if (skillCount > 0) parts.push(`${skillCount} skill`)
+
+    let summary = `${totalSteps} steps · ${parts.join(', ')}`
+    if (errorCount > 0) {
+      summary += ` · ${errorCount} error`
+    }
+
+    return summary
+  }
+
+  /**
+   * 构建单个步骤行。
+   * V3.7: tool 类型步骤标注 "skill: xxx" 或 "tool: xxx"
+   */
   private buildStepLine(step: StepInfo): any {
     const icon = this.getStepIcon(step)
     let text: string
@@ -451,7 +510,9 @@ export class StreamingCardRenderer {
     if (step.type === 'thinking') {
       text = `${icon}  ${step.label}`
     } else {
-      text = `${icon}  ${step.label}`
+      // V3.7: 使用 category 标注类型
+      const prefix = step.category === 'skill' ? 'skill' : 'tool'
+      text = `${icon}  ${prefix}: ${step.label}`
       if (step.actionSummary) {
         text += `\n　　${step.actionSummary}`
       }
@@ -470,6 +531,43 @@ export class StreamingCardRenderer {
     }
     if (step.status === 'error') return '❌'
     return step.type === 'thinking' ? '🧠' : '✅'
+  }
+
+  // ==================== Tool Info Resolution ====================
+
+  /**
+   * V3.7: 解析工具分类（skill vs tool）和显示名称。
+   *
+   * 分类规则:
+   *   1. toolName === 'Skill' → category='skill'，从 input 中提取 skill 名称作为 displayName
+   *   2. toolName 含 'mcp__' 前缀 → category='tool'，去前缀后作为 displayName
+   *   3. 其他 → category='tool'，直接用 toolName 作为 displayName
+   */
+  private resolveToolInfo(toolName: string, input?: any): { category: 'skill' | 'tool'; displayName: string } {
+    // Case 1: SDK 内置 Skill 工具 → 从 input 提取具体 skill 名
+    if (toolName === 'Skill') {
+      let skillName = ''
+      if (input && typeof input === 'object') {
+        // Claude Agent SDK 的 Skill 工具，input 中通常包含 skill_name / name / skill 字段
+        skillName = input.skill_name || input.name || input.skill || ''
+      }
+      if (typeof input === 'string') {
+        skillName = input
+      }
+      return {
+        category: 'skill',
+        displayName: skillName || 'Skill',
+      }
+    }
+
+    // Case 2: 自定义 MCP 工具（mcp__cf-claw-tools__xxx）→ 去前缀
+    if (toolName.includes('__')) {
+      const shortName = toolName.split('__').pop()!
+      return { category: 'tool', displayName: shortName }
+    }
+
+    // Case 3: SDK 内置工具（Bash, Read, WebSearch 等）→ 直接使用
+    return { category: 'tool', displayName: toolName }
   }
 
   // ==================== Patch Scheduling ====================
@@ -519,7 +617,7 @@ export class StreamingCardRenderer {
       if (msgId) {
         this.messageId = msgId
         this.hasPendingPatch = false
-        // 首次创建完成，后续 patch 不再设置 expanded
+        // 首次创建完成
         this.isFirstBuild = false
       } else {
         this.isFallbackMode = true
@@ -615,6 +713,18 @@ export class StreamingCardRenderer {
 
   private buildToolActionSummary(toolName: string, input?: any): string {
     if (!input) return ''
+
+    // V3.7: Skill 工具的 actionSummary 不重复显示 skill 名（已在 displayName 中体现）
+    if (toolName === 'Skill') {
+      // 尝试提取 prompt / instruction 等有意义的字段
+      if (typeof input === 'object' && input !== null) {
+        const detail = input.prompt || input.instruction || input.description || ''
+        if (detail && typeof detail === 'string') {
+          return detail.length > 50 ? detail.slice(0, 47) + '...' : detail
+        }
+      }
+      return ''
+    }
 
     if (typeof input === 'object' && input !== null) {
       const query = input.query || input.q || input.search || input.keyword || input.command || input.url || input.path
