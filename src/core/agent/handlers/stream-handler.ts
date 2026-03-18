@@ -1,4 +1,4 @@
-import type { StreamEvent, EventHandlers, TokenUsageStats } from '../types/agent'
+import type { StreamEvent, EventHandlers } from '../types/agent'
 
 export class StreamHandler {
   private eventHandlers: EventHandlers
@@ -81,9 +81,6 @@ export class StreamHandler {
       onToolUseStop: async (toolName: string, result: any) => {
         ws.send(JSON.stringify({ type: 'tool_use_stop', toolName, result }))
       },
-      onUsageUpdate: async (usage: TokenUsageStats) => {
-        ws.send(JSON.stringify({ type: 'usage_update', usage }))
-      },
       onError: async (error: string) => {
         ws.send(JSON.stringify({ type: 'error', error }))
       },
@@ -115,9 +112,6 @@ export class StreamHandler {
       },
       onToolUseStop: async (toolName: string, result: any) => {
         write('data: ' + JSON.stringify({ type: 'tool_use_stop', toolName, result }) + '\n\n')
-      },
-      onUsageUpdate: async (usage: TokenUsageStats) => {
-        write('data: ' + JSON.stringify({ type: 'usage_update', usage }) + '\n\n')
       },
       onError: async (error: string) => {
         write('data: ' + JSON.stringify({ type: 'error', error }) + '\n\n')

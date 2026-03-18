@@ -8,7 +8,7 @@ import { FeishuService, FeishuSendError } from './feishu-service.js';
 import { StreamingCardRenderer } from './streaming-card-renderer.js';
 import type { FeishuConnectionConfig, FeishuMessage, ThreadContext } from './types.js';
 import { getAgentEngine } from '../../core/agent-registry.js';
-import type { EventHandlers, TokenUsageStats } from '@/core/agent/types/agent.js';
+import type { EventHandlers } from '@/core/agent/types/agent.js';
 import { writeFileSync } from 'fs';
 import { execSync } from 'child_process';
 import { ClaudeEngine } from '@/core/agent/engine/claude-engine.js';
@@ -459,7 +459,6 @@ ${originalContent}
 
     const eventHandlers: EventHandlers = {
       onContentStart: async () => {
-        console.log('📋 [StreamCard] onContentStart triggered')
         // 立即创建初始卡片，让用户看到即时反馈
         await renderer.init()
       },
@@ -485,31 +484,23 @@ ${originalContent}
         await renderer.onContentDelta(textDelta);
       },
 
-      onUsageUpdate: async (usage: TokenUsageStats) => {
-        await renderer.onUsageUpdate(usage);
-      },
-
-      onContentStop: async (usage?: TokenUsageStats) => {
-        console.log(`📋 [StreamCard] onContentStop triggered, isFallback=${renderer.isFallback()}, usage=${JSON.stringify(usage)}`)
+      onContentStop: async () => {
         // 如果降级模式，通过普通消息发送完整内容
         if (renderer.isFallback()) {
           if (fullResponse) {
             await this.sendMessageWithAIFix(message.chatId, fullResponse, replyMessageId, message.threadId);
           }
         } else {
-          await renderer.onComplete(usage);
+          await renderer.onComplete();
 
           // [FIX] 如果卡片内容被截断，追加一条完整消息
           if (renderer.isContentTruncated() && fullResponse) {
-            console.log(`📋 [StreamCard] Content was truncated (${fullResponse.length} chars), sending full response as follow-up message`)
             await this.sendMessageWithAIFix(message.chatId, fullResponse, replyMessageId, message.threadId);
           }
         }
-        console.log(`✅ Streaming card response completed: ${fullResponse.length} chars`);
       },
 
       onError: async (error: string) => {
-        console.error('Streaming card response error:', error);
         if (renderer.isFallback()) {
           // 降级模式下通过普通消息发送错误
           await this.sendErrorResponse(message.chatId, new Error(error), replyMessageId, message.threadId);

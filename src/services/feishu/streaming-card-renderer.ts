@@ -35,7 +35,6 @@
  *   - Schema V2 不支持 note 标签
  */
 
-import type { TokenUsageStats } from '../../core/agent/types/agent.js'
 
 // ==================== Types ====================
 
@@ -64,7 +63,6 @@ interface CardState {
   /** 当前正在执行的动作描述（展示在状态栏下方） */
   currentAction: string
   contentText: string
-  usage?: TokenUsageStats
   errorMessage?: string
   /** 总步骤数（thinking + tool calls） */
   stepCount: number
@@ -236,7 +234,6 @@ export class StreamingCardRenderer {
         .reverse()
         .find(t => t.status === 'running')
       if (anyRunning) {
-        console.log(`⚠️ [StreamCard] onToolEnd: name mismatch (got "${toolName}"), marking "${anyRunning.name}" as success`)
         anyRunning.status = typeof output === 'string' && output.startsWith('Error') ? 'error' : 'success'
         anyRunning.endTime = Date.now()
         anyRunning.output = output
@@ -266,18 +263,13 @@ export class StreamingCardRenderer {
     await this.schedulePatch()
   }
 
-  /** 用量更新 */
-  async onUsageUpdate(usage: TokenUsageStats): Promise<void> {
-    this.state.usage = usage
-  }
 
   /** 完成 */
-  async onComplete(usage?: TokenUsageStats): Promise<void> {
+  async onComplete(): Promise<void> {
     // [FIX] 防御性兜底：将所有仍在 running 的工具强制标记为 success
     // 避免因上游 onToolEnd 未正确触发导致卡片永远显示 "执行中 (0/N)"
     for (const tool of this.state.toolCalls) {
       if (tool.status === 'running') {
-        console.log(`⚠️ [StreamCard] onComplete: force-completing tool "${tool.name}" (was still running)`)
         tool.status = 'success'
         tool.endTime = tool.endTime ?? Date.now()
       }
@@ -285,7 +277,6 @@ export class StreamingCardRenderer {
 
     this.state.phase = 'completed'
     this.state.currentAction = ''
-    if (usage) this.state.usage = usage
     await this.flushPatch()
   }
 
@@ -365,7 +356,7 @@ export class StreamingCardRenderer {
 
       elements.push({
         tag: 'collapsible_panel',
-        expanded: false,
+        ...(isFinished ? { expanded: false } : {}),
         background_color: 'grey',
         header: {
           title: {
@@ -469,9 +460,10 @@ export class StreamingCardRenderer {
         : (this.state.thinkingStartTime ? Date.now() - this.state.thinkingStartTime : 0)
 
       const isThinking = this.state.phase === 'thinking'
+      const isFinished = this.state.phase === 'completed' || this.state.phase === 'error'
       elements.push({
         tag: 'collapsible_panel',
-        expanded: false,
+        ...(isFinished ? { expanded: false } : {}),
         background_color: 'grey',
         header: {
           title: {
@@ -566,9 +558,10 @@ export class StreamingCardRenderer {
       })
     }
 
+    const isFinished = this.state.phase === 'completed' || this.state.phase === 'error'
     return {
       tag: 'collapsible_panel',
-      expanded: false,
+      ...(isFinished ? { expanded: false } : {}),
       background_color: tool.status === 'error' ? 'red' : 'grey',
       header: {
         title: {
@@ -592,17 +585,6 @@ export class StreamingCardRenderer {
     // 运行时间
     parts.push(`⏱ ${this.formatDuration(elapsed)}`)
 
-    // Token 统计
-    if (this.state.usage) {
-      const u = this.state.usage
-      if (u.inputTokens > 0 || u.outputTokens > 0) {
-        parts.push(`📥 ${this.formatTokenCount(u.inputTokens)}`)
-        parts.push(`📤 ${this.formatTokenCount(u.outputTokens)}`)
-      }
-      if (u.totalCostUsd > 0) {
-        parts.push(`💰 $${u.totalCostUsd.toFixed(4)}`)
-      }
-    }
 
     // 工具调用次数（仅统计实际工具调用，不含 thinking）
     const toolCallCount = this.state.toolCalls.length
@@ -678,13 +660,10 @@ export class StreamingCardRenderer {
       if (msgId) {
         this.messageId = msgId
         this.hasPendingPatch = false
-        console.log(`📋 流式卡片已创建: ${msgId}`)
       } else {
-        console.warn('⚠️ 创建卡片未返回 message_id，降级为普通消息')
         this.isFallbackMode = true
       }
     } catch (error) {
-      console.error('❌ 创建初始卡片失败，降级为普通消息:', error)
       this.isFallbackMode = true
     }
   }
@@ -706,7 +685,6 @@ export class StreamingCardRenderer {
 
       // [FIX] 基于 UTF-8 字节数动态缩减
       if (byteSize > StreamingCardRenderer.CARD_BYTE_LIMIT) {
-        console.warn(`⚠️ 卡片 JSON 超限 (${byteSize} bytes / ${StreamingCardRenderer.CARD_BYTE_LIMIT} limit)，动态缩减...`)
 
         // 第1步：缩减思考内容
         if (this.state.thinkingContent.length > 500) {
@@ -744,14 +722,12 @@ export class StreamingCardRenderer {
             ? originalContent.slice(0, lo) + '\n... (已截断)'
             : originalContent
           cardJson = JSON.stringify(this.buildCard())
-          console.log(`📋 正文缩减: ${originalContent.length} → ${lo} 字符, 卡片 ${this.getByteLength(cardJson)} bytes`)
         }
       }
 
       await this.client.patchInteractiveCard(this.messageId, cardJson)
       this.hasPendingPatch = false
     } catch (error) {
-      console.error('❌ Patch 卡片失败:', error)
     }
   }
 
@@ -768,11 +744,6 @@ export class StreamingCardRenderer {
     const minutes = Math.floor(seconds / 60)
     const secs = Math.round(seconds % 60)
     return `${minutes}m${secs}s`
-  }
-
-  private formatTokenCount(count: number): string {
-    if (count < 1000) return `${count}`
-    return `${(count / 1000).toFixed(1)}k`
   }
 
   private truncate(text: string, maxLen: number): string {
