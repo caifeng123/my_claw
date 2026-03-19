@@ -311,31 +311,39 @@ export class FeishuAgentBridge {
             message.quotedContent = quotedContent;
           }
 
-          // 引用消息中的图片：下载到 session 目录
+          // 引用消息中的图片：下载到 session 目录，路径直接拼入 quotedContent
           if (quoted.imageKeys && quoted.imageKeys.length > 0 && quoted.messageId) {
             const quotedReceivedDir = getReceivedFilesDir(sessionId);
+            const existingPaths = message.downloadedPaths || [];
             for (let i = 0; i < quoted.imageKeys.length; i++) {
               const imageKey = quoted.imageKeys[i] as string;
-              try {
-                const filePath = await this.feishuService.downloadFile(
-                  quoted.messageId,
-                  imageKey,
-                  `${Date.now()}-quoted-image-${i}`,
-                  'image',
-                  quotedReceivedDir,
-                );
-                // 将引用图片也加入 downloadedPaths，让 AI 能看到
-                if (!message.downloadedPaths) message.downloadedPaths = [];
-                message.downloadedPaths.push(filePath);
-                // 更新引用文本，标注图片路径
-                const relPath = relative(process.cwd(), filePath);
-                const imgRef = `[引用的图片已保存到本地: ${relPath.startsWith('..') ? filePath : relPath}]`;
-                message.quotedContent = message.quotedContent
-                  ? message.quotedContent + '\n' + imgRef
-                  : imgRef;
-              } catch (downloadError) {
-                console.error(`下载引用图片失败: ${imageKey}`, downloadError);
+              // 检查是否已下载过
+              const alreadyDownloaded = existingPaths.find(p => p.includes(imageKey));
+              let inlinePath: string;
+
+              if (alreadyDownloaded) {
+                const relPath = relative(process.cwd(), alreadyDownloaded);
+                inlinePath = relPath.startsWith('..') ? alreadyDownloaded : relPath;
+              } else {
+                try {
+                  const filePath = await this.feishuService.downloadFile(
+                    quoted.messageId,
+                    imageKey,
+                    `${Date.now()}-quoted-image-${i}`,
+                    'image',
+                    quotedReceivedDir,
+                  );
+                  const relPath = relative(process.cwd(), filePath);
+                  inlinePath = relPath.startsWith('..') ? filePath : relPath;
+                } catch (downloadError) {
+                  console.error(`下载引用文件失败: ${imageKey}`, downloadError);
+                  continue;
+                }
               }
+
+              message.quotedContent = message.quotedContent
+                ? message.quotedContent + '\n' + inlinePath
+                : inlinePath;
             }
           }
         } catch (error: any) {
@@ -393,12 +401,38 @@ export class FeishuAgentBridge {
         }
       }
 
-      // 将下载路径回写到 message 对象
+      // 将下载路径回写到 message 对象，并将占位符替换为实际本地路径
       if (downloadedPaths.length > 0) {
         message.downloadedPaths = downloadedPaths;
 
-        // 移除 content 中的文件占位符（路径已通过 downloadedPaths 传递）
-        message.content = message.content.replace(/\{\{FILE:[^}]+\}\}/g, '').trim();
+        // 构建占位符 → 实际路径的映射（按类型+下标匹配）
+        const toRelative = (p: string) => {
+          const rel = relative(process.cwd(), p);
+          return rel.startsWith('..') ? p : rel;
+        };
+        const imagePathMap = new Map<number, string>();
+        const filePathMap = new Map<number, string>();
+        for (const p of downloadedPaths) {
+          const imgMatch = p.match(/-(image)-(\d+)\b/);
+          const fileMatch = p.match(/-(file)-(\d+)\b/);
+          if (imgMatch?.[2]) imagePathMap.set(parseInt(imgMatch[2]), p);
+          else if (fileMatch?.[2]) filePathMap.set(parseInt(fileMatch[2]), p);
+        }
+
+        // 替换占位符为实际路径
+        message.content = message.content.replace(
+          /!\[image\]\(\{\{FILE:[^}]*-image-(\d+)\}\}\)/g,
+          (_match: string, idx: string) => {
+            const p = imagePathMap.get(parseInt(idx));
+            return p ? toRelative(p) : '';
+          }
+        ).replace(
+          /\{\{FILE:[^}]*-file-(\d+)\}\}/g,
+          (_match: string, idx: string) => {
+            const p = filePathMap.get(parseInt(idx));
+            return p ? toRelative(p) : '';
+          }
+        ).trim();
       }
 
       if (this.config.showTypingIndicator) {
@@ -547,58 +581,12 @@ ${originalContent}
    * 包含：飞书系统上下文 + 引用消息内容 + 用户消息 + 文件路径
    */
   private buildEnrichedContent(message: FeishuMessage): string {
-    const parts: string[] = [];
-
-    // 系统上下文
-    parts.push(`[系统上下文: 当前飞书会话 chatId=${message.chatId}]`);
-
-    // 引用消息上下文
+    // 引用消息作为前缀，与用户消息合并
     if (message.quotedContent) {
-      parts.push('');
-      parts.push('[引用消息内容]:');
-      parts.push('> ' + message.quotedContent.split('\n').join('\n> '));
-      parts.push('');
+      const quoted = '> ' + message.quotedContent.split('\n').join('\n> ');
+      return quoted + '\n\n' + message.content;
     }
-
-    // 下载的文件路径（图片 + 其他文件）
-    if (message.downloadedPaths && message.downloadedPaths.length > 0) {
-      const imagePaths: string[] = [];
-      const otherPaths: string[] = [];
-      for (const filePath of message.downloadedPaths) {
-        if (/\.(jpg|jpeg|png|gif|webp|bmp)$/i.test(filePath)) {
-          imagePaths.push(filePath);
-        } else {
-          otherPaths.push(filePath);
-        }
-      }
-      // 将绝对路径转为相对于项目根目录的路径，便于 Read 工具识别
-      const toRelative = (p: string) => {
-        const rel = relative(process.cwd(), p);
-        return rel.startsWith('..') ? p : rel;  // 如果不在项目目录下，保留绝对路径
-      };
-
-      if (imagePaths.length > 0) {
-        parts.push('');
-        parts.push('[用户发送的图片(请使用 read_image 工具读取以下图片路径来查看图片内容)]:');
-        for (const filePath of imagePaths) {
-          parts.push(`- ${toRelative(filePath)}`);
-        }
-        parts.push('');
-      }
-      if (otherPaths.length > 0) {
-        parts.push('');
-        parts.push('[用户发送的文件]:');
-        for (const filePath of otherPaths) {
-          parts.push(`- ${toRelative(filePath)}`);
-        }
-        parts.push('');
-      }
-    }
-
-    // 用户消息
-    parts.push(message.content);
-
-    return parts.join('\n');
+    return message.content;
   }
 
   /**
