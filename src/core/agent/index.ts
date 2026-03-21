@@ -16,6 +16,7 @@ import { CronScheduler } from '../cronjob/cron-scheduler.js'
 import { createCronjobTools } from './tools/cronjob-tools.js'
 import { calculatorTool, timeTool } from './tools/calculator.js'
 import { createTavilyTools } from './tools/tavily-tools.js'
+import { createLinkAnalyzeTools } from './tools/link-analyze.js'
 import { registerAgentEngine } from '../agent-registry.js'
 import type {
   SessionConfig,
@@ -87,6 +88,8 @@ export class AgentEngine {
     this.toolManager.registerTools(createMemoryTools(this.memoryDb))
     // CronJob 工具
     this.toolManager.registerTools(createCronjobTools(this.cronScheduler))
+    // Link Analyze 工具
+    this.toolManager.registerTools(createLinkAnalyzeTools())
   }
 
   /**

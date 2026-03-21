@@ -49,7 +49,7 @@ remote-computer-control/
 ### Step 1 — 环境初始化
 
 ```bash
-sh $SKILL_DIR/scripts/start.sh
+bash $SKILL_DIR/scripts/start.sh
 ```
 
 确保 Go 依赖就绪。仅首次执行或依赖变更时有实际开销。
