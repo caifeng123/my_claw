@@ -32,6 +32,7 @@
  *   init / thinking / tool_calling / generating → turquoise (进行中)
  *   completed                                   → green     (成功)
  *   error                                       → red       (错误)
+ *   aborted                                     → grey      (中断)
  *
  * 面板策略 (V3.9):
  *   运行中  → collapsible_panel (expanded=false)，header 显示 "Show N steps"
@@ -67,7 +68,7 @@ interface StepInfo {
 }
 
 /** 卡片渲染阶段 */
-type CardPhase = 'init' | 'thinking' | 'tool_calling' | 'generating' | 'completed' | 'error'
+type CardPhase = 'init' | 'thinking' | 'tool_calling' | 'generating' | 'completed' | 'error' | 'aborted'
 
 /** 卡片内部状态 */
 interface CardState {
@@ -125,6 +126,9 @@ export class StreamingCardRenderer {
    */
   private isFirstBuild = true
 
+  /** onAborted 后锁定卡片，拒绝后续 onError/onComplete 覆盖 */
+  private isLocked = false
+
   /** 当前正在累积的 thinking 文本 */
   private currentThinkingText = ''
   /** 当前 thinking 步骤的 ID */
@@ -166,7 +170,7 @@ export class StreamingCardRenderer {
 
   /** 思考内容增量 */
   async onThinking(thinkingText: string): Promise<void> {
-    if (this.isFallbackMode) return
+    if (this.isFallbackMode || this.isLocked) return
 
     if (this.state.phase === 'init' || this.state.phase === 'thinking') {
       this.state.phase = 'thinking'
@@ -203,7 +207,7 @@ export class StreamingCardRenderer {
 
   /** 思考结束 */
   async onThinkingStop(): Promise<void> {
-    if (this.isFallbackMode) return
+    if (this.isFallbackMode || this.isLocked) return
 
     if (this.currentThinkingStepId) {
       const step = this.state.steps.find(s => s.id === this.currentThinkingStepId)
@@ -221,7 +225,7 @@ export class StreamingCardRenderer {
 
   /** 工具调用开始 */
   async onToolStart(toolName: string, input?: any): Promise<void> {
-    if (this.isFallbackMode) return
+    if (this.isFallbackMode || this.isLocked) return
 
     // 如果有未结束的 thinking 步骤，先结束它
     if (this.currentThinkingStepId) {
@@ -254,7 +258,7 @@ export class StreamingCardRenderer {
 
   /** 工具调用结束 */
   async onToolEnd(toolName: string, output: any): Promise<void> {
-    if (this.isFallbackMode) return
+    if (this.isFallbackMode || this.isLocked) return
 
     console.log('[card-renderer] ✅ onToolEnd:', toolName)
     // V3.7: onToolEnd 的 toolName 匹配逻辑需兼容新的 displayName
@@ -279,7 +283,7 @@ export class StreamingCardRenderer {
 
   /** 回答内容增量 */
   async onContentDelta(delta: string): Promise<void> {
-    if (this.isFallbackMode) return
+    if (this.isFallbackMode || this.isLocked) return
 
     if (this.state.phase !== 'generating') {
       this.state.phase = 'generating'
@@ -292,6 +296,7 @@ export class StreamingCardRenderer {
 
   /** 完成 */
   async onComplete(): Promise<void> {
+    if (this.isLocked) return
     for (const step of this.state.steps) {
       if (step.status === 'running') {
         step.status = 'success'
@@ -305,6 +310,7 @@ export class StreamingCardRenderer {
 
   /** 错误 */
   async onError(errorMessage: string): Promise<void> {
+    if (this.isLocked) return
     for (const step of this.state.steps) {
       if (step.status === 'running') {
         step.status = 'error'
@@ -315,6 +321,20 @@ export class StreamingCardRenderer {
     this.state.errorMessage = errorMessage
     this.state.liveThinkingText = ''  // 出错时清除预览
     await this.flushPatch()
+  }
+
+  /** 用户主动中断 */
+  async onAborted(): Promise<void> {
+    for (const step of this.state.steps) {
+      if (step.status === 'running') {
+        step.status = 'error'
+      }
+    }
+
+    this.state.phase = 'aborted'
+    this.state.liveThinkingText = ''
+    await this.flushPatch()
+    this.isLocked = true
   }
 
   /** 获取当前是否降级模式 */
@@ -336,7 +356,7 @@ export class StreamingCardRenderer {
 
   private buildCard(): object {
     const elements: any[] = []
-    const isFinished = this.state.phase === 'completed' || this.state.phase === 'error'
+    const isFinished = this.state.phase === 'completed' || this.state.phase === 'error' || this.state.phase === 'aborted'
 
     // ====== 1. 步骤面板 ======
     if (this.state.steps.length > 0) {
@@ -402,6 +422,7 @@ export class StreamingCardRenderer {
    *   init / thinking / tool_calling / generating → turquoise (进行中)
    *   completed                                   → green     (成功)
    *   error                                       → red       (错误)
+ *   aborted                                     → grey      (中断)
    */
   private buildCardHeader(): object {
     const phaseConfig: Record<CardPhase, { template: string; icon: string; text: string }> = {
@@ -411,13 +432,14 @@ export class StreamingCardRenderer {
       generating:   { template: 'turquoise', icon: '✍️', text: '生成中...' },
       completed:    { template: 'green',     icon: '✅', text: '已完成' },
       error:        { template: 'red',       icon: '❌', text: '失败' },
+      aborted:      { template: 'grey',      icon: '⏸️', text: '用户已中断' },
     }
 
     const { template, icon, text } = phaseConfig[this.state.phase]
 
     // 已完成/失败时，耗时直接拼在大标题后面
     let titleContent = `${icon} ${text}`
-    if (this.state.phase === 'completed' || this.state.phase === 'error') {
+    if (this.state.phase === 'completed' || this.state.phase === 'error' || this.state.phase === 'aborted') {
       const elapsed = this.formatDuration(Date.now() - this.state.startTime)
       titleContent = `${icon} ${text} · ⏱ ${elapsed}`
     }

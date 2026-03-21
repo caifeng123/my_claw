@@ -51,6 +51,7 @@ export class FeishuAgentBridge {
   private threadContexts = new Map<string, ThreadContext>();
   private isConnected = false;
   private processingChats = new Set<string>();
+  private activeRenderers = new Map<string, StreamingCardRenderer>();
 
   constructor(config: FeishuAgentBridgeConfig) {
     this.claudeEngine = new ClaudeEngine()
@@ -218,19 +219,48 @@ export class FeishuAgentBridge {
 
   /**
    * 处理 /stop 指令 - 中断当前 session 正在进行的请求
+   * - 精确匹配 sessionId，失败后按 chatId 前缀遍历所有关联 session
+   * - 中断成功后将流式卡片更新为灰色「用户已中断」状态
    */
   private async handleStopCommand(message: FeishuMessage): Promise<void> {
-    console.log('⏹️ 收到 /stop 指令，中断当前会话');
-
-    const sessionId = this.getOrCreateSessionId(message.chatId, message.threadId);
     const agentEngine = getAgentEngine();
+    let aborted = false;
+    let matchedProcessingKey: string | null = null;
 
-    const aborted = agentEngine.abortSession(sessionId);
+    // 1. 精确匹配
+    const sessionId = this.getOrCreateSessionId(message.chatId, message.threadId);
+    aborted = agentEngine.abortSession(sessionId);
+    if (aborted) {
+      matchedProcessingKey = message.threadId ? `${message.chatId}:${message.threadId}` : message.chatId;
+    }
+
+    // 2. 精确匹配失败，按 chatId 前缀遍历
+    if (!aborted) {
+      for (const [key, sid] of this.chatToSessionMap.entries()) {
+        if (key === sessionId) continue;
+        if (key.startsWith(message.chatId)) {
+          if (agentEngine.abortSession(sid)) {
+            aborted = true;
+            matchedProcessingKey = key;
+            break;
+          }
+        }
+      }
+    }
+
+    // 3. 更新流式卡片为「用户已中断」状态
+    if (aborted && matchedProcessingKey) {
+      const renderer = this.activeRenderers.get(matchedProcessingKey);
+      if (renderer) {
+        await renderer.onAborted();
+        this.activeRenderers.delete(matchedProcessingKey);
+      }
+    }
 
     if (aborted) {
       await this.feishuService.sendMessage(
         message.chatId,
-        '⏹️ 已中断当前对话，你可以继续发送新消息。',
+        '⏸️ 已中断当前对话，你可以继续发送新消息。',
         message.messageId,
         message.threadId
       );
@@ -608,6 +638,10 @@ ${originalContent}
       message.threadId,
     );
 
+    // 注册活跃 renderer，供 /stop 时调用 onAborted
+    const processingKey = message.threadId ? `${message.chatId}:${message.threadId}` : message.chatId;
+    this.activeRenderers.set(processingKey, renderer);
+
     const eventHandlers: EventHandlers = {
       onContentStart: async () => {
         await renderer.init()
@@ -646,6 +680,7 @@ ${originalContent}
             await this.sendMessageWithAIFix(message.chatId, fullResponse, replyMessageId, message.threadId);
           }
         }
+        this.activeRenderers.delete(processingKey);
       },
 
       onError: async (error: string) => {
@@ -654,6 +689,7 @@ ${originalContent}
         } else {
           await renderer.onError(error);
         }
+        this.activeRenderers.delete(processingKey);
       },
     };
 
