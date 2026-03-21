@@ -299,17 +299,20 @@ export class FeishuAgentBridge {
     }
 
     const trimmedContent = message.content.trim();
-    if (trimmedContent === '/restart') {
+    // 去掉所有 @xxx 提及后提取指令（群聊中可能有多个 @）
+    const command = trimmedContent.replace(/@\w+\S*/g, '').trim();
+
+    if (command === '/restart') {
       await this.handleRestartCommand(message);
       return;
     }
 
-    if (trimmedContent === '/new') {
+    if (command === '/new') {
       await this.handleNewCommand(message);
       return;
     }
 
-    if (trimmedContent === '/stop') {
+    if (command === '/stop') {
       await this.handleStopCommand(message);
       return;
     }
@@ -637,6 +640,11 @@ ${originalContent}
       replyMessageId,
       message.threadId,
     );
+
+    // 设置完成时 @ 提问者
+    if (message.senderId) {
+      renderer.setMentionUser(message.senderId);
+    }
 
     // 注册活跃 renderer，供 /stop 时调用 onAborted
     const processingKey = message.threadId ? `${message.chatId}:${message.threadId}` : message.chatId;

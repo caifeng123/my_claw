@@ -129,6 +129,9 @@ export class StreamingCardRenderer {
   /** onAborted 后锁定卡片，拒绝后续 onError/onComplete 覆盖 */
   private isLocked = false
 
+  /** 完成时 @ 的用户 open_id */
+  private mentionUserId: string | null = null
+
   /** 当前正在累积的 thinking 文本 */
   private currentThinkingText = ''
   /** 当前 thinking 步骤的 ID */
@@ -161,6 +164,11 @@ export class StreamingCardRenderer {
   }
 
   // ==================== Event Methods ====================
+
+  /** 设置完成时要 @ 的用户 */
+  setMentionUser(openId: string): void {
+    this.mentionUserId = openId
+  }
 
   /** 初始化：立即创建初始卡片 */
   async init(): Promise<void> {
@@ -372,11 +380,15 @@ export class StreamingCardRenderer {
       })
     }
 
-    // ====== 3. 回答内容 ======
+    // ====== 3. 回答内容（完成时在开头 @ 提问者）======
     if (this.state.contentText) {
+      let content = this.state.contentText
+      if (isFinished && this.mentionUserId) {
+        content = `<at id=${this.mentionUserId}></at> ` + content
+      }
       elements.push({
         tag: 'markdown',
-        content: this.state.contentText,
+        content,
         text_size: 'normal',
       })
     }
