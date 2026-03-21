@@ -266,7 +266,6 @@ export class AgentEngine {
     if (controller) {
       controller.abort()
       this.abortControllers.delete(sessionId)
-      console.log(`⏹️ 已中断会话: ${sessionId}`)
       return true
     }
     return false
