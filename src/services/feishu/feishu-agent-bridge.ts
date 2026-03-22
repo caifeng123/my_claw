@@ -190,15 +190,36 @@ export class FeishuAgentBridge {
     }
   }
 
-  /**
-   * 处理 /new 指令 - 清空当前 session，开启新对话
-   */
-  private async handleNewCommand(message: FeishuMessage): Promise<void> {
+/**
+ * 处理 /new 指令 - 清空当前 session，开启新对话
+ */
+private async handleNewCommand(message: FeishuMessage): Promise<void> {
     console.log('🆕 收到 /new 指令，重置当前会话');
 
     const sessionId = this.getOrCreateSessionId(message.chatId, message.threadId);
     const agentEngine = getAgentEngine();
 
+    const aborted = agentEngine.abortSession(sessionId);
+    if (aborted) {
+      console.log(`⏹️ 已中断会话 ${sessionId} 的进行中请求`);
+    }
+
+    const processingKey = message.threadId
+      ? `${message.chatId}:${message.threadId}`
+      : message.chatId;
+    const renderer = this.activeRenderers.get(processingKey);
+    if (renderer) {
+      await renderer.onAborted();
+      this.activeRenderers.delete(processingKey);
+    }
+
+    // 确保旧请求的 finally 块执行完毕，不会再写入 JSONL
+    if (this.processingChats.has(processingKey)) {
+      console.log(`⏳ 等待 ${processingKey} 的旧请求处理完毕...`);
+      await this.waitForProcessingComplete(processingKey);
+    }
+
+    // === 现在安全地清空上下文 ===
     agentEngine.getConversationStore().deleteSession(sessionId);
     agentEngine.deleteSession(sessionId);
 
@@ -215,7 +236,7 @@ export class FeishuAgentBridge {
       message.messageId,
       message.threadId
     );
-  }
+}
 
   /**
    * 处理 /stop 指令 - 中断当前 session 正在进行的请求
