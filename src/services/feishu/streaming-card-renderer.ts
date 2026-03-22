@@ -248,7 +248,6 @@ export class StreamingCardRenderer {
     }
 
     this.state.phase = 'tool_calling'
-    console.log(`[card-renderer] onToolStart: tool=${toolName}, parentToolUseId=${parentToolUseId ?? "null"}, toolUseId=${toolUseId ?? "null"}`)
 
     const { category, displayName } = this.resolveToolInfo(toolName, input)
 
@@ -292,7 +291,6 @@ export class StreamingCardRenderer {
   async onToolEnd(toolName: string, output: any, parentToolUseId?: string | null): Promise<void> {
     if (this.isFallbackMode || this.isLocked) return
 
-    console.log('[card-renderer] ✅ onToolEnd:', toolName, parentToolUseId ? `(sub of ${parentToolUseId})` : '')
     const { displayName } = this.resolveToolInfo(toolName)
     const resultStatus = typeof output === 'string' && output.startsWith('Error') ? 'error' : 'success'
 

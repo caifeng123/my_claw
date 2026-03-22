@@ -1,12 +1,12 @@
 /**
- * FeishuAgentBridge V4.3
+ * FeishuAgentBridge V4.4
  * 新增:
- *   - 引用消息读取（parent_id → getQuotedMessageContent → enrichedContent）
- *   - 文件下载迁移到 session 目录（data/sessions/{sessionId}/files/received/）
- *   - 文件发送能力（uploadAndSendFile）
- *   - 流式卡片支持 (Create + Patch 模式, 继承 V4.2)
+ *   - 图片分析缓存：vision-analyzer Sub-Agent 分析完成后自动将结果写入 images.json
+ *   - JSONL 中只存图片路径 ![image](path)，分析结果存在独立可覆盖的缓存中
+ *   - context-builder 加载历史时从缓存替换图片引用，避免重复调用 Sub-Agent
+ *   - 首次分析和重新分析均通过 onToolUseStart/Stop 回调自动处理
  *
- * 基于 V4.2：去掉手动拼历史逻辑，由 AgentEngine 内部管理上下文
+ * 基于 V4.3：引用消息读取 + 文件下载迁移到 session 目录 + 流式卡片支持
  */
 
 import { FeishuService, FeishuSendError } from './feishu-service.js';
@@ -19,6 +19,7 @@ import { execSync } from 'child_process';
 import { ClaudeEngine } from '@/core/agent/engine/claude-engine.js';
 import { getReceivedFilesDir } from '../../utils/paths.js';
 import { relative } from 'path';
+import type { ImageAnalysisEntry } from '../../core/memory/conversation-store.js';
 
 // 状态文件路径
 const STATE_FILE = '.restart-state.json';
@@ -308,9 +309,77 @@ private async handleNewCommand(message: FeishuMessage): Promise<void> {
     };
   }
 
+  // ==================== 图片分析缓存 ====================
+
+  /**
+   * 追踪 vision-analyzer Sub-Agent 调用的图片路径
+   * key: toolUseId, value: 从 Agent tool input.prompt 中提取的图片路径
+   * 在 onToolUseStart 时记录，在 onToolUseStop 时查找并写入缓存
+   */
+  private pendingVisionAnalysis = new Map<string, string>()
+
+  /** 清理超过 5 分钟未完成的 pending 条目，防止内存泄漏 */
+  private cleanStalePendingAnalysis(): void {
+    // Map 只存 toolUseId → path，无时间戳，用 size 兜底
+    if (this.pendingVisionAnalysis.size > 50) {
+      // 超过 50 个未完成的分析不正常，全部清理
+      console.warn(`⚠️ pendingVisionAnalysis 异常堆积 (${this.pendingVisionAnalysis.size})，已清理`)
+      this.pendingVisionAnalysis.clear()
+    }
+  }
+
+  /**
+   * 从 Agent tool 的 input 中提取 vision-analyzer 的图片路径
+   */
+  private extractImagePathFromAgentInput(input: any): string | null {
+    if (!input) return null
+    // Agent tool 的 input 结构: { subagent_type: "vision-analyzer", prompt: "...image at <path>..." }
+    const subagentType = input.subagent_type ?? input.type ?? ''
+    if (!String(subagentType).includes('vision')) return null
+
+    const prompt = String(input.prompt ?? '')
+    const pathMatch = prompt.match(/(?:image|图片)\s+(?:at\s+)?([^\s,."']+\.(png|jpe?g|gif|webp|bmp|svg|ico|tiff?|avif))/i)
+    return pathMatch?.[1] ?? null
+  }
+
+  /**
+   * 构建缓存写入逻辑（供 onToolUseStop 调用）
+   * 检查 toolUseId 是否有对应的 pending vision analysis，有则写入缓存
+   */
+  private tryWriteImageCache(
+    sessionId: string,
+    toolUseId: string | undefined,
+    result: any,
+  ): void {
+    if (!toolUseId) return
+
+    const imagePath = this.pendingVisionAnalysis.get(toolUseId)
+    if (!imagePath) return
+
+    // 清理 pending 记录
+    this.pendingVisionAnalysis.delete(toolUseId)
+
+    const resultStr = typeof result === 'string' ? result : JSON.stringify(result)
+    // 基本校验：结果应包含分析内容
+    if (resultStr.length < 20) return
+
+    const entry: ImageAnalysisEntry = {
+      result: resultStr,
+      analyzedAt: Date.now(),
+      context: 'auto-cached from vision-analyzer',
+    }
+
+    try {
+      getAgentEngine().getConversationStore().updateImageCacheEntry(sessionId, imagePath, entry)
+      console.log(`🖼️ 图片分析缓存已写入: ${imagePath} (${resultStr.length} 字符)`)
+    } catch (error) {
+      console.error(`❌ 写入图片分析缓存失败: ${imagePath}`, error)
+    }
+  }
+
   /**
    * 处理飞书消息
-   * V4.3: 新增引用消息读取 + 文件下载到 session 目录
+   * V4.4: 新增图片分析缓存写入
    */
   private async handleFeishuMessage(message: FeishuMessage): Promise<void> {
     console.log(`📨 Received Feishu message: ${message.senderName} -> ${message.content.substring(0, 50)}...`);
@@ -644,7 +713,7 @@ ${originalContent}
   }
 
   /**
-   * 处理流式卡片回复 (V4.2 -> V4.3: 使用 buildEnrichedContent)
+   * 处理流式卡片回复 (V4.4: 使用 buildEnrichedContent + 图片缓存覆盖)
    */
   private async handleStreamingCardResponse(sessionId: string, message: FeishuMessage): Promise<void> {
     let fullResponse = '';
@@ -686,10 +755,23 @@ ${originalContent}
 
       onToolUseStart: async (toolName: string, input?: any, parentToolUseId?: string | null, toolUseId?: string) => {
         await renderer.onToolStart(toolName, input, parentToolUseId, toolUseId);
+
+        // V4.4: 追踪 vision-analyzer 调用，记录图片路径
+        if (toolName === 'Agent' && toolUseId) {
+          const imgPath = this.extractImagePathFromAgentInput(input);
+          if (imgPath) {
+            this.cleanStalePendingAnalysis();
+            this.pendingVisionAnalysis.set(toolUseId, imgPath);
+          }
+        }
       },
 
-      onToolUseStop: async (toolName: string, result: any, parentToolUseId?: string | null) => {
+      onToolUseStop: async (toolName: string, result: any, parentToolUseId?: string | null, toolUseId?: string) => {
         await renderer.onToolEnd(toolName, result, parentToolUseId);
+
+        // V4.4: vision-analyzer 完成 → 自动写入/覆盖图片分析缓存
+        // toolUseId 即 onToolUseStart 中存入 pendingVisionAnalysis 的 key
+        this.tryWriteImageCache(sessionId, toolUseId, result);
       },
 
       onContentDelta: async (textDelta: string) => {
@@ -728,7 +810,7 @@ ${originalContent}
   }
 
   /**
-   * 处理流式回复 (V4.3: 使用 buildEnrichedContent)
+   * 处理流式回复 (V4.4: 使用 buildEnrichedContent + 图片缓存覆盖)
    */
   private async handleStreamingResponse(sessionId: string, message: FeishuMessage): Promise<void> {
     let fullResponse = '';
@@ -738,6 +820,20 @@ ${originalContent}
     const eventHandlers: EventHandlers = {
       onContentDelta: async (textDelta: string) => {
         fullResponse += textDelta;
+      },
+      onToolUseStart: async (toolName: string, input?: any, _parentToolUseId?: string | null, toolUseId?: string) => {
+        // V4.4: 追踪 vision-analyzer 调用
+        if (toolName === 'Agent' && toolUseId) {
+          const imgPath = this.extractImagePathFromAgentInput(input);
+          if (imgPath) {
+            this.cleanStalePendingAnalysis();
+            this.pendingVisionAnalysis.set(toolUseId, imgPath);
+          }
+        }
+      },
+      onToolUseStop: async (toolName: string, result: any, parentToolUseId?: string | null, toolUseId?: string) => {
+        // V4.4: vision-analyzer 完成 → 自动写入/覆盖图片分析缓存
+        this.tryWriteImageCache(sessionId, toolUseId, result);
       },
       onContentStop: async () => {
         if (fullResponse) {
@@ -757,7 +853,7 @@ ${originalContent}
   }
 
   /**
-   * 处理常规回复 (V4.3: 使用 buildEnrichedContent)
+   * 处理常规回复 (V4.4: 使用 buildEnrichedContent)
    */
   private async handleRegularResponse(sessionId: string, message: FeishuMessage): Promise<void> {
     const enrichedContent = this.buildEnrichedContent(message);

@@ -70,7 +70,8 @@ export interface EventHandlers {
   /**
    * 工具调用结束
    * @param parentToolUseId - 同上
+   * @param toolUseId - 此 tool_use 块的 ID（与 onToolUseStart 中的 toolUseId 一致）
    */
-  onToolUseStop?: (toolName: string, result: any, parentToolUseId?: string | null) => Promise<void>
+  onToolUseStop?: (toolName: string, result: any, parentToolUseId?: string | null, toolUseId?: string) => Promise<void>
   onError?: (error: string) => Promise<void>
 }

@@ -13,6 +13,11 @@
  *    否则会产生自拦截死锁。通过 HookInput.agent_id 区分：
  *    - agent_id 存在 → Sub-Agent 内部调用 → 放行
  *    - agent_id 不存在 → 主 Agent 调用 → 拦截
+ *
+ * V4.2: 新增图片分析缓存策略
+ *   - 首次分析后缓存到 images.json（可覆盖）
+ *   - context-builder 加载历史时将 ![image](path) 替换为 [图片: path] + [此前分析结果]
+ *   - Claude 默认直接使用缓存结果，仅在判断不够用时主动重新分析
  */
 
 import type {
@@ -61,12 +66,10 @@ const VISION_AGENT_DEFINITION = {
     'Reads and analyzes images in isolated context, returns concise text summaries. ' +
     'Use this whenever a task involves viewing, understanding, or extracting info from images.',
 
-  prompt: `You are a vision analyst serving a coding assistant.
-
-When given a file path or image description:
-1. Use the Read tool to load the image file
-2. Analyze its visual content thoroughly
-3. Return a STRUCTURED TEXT SUMMARY
+  prompt: `You are a vision analyst. Given an image file path:
+1. Use the Read tool to load the image
+2. Analyze its visual content
+3. Return a structured summary
 
 ## Output Format
 
@@ -83,6 +86,7 @@ Actionable Details: (what a developer needs to debug/implement/fix/understand)
 - For code screenshots: OCR the code content as accurately as possible
 - For charts/graphs: extract data trends, key values, axis labels
 - Focus on INFORMATION content, not visual aesthetics or colors
+- If Read fails, use Bash to check: file <path>
 - If the image is unreadable or corrupted, say so clearly`,
 
   tools: ['Read', 'Bash', 'Glob'] as string[],
@@ -101,16 +105,28 @@ const IMAGE_HANDLING_RULES = `
 
 You MUST follow these rules for ANY image file (${[...IMAGE_EXTENSIONS].join(', ')}):
 
-1. **NEVER** use the Read tool to read image files directly
-2. **ALWAYS** delegate image analysis to the "vision-analyzer" subagent via the Agent tool
-3. When you encounter an image path in user messages or file listings, invoke:
+1. **NEVER** read image files directly (Read tool is BLOCKED for images)
+2. **ALWAYS** use the vision-analyzer subagent:
    Agent(subagent_type: "vision-analyzer", prompt: "Analyze the image at <file_path>")
-4. Use ONLY the text summary returned by vision-analyzer for your reasoning
-5. The Read tool is BLOCKED for image files and will return an error if you try
+3. Use ONLY the text summary returned by vision-analyzer for your reasoning
+4. **Multiple images → analyze ALL at once**: When you need to analyze 2+ images, call Agent for each image in the SAME turn. Do NOT wait for one to finish before starting the next. Example:
+   Agent(subagent_type: "vision-analyzer", prompt: "Analyze the image at /path/img1.png")
+   Agent(subagent_type: "vision-analyzer", prompt: "Analyze the image at /path/img2.png")
 
-**WHY**: Reading images via Read tool dumps base64 data into your context window,
-consuming 10,000+ tokens per image. The vision-analyzer processes images in an
-isolated context (haiku model) and returns ~300 token summaries, saving 97% context.
+## Cached Image Analysis
+
+When conversation history contains "[图片: <path>]" followed by "[此前分析结果]: ...",
+the image has already been analyzed. Rules:
+
+**Use cache directly** (default): The cached result is sufficient for most follow-up questions.
+
+**Re-analyze** only when:
+- User explicitly says the previous analysis is wrong or asks to "look again"
+- User asks about a completely different aspect not covered by the cached result
+- The cached result is clearly incomplete or corrupted
+
+To re-analyze, call vision-analyzer with the specific focus:
+Agent(subagent_type: "vision-analyzer", prompt: "Re-analyze the image at <path>. Focus on: <specific question>")
 `
 
 // ============================================================

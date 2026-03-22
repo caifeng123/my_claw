@@ -1,9 +1,9 @@
 /**
  * ContextBuilder - 构建上下文窗口（截断/压缩/注入）
- * V4.1 - 保鲜区 + 压缩区模型，增量分段压缩
+ * V4.2 - 保鲜区 + 压缩区模型，增量分段压缩，图片分析缓存替换
  */
 
-import { ConversationStore, type ConversationEntry, type CompressedSummary } from '../../memory/conversation-store.js'
+import { ConversationStore, type ConversationEntry, type CompressedSummary, type ImageAnalysisCache } from '../../memory/conversation-store.js'
 import { SystemPromptBuilder } from './system-prompt-builder.js'
 import { MEMORY_CONFIG, estimateTokens, COMPRESS_SYSTEM_PROMPT } from '../../memory/config.js'
 
@@ -35,6 +35,32 @@ export type CompressQueryFn = (params: {
   prompt: string
   maxTokens: number
 }) => Promise<string>
+
+// ==================== 图片路径匹配 ====================
+
+/** 匹配 Markdown 图片语法中的图片文件路径 */
+const IMAGE_MD_PATTERN = /!\[.*?\]\(([^)]+\.(png|jpe?g|gif|webp|bmp|svg|ico|tiff?|avif))\)/gi
+
+/**
+ * 将消息内容中的图片引用替换为缓存的分析结果
+ *
+ * - 缓存命中: ![image](path) → [图片: path]\n[此前分析结果]: analysis
+ *   Claude 看到纯文本，不会触发 vision-guard，默认直接使用
+ *   但路径保留在 [图片: path] 中，Claude 需要时可以主动调 vision-analyzer 重新分析
+ *
+ * - 缓存未命中: 保留原始 ![image](path) 语法
+ *   vision-guard 正常拦截 → 引导调 Sub-Agent 分析
+ */
+function resolveImageReferences(content: string, imageCache: ImageAnalysisCache): string {
+  return content.replace(IMAGE_MD_PATTERN, (match, filePath: string) => {
+    const entry = imageCache[filePath]
+    if (entry) {
+      return `[图片: ${filePath}]\n[此前分析结果]: ${entry.result}`
+    }
+    // 缓存未命中，保留原始语法让 vision-guard 处理
+    return match
+  })
+}
 
 // ==================== ContextBuilder ====================
 
@@ -68,6 +94,9 @@ export class ContextBuilder {
     const allHistory = this.conversationStore.loadSync(sessionId)
     const totalHistoryTokens = allHistory.reduce((sum, e) => sum + e.token_est, 0)
 
+    // 1.5 加载图片分析缓存（用于替换历史消息中的图片引用）
+    const imageCache = this.conversationStore.loadImageCache(sessionId)
+
     // 2. 构建 system prompt（纯静态层）
     const systemPromptResult = this.systemPromptBuilder.build()
     const systemTokens = estimateTokens(systemPromptResult.text)
@@ -85,20 +114,22 @@ export class ContextBuilder {
     if (!needCompress) {
       // 全量原文注入（从后往前填满预算）
       const recentMessages = this.selectRecent(allHistory, availableBudget)
-      const recentTokens = recentMessages.reduce(
+      // 替换图片引用为缓存分析结果
+      const resolvedMessages = this.resolveMessagesImageRefs(recentMessages, imageCache)
+      const recentTokens = resolvedMessages.reduce(
         (sum, m) => sum + estimateTokens(m.content), 0
       )
 
       return {
         systemPrompt: systemPromptResult.text,
-        messages: recentMessages,
+        messages: resolvedMessages,
         stats: {
           systemPromptTokens: systemTokens,
           summaryTokens: 0,
           recentTokens,
           totalTokens: systemTokens + recentTokens + userMsgTokens,
           totalRounds: Math.ceil(allHistory.filter(e => e.role === 'user').length),
-          recentRounds: Math.ceil(recentMessages.filter(m => m.role === 'user').length),
+          recentRounds: Math.ceil(resolvedMessages.filter(m => m.role === 'user').length),
           compressedRounds: 0,
           compressionTriggered: false,
         },
@@ -122,7 +153,10 @@ export class ContextBuilder {
       console.warn('⚠️ 压缩摘要生成失败，回退到无摘要模式:', error)
     }
 
-    // 8. 组装消息列表
+    // 8. 替换图片引用为缓存分析结果
+    const resolvedMessages = this.resolveMessagesImageRefs(recentMessages, imageCache)
+
+    // 9. 组装消息列表
     const messages: MessageParam[] = []
     let summaryTokens = 0
     if (summary) {
@@ -139,9 +173,9 @@ export class ContextBuilder {
         { role: 'assistant', content: '好的，我已了解之前的对话内容，请继续。' },
       )
     }
-    messages.push(...recentMessages)
+    messages.push(...resolvedMessages)
 
-    const recentTokens = recentMessages.reduce(
+    const recentTokens = resolvedMessages.reduce(
       (sum, m) => sum + estimateTokens(m.content), 0
     )
     const totalRounds = Math.ceil(allHistory.filter(e => e.role === 'user').length)
@@ -155,11 +189,27 @@ export class ContextBuilder {
         recentTokens,
         totalTokens: systemTokens + summaryTokens + recentTokens + userMsgTokens,
         totalRounds,
-        recentRounds: Math.ceil(recentMessages.filter(m => m.role === 'user').length),
-        compressedRounds: totalRounds - Math.ceil(recentMessages.filter(m => m.role === 'user').length),
+        recentRounds: Math.ceil(resolvedMessages.filter(m => m.role === 'user').length),
+        compressedRounds: totalRounds - Math.ceil(resolvedMessages.filter(m => m.role === 'user').length),
         compressionTriggered: true,
       },
     }
+  }
+
+  /**
+   * 对消息列表中的图片引用进行替换
+   */
+  private resolveMessagesImageRefs(
+    messages: MessageParam[],
+    imageCache: ImageAnalysisCache,
+  ): MessageParam[] {
+    // 无缓存数据时直接返回，避免无意义的正则扫描
+    if (Object.keys(imageCache).length === 0) return messages
+
+    return messages.map(msg => ({
+      ...msg,
+      content: resolveImageReferences(msg.content, imageCache),
+    }))
   }
 
   /**

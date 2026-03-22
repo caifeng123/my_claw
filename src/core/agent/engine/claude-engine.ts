@@ -213,20 +213,6 @@ export class ClaudeEngine {
 
       // 处理AI响应流（abortController.abort() 会中断此循环）
       for await (const message of response) {
-        // [DEBUG] 打印所有消息类型，定位 Sub-Agent 消息结构
-        const debugMsg = message as any
-        const debugInfo: any = { type: message.type, subtype: debugMsg.subtype }
-        if (debugMsg.parent_tool_use_id) debugInfo.parent_tool_use_id = debugMsg.parent_tool_use_id
-        if (debugMsg.task_id) debugInfo.task_id = debugMsg.task_id
-        if (debugMsg.task_type) debugInfo.task_type = debugMsg.task_type
-        if (debugMsg.status) debugInfo.status = debugMsg.status
-        if (debugMsg.last_tool_name) debugInfo.last_tool_name = debugMsg.last_tool_name
-        if (debugMsg.description) debugInfo.description = String(debugMsg.description).slice(0, 100)
-        if (message.type === "assistant" || message.type === "user") {
-          const mc = debugMsg.message?.content
-          if (Array.isArray(mc)) debugInfo.content_types = mc.map((b: any) => b.type + (b.name ? ":" + b.name : ""))
-        }
-        console.log(`[engine][DEBUG] msg:`, JSON.stringify(debugInfo))
         if (message.type === 'result') {
           // ====== result 消息：最终结果 ======
           const resultMsg = message as any
@@ -273,7 +259,6 @@ export class ClaudeEngine {
           // 但 tool_use 块需要传递给 renderer 做嵌套展示
           const msg = message?.message
           const assistantContent = msg?.content
-          console.log(`[engine] assistant msg: parent_tool_use_id=${parentToolUseId}, content_types=${Array.isArray(assistantContent) ? assistantContent.map((b: any) => b.type).join(",") : "N/A"}`)
 
           if (assistantContent && Array.isArray(assistantContent)) {
             // [FIX] 跟踪本轮 assistant 消息是否包含 thinking 块
@@ -361,7 +346,7 @@ export class ClaudeEngine {
                     : '(tool executed, no result captured)'
                 }
 
-                await eventHandlers?.onToolUseStop?.(toolName, resultContent, effectiveParent)
+                await eventHandlers?.onToolUseStop?.(toolName, resultContent, effectiveParent, toolUseId)
               }
             }
           } else {
@@ -402,7 +387,7 @@ export class ClaudeEngine {
 
               // [SUBAGENT] fallback 路径的 parentToolUseId 传递
               const effectiveParent = toolUseIdToParent.get(parentToolUseId) ?? userParentToolUseId
-              await eventHandlers?.onToolUseStop?.(toolName, resultContent, effectiveParent)
+              await eventHandlers?.onToolUseStop?.(toolName, resultContent, effectiveParent, parentToolUseId)
             }
           }
         }

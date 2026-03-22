@@ -1,6 +1,6 @@
 /**
  * ConversationStore - JSONL 对话历史持久化
- * V4.1 - 支持 rotate、按 token 预算加载、摘要缓存
+ * V4.2 - 支持 rotate、按 token 预算加载、摘要缓存、图片分析缓存
  */
 
 import * as fs from 'node:fs'
@@ -35,6 +35,22 @@ export interface LoadByBudgetResult {
   totalRounds: number
   loadedRounds: number
 }
+
+/** 图片分析缓存条目 */
+export interface ImageAnalysisEntry {
+  /** 分析结果文本 */
+  result: string
+  /** 分析时间戳 */
+  analyzedAt: number
+  /** 分析时的用户上下文（用于判断是否需要重新分析） */
+  context: string
+}
+
+/** 图片分析缓存: filePath → ImageAnalysisEntry */
+export type ImageAnalysisCache = Record<string, ImageAnalysisEntry>
+
+/** 图片分析缓存最大条目数 */
+const IMAGE_CACHE_MAX_ENTRIES = 500
 
 // ==================== ConversationStore ====================
 
@@ -141,14 +157,16 @@ export class ConversationStore {
   // ==================== 会话管理 ====================
 
   /**
-   * 删除会话（包括摘要缓存）
+   * 删除会话（包括摘要缓存和图片分析缓存）
    */
   deleteSession(sessionId: string): void {
     const filePath = this.getFilePath(sessionId)
     const summaryPath = this.getSummaryPath(sessionId)
+    const imageCachePath = this.getImageCachePath(sessionId)
 
     if (fs.existsSync(filePath)) fs.unlinkSync(filePath)
     if (fs.existsSync(summaryPath)) fs.unlinkSync(summaryPath)
+    if (fs.existsSync(imageCachePath)) fs.unlinkSync(imageCachePath)
 
     // 删除旧 rotate 文件
     for (let i = 1; i <= MEMORY_CONFIG.CONVERSATION.MAX_ROTATED_FILES; i++) {
@@ -202,6 +220,51 @@ export class ConversationStore {
     fs.writeFileSync(summaryPath, JSON.stringify(summary, null, 2), 'utf-8')
   }
 
+  // ==================== 图片分析缓存 ====================
+
+  /**
+   * 加载图片分析缓存
+   */
+  loadImageCache(sessionId: string): ImageAnalysisCache {
+    const cachePath = this.getImageCachePath(sessionId)
+    if (!fs.existsSync(cachePath)) return {}
+
+    try {
+      const content = fs.readFileSync(cachePath, 'utf-8')
+      return JSON.parse(content) as ImageAnalysisCache
+    } catch {
+      console.warn(`⚠️ 图片分析缓存损坏，已删除: ${cachePath}`)
+      fs.unlinkSync(cachePath)
+      return {}
+    }
+  }
+
+  /**
+   * 保存图片分析缓存（含淘汰策略：超过上限保留最新的）
+   */
+  saveImageCache(sessionId: string, cache: ImageAnalysisCache): void {
+    const cachePath = this.getImageCachePath(sessionId)
+
+    // 淘汰策略：超过上限时按 analyzedAt 保留最新的
+    let cacheToSave = cache
+    const entries = Object.entries(cache)
+    if (entries.length > IMAGE_CACHE_MAX_ENTRIES) {
+      entries.sort((a, b) => b[1].analyzedAt - a[1].analyzedAt)
+      cacheToSave = Object.fromEntries(entries.slice(0, IMAGE_CACHE_MAX_ENTRIES))
+    }
+
+    fs.writeFileSync(cachePath, JSON.stringify(cacheToSave, null, 2), 'utf-8')
+  }
+
+  /**
+   * 更新单条图片分析缓存（便捷方法，读取-修改-写回）
+   */
+  updateImageCacheEntry(sessionId: string, filePath: string, entry: ImageAnalysisEntry): void {
+    const cache = this.loadImageCache(sessionId)
+    cache[filePath] = entry
+    this.saveImageCache(sessionId, cache)
+  }
+
   // ==================== 内部方法 ====================
 
   /**
@@ -218,6 +281,14 @@ export class ConversationStore {
   private getSummaryPath(sessionId: string): string {
     const safeId = this.sanitizeSessionId(sessionId)
     return path.join(this.basePath, `${safeId}.summary.json`)
+  }
+
+  /**
+   * 获取图片分析缓存路径
+   */
+  private getImageCachePath(sessionId: string): string {
+    const safeId = this.sanitizeSessionId(sessionId)
+    return path.join(this.basePath, `${safeId}.images.json`)
   }
 
   /**
