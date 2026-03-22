@@ -57,7 +57,20 @@ export interface EventHandlers {
   onContentStop?: () => Promise<void>
   onThinkingDelta?: (thinkingText: string) => Promise<void>
   onThinkingStop?: () => Promise<void>
-  onToolUseStart?: (toolName: string, input?: any) => Promise<void>
-  onToolUseStop?: (toolName: string, result: any) => Promise<void>
+  /**
+   * 工具调用开始
+   * @param toolName - 工具名称
+   * @param input - 工具输入参数
+   * @param parentToolUseId - 如果非 null，表示这是 Sub-Agent 内部的工具调用，
+   *   值为父 Agent tool 的 tool_use_id，用于在 UI 中做嵌套展示
+   * @param toolUseId - 此 tool_use 块的 ID，仅在 toolName='Agent' 时有意义，
+   *   后续 Sub-Agent 内部调用会引用此 ID 作为 parentToolUseId
+   */
+  onToolUseStart?: (toolName: string, input?: any, parentToolUseId?: string | null, toolUseId?: string) => Promise<void>
+  /**
+   * 工具调用结束
+   * @param parentToolUseId - 同上
+   */
+  onToolUseStop?: (toolName: string, result: any, parentToolUseId?: string | null) => Promise<void>
   onError?: (error: string) => Promise<void>
 }

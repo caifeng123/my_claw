@@ -684,12 +684,12 @@ ${originalContent}
         await renderer.onThinkingStop();
       },
 
-      onToolUseStart: async (toolName: string, input?: any) => {
-        await renderer.onToolStart(toolName, input);
+      onToolUseStart: async (toolName: string, input?: any, parentToolUseId?: string | null, toolUseId?: string) => {
+        await renderer.onToolStart(toolName, input, parentToolUseId, toolUseId);
       },
 
-      onToolUseStop: async (toolName: string, result: any) => {
-        await renderer.onToolEnd(toolName, result);
+      onToolUseStop: async (toolName: string, result: any, parentToolUseId?: string | null) => {
+        await renderer.onToolEnd(toolName, result, parentToolUseId);
       },
 
       onContentDelta: async (textDelta: string) => {

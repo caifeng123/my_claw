@@ -12,6 +12,7 @@ export const DEFAULT_ALLOWED_TOOLS = [
   'Read', 'Write', 'Edit', 'Glob', 'Grep',
   'WebSearch', 'WebFetch',
   'Task', 'TaskOutput', 'TaskStop',
+  'Agent',  // Sub-Agent 调用 (VisionGuard 等)
   'TeamCreate', 'TeamDelete', 'SendMessage',
   'TodoWrite', 'ToolSearch', 'Skill',
   'NotebookEdit'

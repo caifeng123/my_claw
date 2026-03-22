@@ -1,6 +1,7 @@
 import { query, type Options } from '@anthropic-ai/claude-agent-sdk'
 import type { AgentResponse, EventHandlers } from '../types/agent'
 import { ToolManager } from './tool-manager'
+import { getVisionGuardConfig } from './vision-guard'
 
 export class ClaudeEngine {
   private config: {
@@ -8,6 +9,9 @@ export class ClaudeEngine {
     env: Record<string, any>
   }
   toolManager: ToolManager
+
+  /** VisionGuard 配置 (三层防线) */
+  private visionGuard = getVisionGuardConfig()
 
   constructor() {
     this.toolManager = new ToolManager()
@@ -24,11 +28,60 @@ export class ClaudeEngine {
   }
 
   /**
+   * 构建包含 VisionGuard 的 query options
+   * 将三层防线注入到每次 query 调用中
+   */
+  private buildQueryOptions(
+    toolsConfig: Awaited<ReturnType<ToolManager['getTools']>>,
+    systemPrompt?: string,
+    abortController?: AbortController,
+  ) {
+    const { model, env } = this.config
+    const guard = this.visionGuard
+
+    // 合并 allowedTools: 原有工具 + Agent (Sub-Agent 必需)
+    const allowedTools = [
+      ...toolsConfig.allowedTools,
+      ...guard.additionalAllowedTools,
+    ]
+    // 去重
+    const uniqueAllowedTools = [...new Set(allowedTools)]
+
+    // 层级一: 将图片处理规则追加到 system prompt
+    const finalSystemPrompt = systemPrompt
+      ? `${systemPrompt}\n\n${guard.systemPromptRules}`
+      : guard.systemPromptRules
+
+    return {
+      ...toolsConfig,
+      allowedTools: uniqueAllowedTools,
+      model,
+      settingSources: ['project'] as Options['settingSources'],
+      cwd: process.cwd(),
+      env,
+
+      // 层级一: System Prompt 引导
+      ...(finalSystemPrompt ? { systemPrompt: finalSystemPrompt } : {}),
+
+      // Vision Sub-Agent 定义 (haiku model, 独立上下文)
+      agents: guard.agents,
+
+      // 层级二: PreToolUse Hook 拦截 Read 图片
+      hooks: guard.hooks,
+
+      // 层级三: canUseTool 兜底 (含 Bash cat 图片拦截)
+      canUseTool: guard.canUseTool,
+
+      // AbortController
+      ...(abortController ? { abortController } : {}),
+    }
+  }
+
+  /**
    * 发送消息给Claude并获取响应（支持自定义 systemPrompt）
    */
   async sendMessage(messages: any[], systemPrompt?: string): Promise<AgentResponse> {
     try {
-      const { model, env } = this.config
       const toolsConfig = await this.toolManager.getTools()
 
       // 构建用户查询文本
@@ -47,17 +100,10 @@ export class ClaudeEngine {
         return `${msg.role}: [complex content]`
       }).join('\n')
 
-      // 使用异步生成器作为提示
+      // 使用异步生成器作为提示 (含 VisionGuard 三层防线)
       const response = query({
         prompt: userQuery,
-        options: {
-          ...toolsConfig,
-          ...(systemPrompt ? { systemPrompt } : {}),
-          model,
-          settingSources: ['project'],
-          cwd: process.cwd(),
-          env,
-        },
+        options: this.buildQueryOptions(toolsConfig, systemPrompt),
       })
 
       let result = ''
@@ -110,6 +156,12 @@ export class ClaudeEngine {
    *   - 'result' (SDKResultMessage): 最终结果
    *   - 注意: SDK 中不存在 'tool_result' 类型
    *
+   * Sub-Agent 消息识别:
+   *   SDK 返回的 assistant/user 消息中，parent_tool_use_id 字段:
+   *   - null: 主 Agent 消息
+   *   - 非 null (string): Sub-Agent 内部消息，值指向父 Agent tool 的 tool_use_id
+   *   通过 parentToolUseId 传递给 EventHandlers，实现 UI 嵌套展示。
+   *
    * result 推送策略:
    *   SDK 返回的 result.result 是最终完整回答，但流式过程中 text 块已通过
    *   onContentDelta 推送过部分/全部内容。如果 result 包含未推送过的新内容，
@@ -130,12 +182,13 @@ export class ClaudeEngine {
     let lastThinkingContent = ''
     // tool_use_id → tool_name 映射，用于在 user 消息中查找工具名
     const toolUseIdToName = new Map<string, string>()
+    // [SUBAGENT] tool_use_id → parentToolUseId 映射
+    // 当 Sub-Agent 内部的 assistant 消息发起 tool_use 时，记录该 tool_use 属于哪个父级
+    const toolUseIdToParent = new Map<string, string>()
 
     try {
       await eventHandlers?.onContentStart?.()
       const toolsConfig = await this.toolManager.getTools()
-
-      const { model, env } = this.config
 
       const userQuery = messages.map(msg => {
         if (typeof msg.content === 'string') {
@@ -152,22 +205,28 @@ export class ClaudeEngine {
         return `${msg.role}: [complex content]`
       }).join('\n')
 
-      // 使用异步生成器作为提示
+      // 使用异步生成器作为提示 (含 VisionGuard 三层防线)
       const response = query({
         prompt: userQuery,
-        options: {
-          ...toolsConfig,
-          ...(systemPrompt ? { systemPrompt } : {}),
-          ...(abortController ? { abortController } : {}),
-          model,
-          settingSources: ['project'],
-          cwd: process.cwd(),
-          env,
-        },
+        options: this.buildQueryOptions(toolsConfig, systemPrompt, abortController),
       })
 
       // 处理AI响应流（abortController.abort() 会中断此循环）
       for await (const message of response) {
+        // [DEBUG] 打印所有消息类型，定位 Sub-Agent 消息结构
+        const debugMsg = message as any
+        const debugInfo: any = { type: message.type, subtype: debugMsg.subtype }
+        if (debugMsg.parent_tool_use_id) debugInfo.parent_tool_use_id = debugMsg.parent_tool_use_id
+        if (debugMsg.task_id) debugInfo.task_id = debugMsg.task_id
+        if (debugMsg.task_type) debugInfo.task_type = debugMsg.task_type
+        if (debugMsg.status) debugInfo.status = debugMsg.status
+        if (debugMsg.last_tool_name) debugInfo.last_tool_name = debugMsg.last_tool_name
+        if (debugMsg.description) debugInfo.description = String(debugMsg.description).slice(0, 100)
+        if (message.type === "assistant" || message.type === "user") {
+          const mc = debugMsg.message?.content
+          if (Array.isArray(mc)) debugInfo.content_types = mc.map((b: any) => b.type + (b.name ? ":" + b.name : ""))
+        }
+        console.log(`[engine][DEBUG] msg:`, JSON.stringify(debugInfo))
         if (message.type === 'result') {
           // ====== result 消息：最终结果 ======
           const resultMsg = message as any
@@ -203,8 +262,18 @@ export class ClaudeEngine {
 
         } else if (message.type === 'assistant') {
           // ====== assistant 消息：包含 thinking / text / tool_use 块 ======
+
+          // [SUBAGENT] 提取 parentToolUseId：
+          // - null → 主 Agent 消息
+          // - 非 null → Sub-Agent 内部消息，值为父 Agent tool 的 tool_use_id
+          const parentToolUseId: string | null = (message as any).parent_tool_use_id ?? null
+          const isSubAgentMessage = parentToolUseId != null
+
+          // Sub-Agent 内部的 thinking/text 不推送到主层卡片内容区
+          // 但 tool_use 块需要传递给 renderer 做嵌套展示
           const msg = message?.message
           const assistantContent = msg?.content
+          console.log(`[engine] assistant msg: parent_tool_use_id=${parentToolUseId}, content_types=${Array.isArray(assistantContent) ? assistantContent.map((b: any) => b.type).join(",") : "N/A"}`)
 
           if (assistantContent && Array.isArray(assistantContent)) {
             // [FIX] 跟踪本轮 assistant 消息是否包含 thinking 块
@@ -213,10 +282,13 @@ export class ClaudeEngine {
             for (const block of assistantContent) {
               // --- thinking 块 ---
               if (block.type === 'thinking' && block.thinking) {
-                hasThinkingInThisMessage = true
-                allThinkingContent += block.thinking  // [FIX] 累积所有 thinking 内容
-                lastThinkingContent = block.thinking  // [FIX] 记录最后一个 thinking 块
-                await eventHandlers?.onThinkingDelta?.(block.thinking)
+                if (!isSubAgentMessage) {
+                  // 仅主 Agent 的 thinking 推送到卡片
+                  hasThinkingInThisMessage = true
+                  allThinkingContent += block.thinking
+                  lastThinkingContent = block.thinking
+                  await eventHandlers?.onThinkingDelta?.(block.thinking)
+                }
               }
 
               // --- tool_use 块 ---
@@ -224,15 +296,24 @@ export class ClaudeEngine {
                 // 记录 tool_use_id → tool_name 映射
                 if (block.id && block.name) {
                   toolUseIdToName.set(block.id, block.name)
+                  // [SUBAGENT] 如果是 Sub-Agent 内部发起的 tool_use，
+                  // 记录它属于哪个父 Agent tool
+                  if (parentToolUseId) {
+                    toolUseIdToParent.set(block.id, parentToolUseId)
+                  }
                 }
-                await eventHandlers?.onToolUseStart?.(block.name, block.input)
+                // 主 Agent 的 tool_use → parentToolUseId = null
+                // Sub-Agent 内部的 tool_use → parentToolUseId = 父 Agent tool_use_id
+                await eventHandlers?.onToolUseStart?.(block.name, block.input, parentToolUseId, block.id)
               }
 
               // --- text 块 ---
               if (block.type === 'text' && block.text) {
-                // ✅ 触发内容增量事件
-                await eventHandlers?.onContentDelta?.(block.text)
-                pushedContent += block.text  // [FIX] 追踪已推送的内容
+                if (!isSubAgentMessage) {
+                  // 仅主 Agent 的 text 推送到卡片内容区
+                  await eventHandlers?.onContentDelta?.(block.text)
+                  pushedContent += block.text
+                }
               }
             }
             // [FIX] 仅在本轮 assistant 消息确实包含 thinking 块时才触发 thinkingStop
@@ -244,6 +325,10 @@ export class ClaudeEngine {
 
         } else if (message.type === 'user') {
           // ====== user 消息：工具执行结果 ======
+
+          // [SUBAGENT] 提取此 user 消息的 parentToolUseId
+          const userParentToolUseId: string | null = (message as any).parent_tool_use_id ?? null
+
           const userMsg = message as any
 
           // 从 message.content 数组中提取所有 tool_result 条目
@@ -253,6 +338,11 @@ export class ClaudeEngine {
               if (entry?.type === 'tool_result' && entry?.tool_use_id) {
                 const toolUseId = entry.tool_use_id
                 const toolName = toolUseIdToName.get(toolUseId) || 'unknown_tool'
+
+                // [SUBAGENT] 确定此工具结果对应的 parentToolUseId
+                // 优先使用 toolUseIdToParent 映射（从 assistant 消息中记录），
+                // 其次使用 user 消息自身的 parent_tool_use_id
+                const effectiveParent = toolUseIdToParent.get(toolUseId) ?? userParentToolUseId
 
                 // 提取结果文本
                 let resultContent: any
@@ -271,7 +361,7 @@ export class ClaudeEngine {
                     : '(tool executed, no result captured)'
                 }
 
-                await eventHandlers?.onToolUseStop?.(toolName, resultContent)
+                await eventHandlers?.onToolUseStop?.(toolName, resultContent, effectiveParent)
               }
             }
           } else {
@@ -310,7 +400,9 @@ export class ClaudeEngine {
                 }
               }
 
-              await eventHandlers?.onToolUseStop?.(toolName, resultContent)
+              // [SUBAGENT] fallback 路径的 parentToolUseId 传递
+              const effectiveParent = toolUseIdToParent.get(parentToolUseId) ?? userParentToolUseId
+              await eventHandlers?.onToolUseStop?.(toolName, resultContent, effectiveParent)
             }
           }
         }
