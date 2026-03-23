@@ -1,13 +1,11 @@
 /**
  * Memory 系统配置常量
- * V5.1 - JSONL 明文存储版本
+ * V5.2 - 存储路径统一至 sessions/{id}/ 目录
  */
 
 export const MEMORY_CONFIG = {
   /** 记忆文件路径（.jsonl）— 兼容旧 DB_PATH 配置名 */
   DB_PATH: process.env.MEMORY_DB_PATH || './data/memory.jsonl',
-  /** 对话历史存储路径 */
-  CONVERSATIONS_PATH: process.env.CONVERSATIONS_PATH || './data/conversations',
 
   /** System Prompt Token 预算 */
   TOKEN_BUDGET: {

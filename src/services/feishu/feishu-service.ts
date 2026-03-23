@@ -283,7 +283,7 @@ export class FeishuService implements FeishuConnection {
       this.markSeen(messageId);
 
       // 提取消息内容（使用占位符，不再硬编码路径）
-      const extracted = this.extractMessageContent(message.message_type, message.content, message.create_time);
+      const extracted = this.extractMessageContent(message.message_type, message.content);
       let content = extracted.text;
 
       if (!content && !extracted.imageKeys && !extracted.fileKeys) {
@@ -291,23 +291,9 @@ export class FeishuService implements FeishuConnection {
         return;
       }
 
-      // 下载图片（如果有）—— 仍在此处用默认路径，bridge 层会覆盖为 session 路径
-      if (extracted.imageKeys && extracted.imageKeys.length > 0) {
-        for (let i = 0; i < extracted.imageKeys.length; i++) {
-          const imageKey = extracted.imageKeys[i] as string;
-          try {
-            const filePath = await this.downloadFile(
-              messageId,
-              imageKey,
-              `${message.create_time}-image-${i}`,
-              'image'
-            );
-            console.log(`图片下载成功: ${filePath}`);
-          } catch (downloadError) {
-            console.error(`下载图片失败: ${imageKey}`, downloadError);
-          }
-        }
-      }
+      // [FIX] 图片下载已统一由 bridge 层管理（下载到 session 目录），
+      // [FIX] 图片下载已统一由 bridge 层管理（下载到 session 目录），service 层不再冗余下载。
+      // 如需单独使用 service 层（不经过 bridge），可取消此处注释。
 
       // 处理 @ 提及
       if (message.mentions && Array.isArray(message.mentions)) {
@@ -353,7 +339,7 @@ export class FeishuService implements FeishuConnection {
    * 提取消息内容
    * 修改：使用占位符代替硬编码路径，实际路径由 bridge 层在下载后替换
    */
-  extractMessageContent(messageType: string, content: string, createTime: string): { text: string; imageKeys?: string[]; fileKeys?: string[] } {
+  extractMessageContent(messageType: string, content: string): { text: string; imageKeys?: string[]; fileKeys?: string[] } {
     try {
       const parsed = JSON.parse(content);
 
@@ -369,8 +355,6 @@ export class FeishuService implements FeishuConnection {
         const contentArray = parsed.content;
         if (!Array.isArray(contentArray)) return { text: parsed.title || '' };
 
-        let imageIdx = 0;
-        let mediaIdx = 0;
 
         for (const paragraph of contentArray) {
           if (!Array.isArray(paragraph)) continue;
@@ -396,13 +380,13 @@ export class FeishuService implements FeishuConnection {
                 if (segment.image_key) {
                   imageKeys.push(segment.image_key);
                   // 使用占位符，bridge 层下载后替换为实际路径
-                  paragraphTexts.push(`![image]({{FILE:${createTime}-image-${imageIdx++}}})`);
+                  paragraphTexts.push(`![image]({{FILE:${segment.image_key}}})`);
                 }
                 break;
               case 'media':
                 if (segment.file_key) {
                   fileKeys.push(segment.file_key);
-                  paragraphTexts.push(`{{FILE:${createTime}-file-${mediaIdx++}}}`);
+                  paragraphTexts.push(`{{FILE:${segment.file_key}}}`);
                 }
                 break;
               case 'emotion':
@@ -439,7 +423,7 @@ export class FeishuService implements FeishuConnection {
         const imageKey = parsed.image_key;
         if (imageKey) {
           return {
-            text: `{{FILE:${createTime}-image-0}}`,
+            text: `{{FILE:${imageKey}}}`,
             imageKeys: [imageKey],
             fileKeys: parsed.file_key ? [parsed.file_key] : undefined,
           };
@@ -452,7 +436,7 @@ export class FeishuService implements FeishuConnection {
         const fileName = parsed.file_name || 'unknown_file';
         if (fileKey) {
           return {
-            text: `[文件: ${fileName}] {{FILE:${createTime}-file-0}}`,
+            text: `[文件: ${fileName}] {{FILE:${fileKey}}}`,
             fileKeys: [fileKey],
           };
         }
@@ -567,7 +551,7 @@ export class FeishuService implements FeishuConnection {
         return { text: '暂不支持读取卡片详细内容' };
       }
 
-      const extracted = this.extractMessageContent(detail.msgType, detail.body.content, detail.createTime);
+      const extracted = this.extractMessageContent(detail.msgType, detail.body.content);
       return {
         text: extracted.text || null,
         imageKeys: extracted.imageKeys,
@@ -1219,25 +1203,24 @@ export class FeishuService implements FeishuConnection {
    *
    * @param messageId 消息ID
    * @param fileKey 文件key（用于messageResource.get API）
-   * @param timestamp 时间戳（用于文件名），可选，默认使用当前时间
+   * @param filePrefix 文件名前缀（如 imageKey、fileKey）
    * @param type 文件类型
-   * @param targetDir 目标目录（可选，默认使用旧路径 data/lark/{type}s，bridge 层传入 session 路径）
+   * @param targetDir 目标目录（必传，由 bridge 层提供 session files 路径）
    * @returns 下载后的本地文件路径
    */
   async downloadFile(
     messageId: string,
     fileKey: string,
-    timestamp: string,
+    filePrefix: string,
     type: 'image' | 'file',
-    targetDir?: string,
+    targetDir: string,
   ): Promise<string> {
     if (!this.client) {
       throw new Error('Feishu client not initialized');
     }
 
     try {
-      // 确定目标目录：优先使用传入的 targetDir，否则使用旧默认路径
-      const imageDir = targetDir || join(process.cwd(), 'data', 'lark', `${type}s`);
+      const imageDir = targetDir;
       if (!existsSync(imageDir)) {
         mkdirSync(imageDir, { recursive: true });
       }
@@ -1256,7 +1239,7 @@ export class FeishuService implements FeishuConnection {
         },
       });
 
-      const fileName = `${timestamp || Date.now()}${getExtFromContentType(response.headers['Content-Type'] || response.headers['content-type'] || '')}`;
+      const fileName = `${filePrefix || fileKey}${getExtFromContentType(response.headers['Content-Type'] || response.headers['content-type'] || '')}`;
       const filePath = join(imageDir, fileName);
 
       await response.writeFile(filePath);

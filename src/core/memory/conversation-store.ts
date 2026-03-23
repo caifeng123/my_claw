@@ -1,10 +1,24 @@
 /**
  * ConversationStore - JSONL 对话历史持久化
- * V4.2 - 支持 rotate、按 token 预算加载、摘要缓存、图片分析缓存
+ * V5.0 - 存储路径统一至 data/sessions/{sessionId}/ 目录
+ *
+ * 每个 session 的全部数据集中在同一目录下：
+ *   data/sessions/{sessionId}/
+ *   ├── history.jsonl      ← 对话历史
+ *   ├── summary.json       ← 压缩摘要缓存
+ *   ├── images.json        ← 图片分析缓存
+ *   └── files/             ← 用户发送 & Bot 生成的文件
  */
 
 import * as fs from 'node:fs'
-import * as path from 'node:path'
+import {
+  getHistoryPath,
+  getSummaryPath,
+  getImageCachePath,
+  getSessionDir,
+  listAllSessionIds,
+  SESSIONS_ROOT,
+} from '../../utils/paths.js'
 import { MEMORY_CONFIG, estimateTokens } from './config.js'
 
 // ==================== 类型定义 ====================
@@ -46,7 +60,7 @@ export interface ImageAnalysisEntry {
   context: string
 }
 
-/** 图片分析缓存: filePath → ImageAnalysisEntry */
+/** 图片分析缓存: imageKey → ImageAnalysisEntry */
 export type ImageAnalysisCache = Record<string, ImageAnalysisEntry>
 
 /** 图片分析缓存最大条目数 */
@@ -55,14 +69,12 @@ const IMAGE_CACHE_MAX_ENTRIES = 500
 // ==================== ConversationStore ====================
 
 export class ConversationStore {
-  private basePath: string
-
-  constructor(basePath: string = MEMORY_CONFIG.CONVERSATIONS_PATH) {
-    this.basePath = basePath
-    if (!fs.existsSync(basePath)) {
-      fs.mkdirSync(basePath, { recursive: true })
+  constructor() {
+    // 确保 sessions 根目录存在
+    if (!fs.existsSync(SESSIONS_ROOT)) {
+      fs.mkdirSync(SESSIONS_ROOT, { recursive: true })
     }
-    console.log(`💬 ConversationStore 初始化完成: ${basePath}`)
+    console.log(`💬 ConversationStore 初始化完成: ${SESSIONS_ROOT}`)
   }
 
   // ==================== 写入 ====================
@@ -71,7 +83,7 @@ export class ConversationStore {
    * 追加一条对话记录
    */
   append(sessionId: string, role: 'user' | 'assistant' | 'system', content: string): ConversationEntry {
-    const filePath = this.getFilePath(sessionId)
+    const filePath = getHistoryPath(sessionId)
     const entry: ConversationEntry = {
       ts: Date.now(),
       role,
@@ -83,12 +95,6 @@ export class ConversationStore {
     // 检查是否需要 rotate
     this.rotateIfNeeded(filePath)
 
-    // 确保目录存在
-    const dir = path.dirname(filePath)
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true })
-    }
-
     fs.appendFileSync(filePath, JSON.stringify(entry) + '\n', 'utf-8')
     return entry
   }
@@ -99,7 +105,7 @@ export class ConversationStore {
    * 同步加载全部对话历史
    */
   loadSync(sessionId: string): ConversationEntry[] {
-    const filePath = this.getFilePath(sessionId)
+    const filePath = getHistoryPath(sessionId)
     if (!fs.existsSync(filePath)) return []
 
     const content = fs.readFileSync(filePath, 'utf-8')
@@ -157,35 +163,21 @@ export class ConversationStore {
   // ==================== 会话管理 ====================
 
   /**
-   * 删除会话（包括摘要缓存和图片分析缓存）
+   * 删除会话（删除整个 session 目录）
    */
   deleteSession(sessionId: string): void {
-    const filePath = this.getFilePath(sessionId)
-    const summaryPath = this.getSummaryPath(sessionId)
-    const imageCachePath = this.getImageCachePath(sessionId)
-
-    if (fs.existsSync(filePath)) fs.unlinkSync(filePath)
-    if (fs.existsSync(summaryPath)) fs.unlinkSync(summaryPath)
-    if (fs.existsSync(imageCachePath)) fs.unlinkSync(imageCachePath)
-
-    // 删除旧 rotate 文件
-    for (let i = 1; i <= MEMORY_CONFIG.CONVERSATION.MAX_ROTATED_FILES; i++) {
-      const rotatedPath = `${filePath}.${i}`
-      if (fs.existsSync(rotatedPath)) fs.unlinkSync(rotatedPath)
+    const sessionDir = getSessionDir(sessionId)
+    if (fs.existsSync(sessionDir)) {
+      fs.rmSync(sessionDir, { recursive: true, force: true })
+      console.log(`🗑️ 已删除会话目录: ${sessionDir}`)
     }
-
-    console.log(`🗑️ 已删除会话: ${sessionId}`)
   }
 
   /**
    * 列出所有会话 ID
    */
   listSessions(): string[] {
-    if (!fs.existsSync(this.basePath)) return []
-
-    return fs.readdirSync(this.basePath)
-      .filter(f => f.endsWith('.jsonl'))
-      .map(f => this.fileNameToSessionId(f))
+    return listAllSessionIds()
   }
 
   // ==================== 摘要缓存 ====================
@@ -194,7 +186,7 @@ export class ConversationStore {
    * 加载摘要缓存
    */
   loadSummaryCache(sessionId: string): CompressedSummary | null {
-    const summaryPath = this.getSummaryPath(sessionId)
+    const summaryPath = getSummaryPath(sessionId)
     if (!fs.existsSync(summaryPath)) return null
 
     try {
@@ -212,11 +204,7 @@ export class ConversationStore {
    * 保存摘要缓存
    */
   saveSummaryCache(sessionId: string, summary: CompressedSummary): void {
-    const summaryPath = this.getSummaryPath(sessionId)
-    const dir = path.dirname(summaryPath)
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true })
-    }
+    const summaryPath = getSummaryPath(sessionId)
     fs.writeFileSync(summaryPath, JSON.stringify(summary, null, 2), 'utf-8')
   }
 
@@ -226,7 +214,7 @@ export class ConversationStore {
    * 加载图片分析缓存
    */
   loadImageCache(sessionId: string): ImageAnalysisCache {
-    const cachePath = this.getImageCachePath(sessionId)
+    const cachePath = getImageCachePath(sessionId)
     if (!fs.existsSync(cachePath)) return {}
 
     try {
@@ -243,7 +231,7 @@ export class ConversationStore {
    * 保存图片分析缓存（含淘汰策略：超过上限保留最新的）
    */
   saveImageCache(sessionId: string, cache: ImageAnalysisCache): void {
-    const cachePath = this.getImageCachePath(sessionId)
+    const cachePath = getImageCachePath(sessionId)
 
     // 淘汰策略：超过上限时按 analyzedAt 保留最新的
     let cacheToSave = cache
@@ -259,51 +247,13 @@ export class ConversationStore {
   /**
    * 更新单条图片分析缓存（便捷方法，读取-修改-写回）
    */
-  updateImageCacheEntry(sessionId: string, filePath: string, entry: ImageAnalysisEntry): void {
+  updateImageCacheEntry(sessionId: string, imageKey: string, entry: ImageAnalysisEntry): void {
     const cache = this.loadImageCache(sessionId)
-    cache[filePath] = entry
+    cache[imageKey] = entry
     this.saveImageCache(sessionId, cache)
   }
 
   // ==================== 内部方法 ====================
-
-  /**
-   * 获取对话文件路径
-   */
-  private getFilePath(sessionId: string): string {
-    const safeId = this.sanitizeSessionId(sessionId)
-    return path.join(this.basePath, `${safeId}.jsonl`)
-  }
-
-  /**
-   * 获取摘要缓存路径
-   */
-  private getSummaryPath(sessionId: string): string {
-    const safeId = this.sanitizeSessionId(sessionId)
-    return path.join(this.basePath, `${safeId}.summary.json`)
-  }
-
-  /**
-   * 获取图片分析缓存路径
-   */
-  private getImageCachePath(sessionId: string): string {
-    const safeId = this.sanitizeSessionId(sessionId)
-    return path.join(this.basePath, `${safeId}.images.json`)
-  }
-
-  /**
-   * 安全化 session ID（去除特殊字符）
-   */
-  private sanitizeSessionId(sessionId: string): string {
-    return sessionId.replace(/[^a-zA-Z0-9_\-:]/g, '_')
-  }
-
-  /**
-   * 文件名还原为 session ID
-   */
-  private fileNameToSessionId(fileName: string): string {
-    return fileName.replace(/\.jsonl$/, '')
-  }
 
   /**
    * 文件 rotate：超过大小限制时归档

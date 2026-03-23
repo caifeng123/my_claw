@@ -1,11 +1,15 @@
 /**
  * ContextBuilder - 构建上下文窗口（截断/压缩/注入）
- * V4.2 - 保鲜区 + 压缩区模型，增量分段压缩，图片分析缓存替换
+ * V5.3 - 保鲜区 + 压缩区模型，增量分段压缩，图片分析缓存替换
+ *        JSONL 中只存 ![image](imageKey)，运行时按 sessionId 解析完整磁盘路径
  */
 
 import { ConversationStore, type ConversationEntry, type CompressedSummary, type ImageAnalysisCache } from '../../memory/conversation-store.js'
 import { SystemPromptBuilder } from './system-prompt-builder.js'
 import { MEMORY_CONFIG, estimateTokens, COMPRESS_SYSTEM_PROMPT } from '../../memory/config.js'
+import { getFilesDir } from '../../../utils/paths.js'
+import { existsSync, readdirSync } from 'fs'
+import { join, relative } from 'path'
 
 // ==================== 类型定义 ====================
 
@@ -36,28 +40,61 @@ export type CompressQueryFn = (params: {
   maxTokens: number
 }) => Promise<string>
 
-// ==================== 图片路径匹配 ====================
-
-/** 匹配 Markdown 图片语法中的图片文件路径 */
-const IMAGE_MD_PATTERN = /!\[.*?\]\(([^)]+\.(png|jpe?g|gif|webp|bmp|svg|ico|tiff?|avif))\)/gi
+// ==================== 图片引用处理 ====================
 
 /**
- * 将消息内容中的图片引用替换为缓存的分析结果
- *
- * - 缓存命中: ![image](path) → [图片: path]\n[此前分析结果]: analysis
- *   Claude 看到纯文本，不会触发 vision-guard，默认直接使用
- *   但路径保留在 [图片: path] 中，Claude 需要时可以主动调 vision-analyzer 重新分析
- *
- * - 缓存未命中: 保留原始 ![image](path) 语法
- *   vision-guard 正常拦截 → 引导调 Sub-Agent 分析
+ * 匹配 JSONL 中的图片引用: ![image](imageKey)
+ * imageKey 不含扩展名、不含路径分隔符，例如 img_v3_02cc_xxx
  */
-function resolveImageReferences(content: string, imageCache: ImageAnalysisCache): string {
-  return content.replace(IMAGE_MD_PATTERN, (match, filePath: string) => {
-    const entry = imageCache[filePath]
+const IMAGE_MD_PATTERN = /!\[image\]\(([^)\s]+)\)/gi
+
+/**
+ * 在 session files 目录中查找包含指定 imageKey 的文件
+ * 文件命名格式: img-{imageKey}.{ext}
+ */
+function findFileByKey(dir: string, imageKey: string): string | null {
+  try {
+    if (!existsSync(dir)) return null
+    const files = readdirSync(dir)
+    const match = files.find(f => f.includes(imageKey))
+    return match ? join(dir, match) : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 将消息内容中的图片引用替换为缓存分析结果或完整磁盘路径
+ *
+ * 缓存命中: ![image](key) → [图片: key]\n[此前分析结果]: analysis
+ *   Claude 看到纯文本，不触发 vision-guard，直接复用
+ *
+ * 缓存未命中: ![image](key) → ![image](data/sessions/.../files/img-key.jpg)
+ *   vision-guard 正常拦截 → Sub-Agent 分析 → 结果写入缓存
+ *
+ * 文件不存在: 原样保留（图片可能已被清理）
+ */
+function resolveImageReferences(
+  content: string,
+  imageCache: ImageAnalysisCache,
+  sessionId: string,
+): string {
+  return content.replace(IMAGE_MD_PATTERN, (match, imageKey: string) => {
+    // 缓存命中 → 替换为纯文本分析结果
+    const entry = imageCache[imageKey]
     if (entry) {
-      return `[图片: ${filePath}]\n[此前分析结果]: ${entry.result}`
+      return `[图片: ${imageKey}]\n[此前分析结果]: ${entry.result}`
     }
-    // 缓存未命中，保留原始语法让 vision-guard 处理
+
+    // 缓存未命中 → 解析 imageKey 为完整磁盘路径
+    const filesDir = getFilesDir(sessionId)
+    const fullPath = findFileByKey(filesDir, imageKey)
+    if (fullPath) {
+      const relPath = relative(process.cwd(), fullPath)
+      return `![image](${relPath.startsWith('..') ? fullPath : relPath})`
+    }
+
+    // 文件不存在，原样保留
     return match
   })
 }
@@ -77,16 +114,12 @@ export class ContextBuilder {
     this.systemPromptBuilder = systemPromptBuilder
   }
 
-  /**
-   * 设置压缩查询函数（延迟注入，避免循环依赖）
-   */
+  /** 设置压缩查询函数（延迟注入，避免循环依赖） */
   setCompressQuery(fn: CompressQueryFn): void {
     this.compressQuery = fn
   }
 
-  /**
-   * 构建完整上下文（核心方法）
-   */
+  /** 构建完整上下文（核心方法） */
   async build(sessionId: string, userMessage: string): Promise<ContextBuildResult> {
     const config = MEMORY_CONFIG.CONTEXT
 
@@ -94,17 +127,17 @@ export class ContextBuilder {
     const allHistory = this.conversationStore.loadSync(sessionId)
     const totalHistoryTokens = allHistory.reduce((sum, e) => sum + e.token_est, 0)
 
-    // 1.5 加载图片分析缓存（用于替换历史消息中的图片引用）
+    // 1.5 加载图片分析缓存
     const imageCache = this.conversationStore.loadImageCache(sessionId)
 
-    // 2. 构建 system prompt（纯静态层）
+    // 2. 构建 system prompt
     const systemPromptResult = this.systemPromptBuilder.build()
     const systemTokens = estimateTokens(systemPromptResult.text)
 
     // 3. 计算可用预算
     const userMsgTokens = estimateTokens(userMessage)
     const availableBudget = config.MAX_CONTEXT_TOKENS
-      - config.OUTPUT_RESERVE - systemTokens - userMsgTokens - 500 // 500 为安全余量
+      - config.OUTPUT_RESERVE - systemTokens - userMsgTokens - 500
 
     // 4. 判断是否需要压缩
     const needCompress =
@@ -112,12 +145,10 @@ export class ContextBuilder {
       allHistory.length > config.MIN_ROUNDS_FOR_COMPRESS * 2
 
     if (!needCompress) {
-      // 全量原文注入（从后往前填满预算）
       const recentMessages = this.selectRecent(allHistory, availableBudget)
-      // 替换图片引用为缓存分析结果
-      const resolvedMessages = this.resolveMessagesImageRefs(recentMessages, imageCache)
+      const resolvedMessages = this.resolveMessagesImageRefs(recentMessages, imageCache, sessionId)
       const recentTokens = resolvedMessages.reduce(
-        (sum, m) => sum + estimateTokens(m.content), 0
+        (sum, m) => sum + estimateTokens(m.content), 0,
       )
 
       return {
@@ -153,14 +184,13 @@ export class ContextBuilder {
       console.warn('⚠️ 压缩摘要生成失败，回退到无摘要模式:', error)
     }
 
-    // 8. 替换图片引用为缓存分析结果
-    const resolvedMessages = this.resolveMessagesImageRefs(recentMessages, imageCache)
+    // 8. 替换图片引用
+    const resolvedMessages = this.resolveMessagesImageRefs(recentMessages, imageCache, sessionId)
 
     // 9. 组装消息列表
     const messages: MessageParam[] = []
     let summaryTokens = 0
     if (summary) {
-      // 摘要超过 budget 时截断
       let summaryText = summary.summary
       if (estimateTokens(summaryText) > summaryBudget) {
         const ratio = summaryBudget / estimateTokens(summaryText)
@@ -176,7 +206,7 @@ export class ContextBuilder {
     messages.push(...resolvedMessages)
 
     const recentTokens = resolvedMessages.reduce(
-      (sum, m) => sum + estimateTokens(m.content), 0
+      (sum, m) => sum + estimateTokens(m.content), 0,
     )
     const totalRounds = Math.ceil(allHistory.filter(e => e.role === 'user').length)
 
@@ -196,29 +226,23 @@ export class ContextBuilder {
     }
   }
 
-  /**
-   * 对消息列表中的图片引用进行替换
-   */
+  /** 替换消息列表中的图片引用（缓存命中 → 纯文本，未命中 → 完整路径） */
   private resolveMessagesImageRefs(
     messages: MessageParam[],
     imageCache: ImageAnalysisCache,
+    sessionId: string,
   ): MessageParam[] {
-    // 无缓存数据时直接返回，避免无意义的正则扫描
-    if (Object.keys(imageCache).length === 0) return messages
-
     return messages.map(msg => ({
       ...msg,
-      content: resolveImageReferences(msg.content, imageCache),
+      content: resolveImageReferences(msg.content, imageCache, sessionId),
     }))
   }
 
-  /**
-   * 从后往前选取消息，填满 token 预算
-   */
+  /** 从后往前选取消息，填满 token 预算 */
   private selectRecent(
     history: ConversationEntry[],
     budget: number,
-    minEntries: number = 2
+    minEntries: number = 2,
   ): MessageParam[] {
     const selected: MessageParam[] = []
     let usedTokens = 0
@@ -234,9 +258,7 @@ export class ContextBuilder {
     return selected
   }
 
-  /**
-   * 增量压缩：读取缓存 → 只压缩新增部分 → 更新缓存
-   */
+  /** 增量压缩：读取缓存 → 只压缩新增部分 → 更新缓存 */
   private async getOrCreateSummary(
     sessionId: string,
     compressZone: ConversationEntry[],
@@ -260,7 +282,6 @@ export class ContextBuilder {
       .map(e => `${e.role}: ${e.content}`)
       .join('\n')
 
-    // 调用 LLM 压缩
     let prompt = ''
     if (previousSummary) {
       prompt += `## 之前的摘要\n${previousSummary}\n\n`
