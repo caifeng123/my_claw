@@ -14,11 +14,11 @@ import { StreamingCardRenderer } from './streaming-card-renderer.js';
 import type { FeishuConnectionConfig, FeishuMessage, ThreadContext } from './types.js';
 import { getAgentEngine } from '../../core/agent-registry.js';
 import type { EventHandlers } from '@/core/agent/types/agent.js';
-import { writeFileSync } from 'fs';
+import { writeFileSync, existsSync, readdirSync } from 'fs';
 import { execSync } from 'child_process';
 import { ClaudeEngine } from '@/core/agent/engine/claude-engine.js';
-import { getReceivedFilesDir } from '../../utils/paths.js';
-import { relative } from 'path';
+import { getFilesDir } from '../../utils/paths.js';
+import { relative, join } from 'path';
 import type { ImageAnalysisEntry } from '../../core/memory/conversation-store.js';
 
 // 状态文件路径
@@ -42,6 +42,23 @@ export interface FeishuAgentBridgeConfig {
   showTypingIndicator?: boolean;
   /** 是否启用流式卡片 (Create + Patch)，默认 false */
   enableStreamingCard?: boolean;
+}
+
+
+/**
+ * 在目录中查找包含指定 fileKey 的已有文件
+ * 用于图片/文件去重，避免 Date.now() 导致的重复下载
+ * @returns 完整路径，未找到则返回 null
+ */
+function findExistingFileByKey(dir: string, fileKey: string): string | null {
+  try {
+    if (!existsSync(dir)) return null;
+    const files = readdirSync(dir);
+    const match = files.find(f => f.includes(fileKey));
+    return match ? join(dir, match) : null;
+  } catch {
+    return null;
+  }
 }
 
 export class FeishuAgentBridge {
@@ -331,15 +348,21 @@ private async handleNewCommand(message: FeishuMessage): Promise<void> {
   /**
    * 从 Agent tool 的 input 中提取 vision-analyzer 的图片路径
    */
-  private extractImagePathFromAgentInput(input: any): string | null {
+  private extractImageKeyFromAgentInput(input: any): string | null {
     if (!input) return null
     // Agent tool 的 input 结构: { subagent_type: "vision-analyzer", prompt: "...image at <path>..." }
     const subagentType = input.subagent_type ?? input.type ?? ''
     if (!String(subagentType).includes('vision')) return null
 
     const prompt = String(input.prompt ?? '')
+    // 从 prompt 中提取图片文件路径，再去掉扩展名得到 imageKey
+    // 文件名格式: {imageKey}.ext (如 img_v3_xxx.jpg)
     const pathMatch = prompt.match(/(?:image|图片)\s+(?:at\s+)?([^\s,."']+\.(png|jpe?g|gif|webp|bmp|svg|ico|tiff?|avif))/i)
-    return pathMatch?.[1] ?? null
+    if (!pathMatch?.[1]) return null
+    const filePath = pathMatch[1]
+    // 取最后一段文件名，去掉扩展名即为 imageKey
+    const basename = filePath.split('/').pop() ?? filePath
+    return basename.replace(/\.[^.]+$/, '')
   }
 
   /**
@@ -353,8 +376,8 @@ private async handleNewCommand(message: FeishuMessage): Promise<void> {
   ): void {
     if (!toolUseId) return
 
-    const imagePath = this.pendingVisionAnalysis.get(toolUseId)
-    if (!imagePath) return
+    const imageKey = this.pendingVisionAnalysis.get(toolUseId)
+    if (!imageKey) return
 
     // 清理 pending 记录
     this.pendingVisionAnalysis.delete(toolUseId)
@@ -370,10 +393,10 @@ private async handleNewCommand(message: FeishuMessage): Promise<void> {
     }
 
     try {
-      getAgentEngine().getConversationStore().updateImageCacheEntry(sessionId, imagePath, entry)
-      console.log(`🖼️ 图片分析缓存已写入: ${imagePath} (${resultStr.length} 字符)`)
+      getAgentEngine().getConversationStore().updateImageCacheEntry(sessionId, imageKey, entry)
+      console.log(`🖼️ 图片分析缓存已写入: ${imageKey} (${resultStr.length} 字符)`)
     } catch (error) {
-      console.error(`❌ 写入图片分析缓存失败: ${imagePath}`, error)
+      console.error(`❌ 写入图片分析缓存失败: ${imageKey}`, error)
     }
   }
 
@@ -434,39 +457,46 @@ private async handleNewCommand(message: FeishuMessage): Promise<void> {
             message.quotedContent = quotedContent;
           }
 
-          // 引用消息中的图片：下载到 session 目录，路径直接拼入 quotedContent
+          // 引用消息中的图片：下载到 session 目录
+          // 注意：quoted.text 中已包含 ![image]({{FILE:imageKey}}) 占位符，
+          // 只需下载文件并将路径加入 downloadedPaths，后面统一由占位符替换逻辑处理。
           if (quoted.imageKeys && quoted.imageKeys.length > 0 && quoted.messageId) {
-            const quotedReceivedDir = getReceivedFilesDir(sessionId);
-            const existingPaths = message.downloadedPaths || [];
-            for (let i = 0; i < quoted.imageKeys.length; i++) {
-              const imageKey = quoted.imageKeys[i] as string;
-              // 检查是否已下载过
-              const alreadyDownloaded = existingPaths.find(p => p.includes(imageKey));
-              let inlinePath: string;
+            const quotedFilesDir = getFilesDir(sessionId);
+            // 将引用消息的 imageKeys 合并到 message.imageKeys（用于后续 pathByKey 映射）
+            if (!message.imageKeys) message.imageKeys = [];
 
-              if (alreadyDownloaded) {
-                const relPath = relative(process.cwd(), alreadyDownloaded);
-                inlinePath = relPath.startsWith('..') ? alreadyDownloaded : relPath;
-              } else {
-                try {
-                  const filePath = await this.feishuService.downloadFile(
-                    quoted.messageId,
-                    imageKey,
-                    `${Date.now()}-quoted-image-${i}`,
-                    'image',
-                    quotedReceivedDir,
-                  );
-                  const relPath = relative(process.cwd(), filePath);
-                  inlinePath = relPath.startsWith('..') ? filePath : relPath;
-                } catch (downloadError) {
-                  console.error(`下载引用文件失败: ${imageKey}`, downloadError);
-                  continue;
-                }
+            for (const imageKey of quoted.imageKeys) {
+              const key = imageKey as string;
+              // 避免重复添加（引用图片和当前消息图片可能相同）
+              if (!message.imageKeys.includes(key)) {
+                message.imageKeys.push(key);
               }
 
-              message.quotedContent = message.quotedContent
-                ? message.quotedContent + '\n' + inlinePath
-                : inlinePath;
+              // 检查磁盘是否已存在（跨请求去重）
+              const existingFile = findExistingFileByKey(quotedFilesDir, key);
+              if (existingFile) {
+                if (!message.downloadedPaths) message.downloadedPaths = [];
+                if (!message.downloadedPaths.includes(existingFile)) {
+                  message.downloadedPaths.push(existingFile);
+                }
+                console.log(`📎 引用图片已存在，跳过下载: ${existingFile}`);
+                continue;
+              }
+
+              try {
+                const filePath = await this.feishuService.downloadFile(
+                  quoted.messageId,
+                  key,
+                  key,
+                  'image',
+                  quotedFilesDir,
+                );
+                if (!message.downloadedPaths) message.downloadedPaths = [];
+                message.downloadedPaths.push(filePath);
+                console.log(`📥 引用图片已下载: ${filePath}`);
+              } catch (downloadError) {
+                console.error(`下载引用图片失败: ${key}`, downloadError);
+              }
             }
           }
         } catch (error: any) {
@@ -482,19 +512,26 @@ private async handleNewCommand(message: FeishuMessage): Promise<void> {
 
       // ==================== NEW: 文件下载到 session 目录 ====================
       const downloadedPaths: string[] = [];
-      const receivedDir = getReceivedFilesDir(sessionId);
+      const filesDir = getFilesDir(sessionId);
 
-      // 下载图片到 session 目录
+      // 下载图片到 session 目录（使用 imageKey 作为稳定文件名，避免重复下载）
       if (message.imageKeys && message.imageKeys.length > 0) {
         for (let i = 0; i < message.imageKeys.length; i++) {
           const imageKey = message.imageKeys[i] as string;
+          // 先检查是否已存在
+          const existingImg = findExistingFileByKey(filesDir, imageKey);
+          if (existingImg) {
+            downloadedPaths.push(existingImg);
+            console.log(`📎 图片已存在，跳过下载: ${existingImg}`);
+            continue;
+          }
           try {
             const filePath = await this.feishuService.downloadFile(
               message.messageId,
               imageKey,
-              `${Date.now()}-image-${i}`,
+              imageKey,
               'image',
-              receivedDir,  // 使用 session 目录
+              filesDir,
             );
             downloadedPaths.push(filePath);
             console.log(`📥 图片已下载到 session 目录: ${filePath}`);
@@ -504,17 +541,24 @@ private async handleNewCommand(message: FeishuMessage): Promise<void> {
         }
       }
 
-      // 下载文件到 session 目录
+      // 下载文件到 session 目录（使用 fileKey 作为稳定文件名，避免重复下载）
       if (message.fileKeys && message.fileKeys.length > 0) {
         for (let i = 0; i < message.fileKeys.length; i++) {
           const fileKey = message.fileKeys[i] as string;
+          // 先检查是否已存在
+          const existingFile = findExistingFileByKey(filesDir, fileKey);
+          if (existingFile) {
+            downloadedPaths.push(existingFile);
+            console.log(`📎 文件已存在，跳过下载: ${existingFile}`);
+            continue;
+          }
           try {
             const filePath = await this.feishuService.downloadFile(
               message.messageId,
               fileKey,
-              `${Date.now()}-file-${i}`,
+              `file-${fileKey}`,
               'file',
-              receivedDir,  // 使用 session 目录
+              filesDir,
             );
             downloadedPaths.push(filePath);
             console.log(`📥 文件已下载到 session 目录: ${filePath}`);
@@ -528,31 +572,49 @@ private async handleNewCommand(message: FeishuMessage): Promise<void> {
       if (downloadedPaths.length > 0) {
         message.downloadedPaths = downloadedPaths;
 
-        // 构建占位符 → 实际路径的映射（按类型+下标匹配）
+        // 构建占位符 → 实际路径的映射（直接用 imageKey/fileKey 作为 key）
         const toRelative = (p: string) => {
           const rel = relative(process.cwd(), p);
           return rel.startsWith('..') ? p : rel;
         };
-        const imagePathMap = new Map<number, string>();
-        const filePathMap = new Map<number, string>();
+        const pathByKey = new Map<string, string>();
         for (const p of downloadedPaths) {
-          const imgMatch = p.match(/-(image)-(\d+)\b/);
-          const fileMatch = p.match(/-(file)-(\d+)\b/);
-          if (imgMatch?.[2]) imagePathMap.set(parseInt(imgMatch[2]), p);
-          else if (fileMatch?.[2]) filePathMap.set(parseInt(fileMatch[2]), p);
+          // 从路径中提取 imageKey/fileKey（文件名格式: img-{key}.ext 或 file-{key}.ext）
+          const allKeys = [...(message.imageKeys || []), ...(message.fileKeys || [])];
+          for (const key of allKeys) {
+            if (p.includes(key as string)) {
+              pathByKey.set(key as string, p);
+              break;
+            }
+          }
         }
 
         // 替换占位符为实际路径
+        // 图片占位符: ![image]({{FILE:key}}) → ![image](key)
+        // JSONL 中只存 imageKey，context-builder 读取时:
+        //   - 缓存命中 → 替换为纯文本分析结果
+        //   - 缓存未命中 → 按 sessionId 扫描 files/ 目录还原完整路径
+        // 文件占位符: {{FILE:key}} → 完整相对路径（非图片文件无缓存机制，需要完整路径）
+        if (message.quotedContent) {
+          message.quotedContent = message.quotedContent.replace(
+            /!\[image\]\(\{\{FILE:([^}]+)\}\}\)/g,
+            (_match: string, key: string) => `![image](${key})`
+          ).replace(
+            /\{\{FILE:([^}]+)\}\}/g,
+            (_match: string, key: string) => {
+              const p = pathByKey.get(key);
+              return p ? toRelative(p) : '';
+            }
+          );
+        }
+
         message.content = message.content.replace(
-          /!\[image\]\(\{\{FILE:[^}]*-image-(\d+)\}\}\)/g,
-          (_match: string, idx: string) => {
-            const p = imagePathMap.get(parseInt(idx));
-            return p ? toRelative(p) : '';
-          }
+          /!\[image\]\(\{\{FILE:([^}]+)\}\}\)/g,
+          (_match: string, key: string) => `![image](${key})`
         ).replace(
-          /\{\{FILE:[^}]*-file-(\d+)\}\}/g,
-          (_match: string, idx: string) => {
-            const p = filePathMap.get(parseInt(idx));
+          /\{\{FILE:([^}]+)\}\}/g,
+          (_match: string, key: string) => {
+            const p = pathByKey.get(key);
             return p ? toRelative(p) : '';
           }
         ).trim();
@@ -758,10 +820,10 @@ ${originalContent}
 
         // V4.4: 追踪 vision-analyzer 调用，记录图片路径
         if (toolName === 'Agent' && toolUseId) {
-          const imgPath = this.extractImagePathFromAgentInput(input);
-          if (imgPath) {
+          const imgKey = this.extractImageKeyFromAgentInput(input);
+          if (imgKey) {
             this.cleanStalePendingAnalysis();
-            this.pendingVisionAnalysis.set(toolUseId, imgPath);
+            this.pendingVisionAnalysis.set(toolUseId, imgKey);
           }
         }
       },
@@ -824,10 +886,10 @@ ${originalContent}
       onToolUseStart: async (toolName: string, input?: any, _parentToolUseId?: string | null, toolUseId?: string) => {
         // V4.4: 追踪 vision-analyzer 调用
         if (toolName === 'Agent' && toolUseId) {
-          const imgPath = this.extractImagePathFromAgentInput(input);
-          if (imgPath) {
+          const imgKey = this.extractImageKeyFromAgentInput(input);
+          if (imgKey) {
             this.cleanStalePendingAnalysis();
-            this.pendingVisionAnalysis.set(toolUseId, imgPath);
+            this.pendingVisionAnalysis.set(toolUseId, imgKey);
           }
         }
       },

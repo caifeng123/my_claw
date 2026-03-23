@@ -115,13 +115,13 @@ export class SessionManager {
       throw new Error(`会话不存在: ${sessionId}`)
     }
 
-    // 删除对话持久化文件（包括摘要缓存）
+    // 删除整个 session 目录（对话 + 文件一起清除）
     this.conversationStore.deleteSession(sessionId)
 
     session.messages = []
     session.contextLength = 0
     session.updatedAt = new Date()
-    console.log(`🗑️ 会话 ${sessionId} 已清空`)
+    console.log(`🗑️ 会话 ${sessionId} 对话已清空`)
   }
 
   /**
