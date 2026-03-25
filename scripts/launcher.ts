@@ -20,6 +20,7 @@
  */
 
 import { fork, execSync, ChildProcess, execFileSync } from 'child_process';
+import { DeviceAuthClient } from '../src/services/feishu/device-auth.js';
 import { existsSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -107,6 +108,9 @@ class Launcher {
     if (existingState) {
       console.log('📄 发现未处理的状态文件:', existingState);
     }
+
+    // Token 预检：启动前确认飞书 User Token 可用
+    this.checkFeishuToken();
 
     await this.forkChild();
   }
@@ -396,6 +400,39 @@ class Launcher {
         setTimeout(cleanup, 1000);
       }, GRACEFUL_SHUTDOWN_TIMEOUT);
     });
+  }
+
+  /**
+   * 启动前检查飞书 User Token 是否可用。
+   * token 不存在或全部过期（access + refresh 均失效）→ 直接报错退出。
+   */
+  private checkFeishuToken(): void {
+    const appId = process.env.FEISHU_APP_ID;
+    const appSecret = process.env.FEISHU_APP_SECRET;
+
+    if (!appId || !appSecret) {
+      console.error('❌ FEISHU_APP_ID 或 FEISHU_APP_SECRET 未配置，跳过 token 检查');
+      return;
+    }
+
+    const client = new DeviceAuthClient({ appId, appSecret, platform: 'feishu' });
+    const status = client.getTokenStatus();
+
+    if (!status.hasToken) {
+      console.error('❌ 飞书 User Token 不存在，请先执行 pnpm auth 完成授权');
+      process.exit(1);
+    }
+
+    if (!status.accessTokenValid && !status.refreshTokenValid) {
+      console.error('❌ 飞书 User Token 已全部过期（access + refresh），请执行 pnpm auth 重新授权');
+      process.exit(1);
+    }
+
+    if (status.accessTokenValid) {
+      console.log('✅ 飞书 User Token 有效');
+    } else {
+      console.log('⚠️ 飞书 access_token 已过期，refresh_token 有效，服务启动后将自动刷新');
+    }
   }
 
   private setupSignalHandlers(): void {

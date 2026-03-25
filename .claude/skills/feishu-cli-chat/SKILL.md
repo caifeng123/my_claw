@@ -296,7 +296,7 @@ pnpm feishu chat member list oc_xxx --member-id-type user_id
 pnpm feishu chat member list oc_xxx --page-size 100 --page-token "xxx"
 ```
 
-> **Scope 要求**：使用 User Token 时需要 `im:chat:readonly` 或 `im:chat.members:read` scope。若报 99991679 错误，使用 **feishu-auth** 技能授权后重试。
+> **Scope 要求**：使用 User Token 时需要 `im:chat:readonly` 或 `im:chat.members:read` scope。若报 99991679 错误，使用 **feishu-notify-admin** 技能通知管理员。
 
 ### 修改群信息
 
@@ -420,7 +420,7 @@ pnpm feishu msg delete <message_id>
 | 创建群聊 | `chat create --name "群名"` | App |
 | 获取群链接 | `chat link oc_xxx` | App |
 
-> 标记 **User** 的命令使用 `pnpm feishu` 执行（自动注入 User Token）。报权限错误时使用 **feishu-auth** 技能授权后重试。标记 **App** 的命令使用应用身份，无需登录。
+> 标记 **User** 的命令使用 `pnpm feishu` 执行（自动注入 User Token）。报权限错误时使用 **feishu-notify-admin** 技能通知管理员。标记 **App** 的命令使用应用身份，无需登录。
 
 ---
 
@@ -478,4 +478,4 @@ text = content.get('text', '')
 | 发送消息、回复、转发/合并转发 | feishu-cli-msg |
 | 搜索文档/应用、高级消息搜索（多条件筛选） | feishu-cli-search |
 | 表格、日历、任务、文件、知识库等其他模块 | feishu-cli-toolkit |
-| OAuth 登录、Token 管理 | **feishu-auth** |
+| Token 异常通知 | **feishu-notify-admin** |

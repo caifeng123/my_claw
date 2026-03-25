@@ -328,7 +328,7 @@ JSON 中包含了 API 不支持的字段。只使用以下安全字段：
 
 - 检查应用是否已开通 `board:whiteboard` 权限
 - 确认 `whiteboard_id` 来自 `doc add-board` 的返回值，而非 `document_id`
-- 确认 App 凭证配置正确（报权限错误时使用 **feishu-auth** 技能授权后重试）
+- 确认 App 凭证配置正确（报权限错误时使用 **feishu-notify-admin** 技能通知管理员）
 
 **Mermaid 导入降级为代码块**：
 

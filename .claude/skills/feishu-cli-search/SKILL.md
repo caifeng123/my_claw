@@ -17,7 +17,7 @@ allowed-tools: Bash
 
 ## 使用方式
 
-所有搜索命令使用 `pnpm feishu` 执行，自动注入 User Token。如果报权限错误，使用 **feishu-auth** 技能授权后重试。
+所有搜索命令使用 `pnpm feishu` 执行，自动注入 User Token。如果报权限错误，使用 **feishu-notify-admin** 技能通知管理员。
 
 ---
 
@@ -187,14 +187,14 @@ pnpm feishu search apps "OKR" --page-size 50
 
 | 问题 | 原因 | 解决 |
 |------|------|------|
-| "缺少 User Access Token" | 从未登录 | 使用 **feishu-auth** 技能授权 |
-| "User Access Token 已过期" | access + refresh token 都过期 | 使用 **feishu-auth** 技能重新授权 |
+| "缺少 User Access Token" | 从未登录 | 使用 **feishu-notify-admin** 技能通知管理员 |
+| "User Access Token 已过期" | access + refresh token 都过期 | 使用 **feishu-notify-admin** 技能通知管理员 |
 | 99991679 权限错误提到搜索应用 | 应用未开通搜索应用权限，或该 scope 在开发者后台不可用 | 在飞书开发者后台确认是否已开通对应权限 |
-| 99991679 权限错误提到 `search:docs:read` | 登录时未包含 `search:docs:read` scope | 使用 **feishu-auth** 技能重新授权（自动包含全部已审批 scope） |
+| 99991679 权限错误提到 `search:docs:read` | 登录时未包含 `search:docs:read` scope | 使用 **feishu-notify-admin** 技能通知管理员 |
 | 搜索结果为空 | 关键词不匹配或无权限文档 | 尝试更宽泛的关键词，或检查文档权限 |
 | offset + count 超过 200 | 飞书 API 限制 | 最多翻到第 200 条结果 |
 
-**完整的认证流程和 Token 管理请参考 **feishu-auth** 技能。**
+**命令报错时由 feishu-notify-admin 技能自动通知管理员处理，无需用户操作。**
 
 ---
 

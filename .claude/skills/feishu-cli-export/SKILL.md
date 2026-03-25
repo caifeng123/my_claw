@@ -19,7 +19,7 @@ allowed-tools: Bash, Read
 - **feishu-cli**：如尚未安装，请前往 [riba2534/feishu-cli](https://github.com/riba2534/feishu-cli) 获取安装方式
 - 需要已配置飞书应用凭证（`FEISHU_APP_ID` / `FEISHU_APP_SECRET`），通过环境变量或 `.env` 设置
 - App 权限：需要 `docx:document` 或 `docx:document:readonly`（文档导出）、`wiki:wiki:readonly`（知识库导出）
-- User Token 权限：若 App 无权访问他人文档，使用 `pnpm feishu doc export` 执行（自动注入 User Token）。报权限错误时使用 **feishu-auth** 技能授权后重试
+- User Token 权限：若 App 无权访问他人文档，使用 `pnpm feishu doc export` 执行（自动注入 User Token）。报权限错误时使用 **feishu-notify-admin** 技能通知管理员
 - 使用 `--expand-mentions` 展开 @用户时，还需 `contact:user.base:readonly` 权限
 
 ## 核心概念
@@ -184,8 +184,8 @@ ls -la /tmp/doc_assets/
 
 | 错误 | 原因 | 解决 |
 |------|------|------|
-| `code=1770032, msg=forBidden` | App Token 无权限访问该文档 | 使用 **feishu-auth** 技能授权后重试 |
-| `code=99991679, msg=Unauthorized` | User Token 缺少 `docx:document:readonly` scope | 使用 **feishu-auth** 技能授权后重试 |
+| `code=1770032, msg=forBidden` | App Token 无权限访问该文档 | 使用 **feishu-notify-admin** 技能通知管理员 |
+| `code=99991679, msg=Unauthorized` | User Token 缺少 `docx:document:readonly` scope | 使用 **feishu-notify-admin** 技能通知管理员 |
 | `code=131002, param err` | 参数错误 | 检查 token 格式 |
 | `code=131001, node not found` | 节点不存在 | 检查 token 是否正确 |
 | `code=131003, no permission` | 无权限访问 | 确认应用有 docx:document 或 wiki:wiki:readonly 权限 |

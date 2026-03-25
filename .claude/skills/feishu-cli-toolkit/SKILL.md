@@ -443,7 +443,7 @@ feishu-cli wiki member remove <space_id> --member-type userid --member-id <USER_
 ## 11. 搜索
 
 > **推荐使用专项技能**：
-> - 搜索消息/群内搜索 → **feishu-cli-chat**（含群聊浏览，通过 **feishu-auth** 技能授权后自动使用 User Token）
+> - 搜索消息/群内搜索 → **feishu-cli-chat**（含群聊浏览，需 User Token，token 异常时由 **feishu-notify-admin** 技能通知管理员）
 > - 搜索文档/应用/跨模块搜索 → **feishu-cli-search**（含完整的 Token 前置检查和排错流程）
 
 **搜索参数详细参考**：读取 `references/search-commands.md` 获取完整筛选参数说明。
@@ -656,7 +656,7 @@ rm -f "$TMP_MD"
 | 素材 | `drive:drive`、`drive:drive:readonly` |
 | 评论 | `drive:drive.comment:readonly`、`drive:drive.comment:write` |
 | 知识库 | `wiki:wiki:readonly`、`wiki:wiki` |
-| 搜索 | 需要 User Access Token（通过 **feishu-auth** 技能授权） |
+| 搜索 | 需要 User Access Token（通过 **feishu-notify-admin** 技能通知管理员） |
 | 用户/部门 | `contact:user.base:readonly`、`contact:department.base:readonly` |
 | 附件下载 | `docx:document`、`drive:file:download`（或 `drive:drive`） |
 

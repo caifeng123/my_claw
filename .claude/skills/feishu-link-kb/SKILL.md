@@ -46,6 +46,8 @@ allowed-tools: Bash, Read, Write
 6. bitable_roundup.py append → 追加记录到多维表格（含标签）
     ↓
 7. 返回两个链接：单篇文档 + 汇总索引
+    ↓
+8. 删除临时文件 `/tmp/*.md`
 ```
 
 ## 依赖的工具和技能
@@ -183,7 +185,7 @@ feishu-cli perm transfer-owner <document_id> \
 检查状态文件：
 
 ```bash
-cat state/roundup.json 2>/dev/null
+cat <PROJECT_ROOT>/data/temp/feishu-link-kb.json 2>/dev/null
 ```
 
 - **文件存在** → 读取 `app_token` 和 `table_id`
@@ -220,8 +222,7 @@ python3 scripts/bitable_roundup.py create \
 # 脚本输出 JSON 包含 app_token 和 table_id
 
 # 2. 保存状态
-mkdir -p state
-cat > state/roundup.json << EOF
+cat > <PROJECT_ROOT>/data/temp/feishu-link-kb.json << EOF
 {
   "app_token": "<app_token>",
   "table_id": "<table_id>",
@@ -257,9 +258,15 @@ EOF
 
 简洁返回，不赘述过程。
 
+### Step 8：删除临时文件
+
+```bash
+rm /tmp/*.md
+```
+
 ## 状态管理
 
-### state/roundup.json
+### `<PROJECT_ROOT>/data/temp/feishu-link-kb.json`
 
 ```json
 {
@@ -305,6 +312,6 @@ EOF
 ## 汇总表格复用策略
 
 1. 如果用户在对话中指定了多维表格链接/app_token → 使用用户指定的
-2. 否则使用 `state/roundup.json` 中的默认多维表格
+2. 否则使用 `<PROJECT_ROOT>/data/temp/feishu-link-kb.json` 中的默认多维表格
 3. 只有在用户明确要求"新建汇总"时才创建新的
 4. 不要静默创建第二个汇总表格

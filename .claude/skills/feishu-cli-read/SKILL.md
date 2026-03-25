@@ -17,7 +17,7 @@ allowed-tools: Bash, Read, Grep
 
 - **feishu-cli**：如尚未安装，请前往 [riba2534/feishu-cli](https://github.com/riba2534/feishu-cli) 获取安装方式
 - App 权限：需要 `docx:document` 或 `docx:document:readonly`（普通文档）、`wiki:wiki:readonly`（知识库）
-- User Token 权限：若 App 无权访问他人文档，使用 `pnpm feishu doc export` 执行（自动注入 User Token）。报权限错误时使用 **feishu-auth** 技能授权后重试
+- User Token 权限：若 App 无权访问他人文档，使用 `pnpm feishu doc export` 执行（自动注入 User Token）。报权限错误时使用 **feishu-notify-admin** 技能通知管理员
 
 ## 核心概念
 
@@ -50,7 +50,7 @@ allowed-tools: Bash, Read, Grep
 
    使用 `pnpm feishu doc export` 执行，自动注入 User Token。未找到 Token 时回退为 App Access Token（租户身份）。
 
-   若遇到 `code=1770032 forBidden` 或 `code=99991679 Unauthorized`，使用 **feishu-auth** 技能授权后重试。
+   若遇到 `code=1770032 forBidden` 或 `code=99991679 Unauthorized`，使用 **feishu-notify-admin** 技能通知管理员。
 
    **知识库文档**:
 
@@ -190,8 +190,8 @@ pnpm feishu wiki export <child_node_token_2> -o /tmp/child2.md
 
 | 错误                              | 原因                                           | 解决                                                                                                        |
 | --------------------------------- | ---------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| `code=1770032, msg=forBidden`     | App Token 无权限访问该文档                     | 使用 **feishu-auth** 技能授权后重试 |
-| `code=99991679, msg=Unauthorized` | User Token 缺少 `docx:document:readonly` scope | 使用 **feishu-auth** 技能授权后重试                           |
+| `code=1770032, msg=forBidden`     | App Token 无权限访问该文档                     | 使用 **feishu-notify-admin** 技能通知管理员 |
+| `code=99991679, msg=Unauthorized` | User Token 缺少 `docx:document:readonly` scope | 使用 **feishu-notify-admin** 技能通知管理员                           |
 | `code=131002, param err`          | 参数错误                                       | 检查 token 格式                                                                                             |
 | `code=131001, node not found`     | 节点不存在                                     | 检查 token 是否正确                                                                                         |
 | `code=131003, no permission`      | 无权限访问                                     | 确认应用有 wiki:wiki:readonly 权限                                                                          |
@@ -247,7 +247,7 @@ sleep 5 && pnpm feishu wiki export <token>
 
 - 确认应用已获得 `docx:document:readonly`（普通文档）或 `wiki:wiki:readonly`（知识库）权限
 - 如果是他人文档且 App 没有被添加为协作者，需要使用 User Token：
-  使用 **feishu-auth** 技能授权后重试，无需额外参数
+  使用 **feishu-notify-admin** 技能通知管理员，无需额外参数
 
 **Q: 文档不存在 / `node not found`**
 
@@ -256,5 +256,5 @@ sleep 5 && pnpm feishu wiki export <token>
 
 **Q: Token 过期 / 认证失败**
 
-- 使用 **feishu-auth** 技能授权后重试
+- 使用 **feishu-notify-admin** 技能通知管理员
 - 如使用 App Access Token，检查 `FEISHU_APP_ID` 和 `FEISHU_APP_SECRET` 环境变量是否正确
