@@ -20,7 +20,7 @@ import { ClaudeEngine } from '@/core/agent/engine/claude-engine.js';
 import { getFilesDir } from '../../utils/paths.js';
 import { relative, join } from 'path';
 import type { ImageAnalysisEntry } from '../../core/memory/conversation-store.js';
-import { getUserAuthService } from '../../core/agent/tools/user-auth-tools.js';
+import { getUserAuthService } from './user-auth-service.js';
 
 // 状态文件路径
 const STATE_FILE = '.restart-state.json';

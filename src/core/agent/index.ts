@@ -17,7 +17,7 @@ import { createCronjobTools } from './tools/cronjob-tools.js'
 import { calculatorTool, timeTool } from './tools/calculator.js'
 import { createTavilyTools } from './tools/tavily-tools.js'
 import { createLinkAnalyzeTools } from './tools/link-analyze.js'
-import { createUserAuthTools, initUserAuthService } from './tools/user-auth-tools.js'
+import { initUserAuthService } from '../../services/feishu/user-auth-service.js'
 import { registerAgentEngine } from '../agent-registry.js'
 import type {
   SessionConfig,
@@ -96,7 +96,6 @@ export class AgentEngine {
     const appSecret = process.env.FEISHU_APP_SECRET || ''
     if (appId && appSecret) {
       initUserAuthService({ appId, appSecret })
-      this.toolManager.registerTools(createUserAuthTools())
     }
   }
 

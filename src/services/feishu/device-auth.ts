@@ -10,6 +10,7 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { dirname, join } from 'path';
 import { homedir } from 'os';
+import { getAllScopes } from '../../config/feishu-scopes.js';
 
 // ========== 类型定义 ==========
 
@@ -31,15 +32,19 @@ export interface DeviceAuthResponse {
 
 /**
  * 内部 token 数据结构（运行时使用）
+ *
+ * 关键：使用绝对时间戳 expires_at_ms / refresh_expires_at_ms 判断过期，
+ * 避免 obtained_at + expires_in 反推带来的精度问题。
  */
 export interface TokenData {
   access_token: string;
   token_type: string;
-  expires_in: number;
+  /** access_token 过期的绝对时间戳 (ms) */
+  expires_at_ms: number;
+  /** refresh_token 过期的绝对时间戳 (ms)，无 refresh_token 时与 expires_at_ms 相同 */
+  refresh_expires_at_ms: number;
   refresh_token?: string;
   scope?: string;
-  /** 获取时间戳(ms) */
-  obtained_at: number;
 }
 
 /**
@@ -81,6 +86,9 @@ const PLATFORM_CONFIG: Record<Platform, PlatformUrls> = {
 /** 默认 token 文件路径: ~/.feishu-cli/token.json */
 const DEFAULT_TOKEN_PATH = join(homedir(), '.feishu-cli', 'token.json');
 
+/** refresh_token 默认有效期 30 天 (秒) */
+const DEFAULT_REFRESH_EXPIRES_IN = 30 * 24 * 3600;
+
 // ========== DeviceAuthClient ==========
 
 export class DeviceAuthClient {
@@ -94,8 +102,11 @@ export class DeviceAuthClient {
 
   /**
    * 记住最近一次请求授权时使用的 scope。
-   * 用于写入 token.json 时保证 scope 字段完整——
-   * 因为飞书服务器响应中 data.scope 可能为空或仅返回部分。
+   *
+   * 优先级链：
+   *   服务器返回 data.scope > this.requestedScope > getAllScopes()
+   *
+   * 保证 token.json 里的 scope 永远不为空。
    */
   private requestedScope: string = '';
 
@@ -109,6 +120,17 @@ export class DeviceAuthClient {
 
     // 启动时尝试从文件加载 token
     this.loadTokenFromFile();
+  }
+
+  /**
+   * 获取当前有效的 scope（永不返回空字符串）
+   */
+  private getEffectiveScope(candidates: (string | undefined)[]): string {
+    for (const s of candidates) {
+      if (s && s.trim()) return s.trim();
+    }
+    // 兜底：使用配置文件中的全量 scope
+    return getAllScopes();
   }
 
   // ==================== Token 持久化（兼容 feishu-cli 格式） ====================
@@ -126,31 +148,39 @@ export class DeviceAuthClient {
       // 兼容 feishu-cli 格式（有 expires_at 字段）
       if (data.expires_at) {
         this.cachedToken = this.fromCliFormat(data as CliTokenFile);
-        // 从文件中恢复已记录的 scope
-        if (data.scope) {
-          this.requestedScope = data.scope;
-        }
+        this.requestedScope = this.getEffectiveScope([data.scope]);
       }
-      // 兼容旧格式（有 obtained_at 字段）
-      else if (data.obtained_at) {
-        this.cachedToken = data as TokenData;
-        if (data.scope) {
-          this.requestedScope = data.scope;
-        }
-      }
-      // 空对象或无效格式
-      else if (data.access_token) {
+      // 兼容旧格式（有 obtained_at 字段，迁移到绝对时间）
+      else if (data.obtained_at && data.expires_in) {
         this.cachedToken = {
           access_token: data.access_token,
           token_type: data.token_type ?? 'Bearer',
-          expires_in: data.expires_in ?? 7200,
+          expires_at_ms: data.obtained_at + data.expires_in * 1000,
+          refresh_expires_at_ms: data.refresh_token
+            ? data.obtained_at + DEFAULT_REFRESH_EXPIRES_IN * 1000
+            : data.obtained_at + data.expires_in * 1000,
           refresh_token: data.refresh_token,
-          scope: data.scope,
-          obtained_at: Date.now(),
+          scope: this.getEffectiveScope([data.scope]),
         };
-        if (data.scope) {
-          this.requestedScope = data.scope;
-        }
+        this.requestedScope = this.cachedToken.scope!;
+        // 立即以新格式回写（同时补全 scope）
+        this.saveTokenToFile(this.cachedToken);
+      }
+      // 只有 access_token 的简单格式
+      else if (data.access_token) {
+        const now = Date.now();
+        const expiresIn = data.expires_in ?? 7200;
+        this.cachedToken = {
+          access_token: data.access_token,
+          token_type: data.token_type ?? 'Bearer',
+          expires_at_ms: now + expiresIn * 1000,
+          refresh_expires_at_ms: data.refresh_token
+            ? now + DEFAULT_REFRESH_EXPIRES_IN * 1000
+            : now + expiresIn * 1000,
+          refresh_token: data.refresh_token,
+          scope: this.getEffectiveScope([data.scope]),
+        };
+        this.requestedScope = this.cachedToken.scope!;
       } else {
         return;
       }
@@ -182,47 +212,61 @@ export class DeviceAuthClient {
 
   /**
    * feishu-cli 格式 → 内部格式
+   *
+   * 直接使用 expires_at / refresh_expires_at 的绝对时间，不反推 obtained_at。
    */
   private fromCliFormat(cli: CliTokenFile): TokenData {
-    const expiresAt = new Date(cli.expires_at).getTime();
-    const now = Date.now();
-    const remainingSeconds = Math.max(0, (expiresAt - now) / 1000);
+    const expiresAtMs = new Date(cli.expires_at).getTime();
+
+    // 有 refresh_token 时用文件里的 refresh_expires_at；没有则 = expires_at
+    let refreshExpiresAtMs: number;
+    if (cli.refresh_token) {
+      refreshExpiresAtMs = cli.refresh_expires_at
+        ? new Date(cli.refresh_expires_at).getTime()
+        : Date.now() + DEFAULT_REFRESH_EXPIRES_IN * 1000;
+    } else {
+      refreshExpiresAtMs = expiresAtMs;
+    }
 
     return {
       access_token: cli.access_token,
       token_type: cli.token_type ?? 'Bearer',
-      expires_in: Math.round(remainingSeconds),
-      refresh_token: cli.refresh_token,
-      scope: cli.scope,
-      obtained_at: now - ((7200 - remainingSeconds) * 1000), // 反推获取时间
+      expires_at_ms: expiresAtMs,
+      refresh_expires_at_ms: refreshExpiresAtMs,
+      refresh_token: cli.refresh_token || undefined,
+      scope: this.getEffectiveScope([cli.scope]),
     };
   }
 
   /**
    * 内部格式 → feishu-cli 格式
-   *
-   * scope 优先级：token.scope > this.requestedScope > ''
    */
   private toCliFormat(token: TokenData): CliTokenFile {
-    const expiresAt = new Date(token.obtained_at + token.expires_in * 1000);
-    // refresh_token 通常有效期 7 天（604800秒）
-    const refreshExpiresAt = new Date(token.obtained_at + 604800 * 1000);
-
     return {
       access_token: token.access_token,
       refresh_token: token.refresh_token ?? '',
       token_type: token.token_type,
-      expires_at: expiresAt.toISOString(),
-      refresh_expires_at: refreshExpiresAt.toISOString(),
-      scope: token.scope || this.requestedScope || '',
+      expires_at: new Date(token.expires_at_ms).toISOString(),
+      refresh_expires_at: new Date(token.refresh_expires_at_ms).toISOString(),
+      scope: this.getEffectiveScope([token.scope, this.requestedScope]),
     };
   }
 
   // ==================== Token 有效性检查 ====================
 
-  private isTokenExpired(token: TokenData): boolean {
-    const elapsed = (Date.now() - token.obtained_at) / 1000;
-    return elapsed >= (token.expires_in - this.refreshBufferSeconds);
+  /**
+   * 基于绝对时间判断 access_token 是否过期
+   * 提前 refreshBufferSeconds 秒视为"即将过期"
+   */
+  private isAccessTokenExpired(token: TokenData): boolean {
+    return Date.now() >= (token.expires_at_ms - this.refreshBufferSeconds * 1000);
+  }
+
+  /**
+   * 基于绝对时间判断 refresh_token 是否过期
+   */
+  private isRefreshTokenExpired(token: TokenData): boolean {
+    return Date.now() >= token.refresh_expires_at_ms;
   }
 
   /**
@@ -234,17 +278,26 @@ export class DeviceAuthClient {
       return null;
     }
 
-    if (!this.isTokenExpired(this.cachedToken)) {
+    // access_token 未过期，直接返回
+    if (!this.isAccessTokenExpired(this.cachedToken)) {
       return this.cachedToken.access_token;
     }
 
+    // access_token 已过期，尝试用 refresh_token 刷新
     if (this.cachedToken.refresh_token) {
+      // 先检查 refresh_token 本身是否也过期了
+      if (this.isRefreshTokenExpired(this.cachedToken)) {
+        console.warn('[DeviceAuth] refresh_token 也已过期，需要重新授权');
+        this.cachedToken = null;
+        return null;
+      }
+
       try {
         console.log('[DeviceAuth] access_token 已过期，尝试刷新...');
         const newToken = await this.refreshAccessToken(this.cachedToken.refresh_token);
         this.cachedToken = newToken;
         this.saveTokenToFile(newToken);
-        console.log('[DeviceAuth] token 刷新成功');
+        console.log('[DeviceAuth] token 刷新成功，已更新 token.json');
         return newToken.access_token;
       } catch (err) {
         console.warn('[DeviceAuth] token 刷新失败，需要重新授权:', err);
@@ -254,20 +307,27 @@ export class DeviceAuthClient {
     }
 
     console.warn('[DeviceAuth] token 过期且无 refresh_token，需要重新授权');
+    console.warn('[DeviceAuth] 提示：授权时 scope 需包含 offline_access 才能获得 refresh_token');
     this.cachedToken = null;
     return null;
   }
 
   /**
-   * 检查是否已有有效的用户授权
+   * 检查是否已有有效的用户授权（不触发刷新）
    */
   hasValidToken(): boolean {
-    return this.cachedToken !== null && !this.isTokenExpired(this.cachedToken);
+    return this.cachedToken !== null && !this.isAccessTokenExpired(this.cachedToken);
   }
 
   // ==================== Step 1: 设备授权请求 ====================
 
   async requestDeviceAuthorization(scope: string = 'offline_access'): Promise<DeviceAuthResponse> {
+    // 确保 scope 包含 offline_access（否则拿不到 refresh_token）
+    if (!scope.includes('offline_access')) {
+      scope = `offline_access ${scope}`;
+      console.log('[DeviceAuth] 自动追加 offline_access 到 scope');
+    }
+
     // 记住本次请求的完整 scope，后续写入 token.json 时使用
     this.requestedScope = scope;
 
@@ -320,14 +380,26 @@ export class DeviceAuthClient {
       const data = await resp.json() as any;
 
       if (resp.ok && data.access_token) {
+        const now = Date.now();
+        const expiresIn = data.expires_in ?? 7200;
+
+        // 有 refresh_token 时用服务器返回的有效期，否则 = access_token 有效期
+        const hasRefresh = !!data.refresh_token;
+        const refreshExpiresIn = hasRefresh
+          ? (data.refresh_expires_in ?? DEFAULT_REFRESH_EXPIRES_IN)
+          : expiresIn;
+
+        if (!hasRefresh) {
+          console.warn('[DeviceAuth] ⚠️ 服务器未返回 refresh_token！scope 是否包含 offline_access？');
+        }
+
         const token: TokenData = {
           access_token: data.access_token,
           token_type: data.token_type ?? 'Bearer',
-          expires_in: data.expires_in,
-          refresh_token: data.refresh_token,
-          // 优先用服务器返回的 scope，为空则用请求时的 scope
-          scope: data.scope || this.requestedScope,
-          obtained_at: Date.now(),
+          expires_at_ms: now + expiresIn * 1000,
+          refresh_expires_at_ms: now + refreshExpiresIn * 1000,
+          refresh_token: data.refresh_token || undefined,
+          scope: this.getEffectiveScope([data.scope, this.requestedScope]),
         };
 
         this.cachedToken = token;
@@ -377,15 +449,20 @@ export class DeviceAuthClient {
     }
 
     const data = await resp.json() as any;
+    const now = Date.now();
+    const expiresIn = data.expires_in ?? 7200;
+    const hasRefresh = !!data.refresh_token;
+    const refreshExpiresIn = hasRefresh
+      ? (data.refresh_expires_in ?? DEFAULT_REFRESH_EXPIRES_IN)
+      : expiresIn;
 
     return {
       access_token: data.access_token,
       token_type: data.token_type ?? 'Bearer',
-      expires_in: data.expires_in,
-      refresh_token: data.refresh_token,
-      // 刷新后服务器可能不回传 scope，保留已有的
-      scope: data.scope || this.requestedScope || this.cachedToken?.scope,
-      obtained_at: Date.now(),
+      expires_at_ms: now + expiresIn * 1000,
+      refresh_expires_at_ms: now + refreshExpiresIn * 1000,
+      refresh_token: data.refresh_token || undefined,
+      scope: this.getEffectiveScope([data.scope, this.requestedScope, this.cachedToken?.scope]),
     };
   }
 
@@ -402,6 +479,34 @@ export class DeviceAuthClient {
     } catch {}
   }
 
+
+  /**
+   * 获取当前 token 状态摘要（供心跳日志等使用）
+   */
+  getTokenStatus(): {
+    hasToken: boolean;
+    accessTokenValid: boolean;
+    accessExpiresAt: string | null;
+    refreshTokenValid: boolean;
+    refreshExpiresAt: string | null;
+  } {
+    if (!this.cachedToken) {
+      return {
+        hasToken: false,
+        accessTokenValid: false,
+        accessExpiresAt: null,
+        refreshTokenValid: false,
+        refreshExpiresAt: null,
+      };
+    }
+    return {
+      hasToken: true,
+      accessTokenValid: !this.isAccessTokenExpired(this.cachedToken),
+      accessExpiresAt: new Date(this.cachedToken.expires_at_ms).toISOString(),
+      refreshTokenValid: !!this.cachedToken.refresh_token && !this.isRefreshTokenExpired(this.cachedToken),
+      refreshExpiresAt: new Date(this.cachedToken.refresh_expires_at_ms).toISOString(),
+    };
+  }
   // ==================== 辅助方法 ====================
 
   private sleep(ms: number): Promise<void> {
