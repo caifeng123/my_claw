@@ -20,6 +20,7 @@ import { ClaudeEngine } from '@/core/agent/engine/claude-engine.js';
 import { getFilesDir } from '../../utils/paths.js';
 import { relative, join } from 'path';
 import type { ImageAnalysisEntry } from '../../core/memory/conversation-store.js';
+import { getUserAuthService } from '../../core/agent/tools/user-auth-tools.js';
 
 // 状态文件路径
 const STATE_FILE = '.restart-state.json';
@@ -96,6 +97,12 @@ export class FeishuAgentBridge {
 
     if (success) {
       this.isConnected = true;
+      // 注入用户身份服务到 FeishuService（如有），使 API 调用可使用 user_access_token
+      const userAuth = getUserAuthService();
+      if (userAuth) {
+        this.feishuService.setUserAuthService(userAuth);
+        console.log('🔑 用户身份服务已注入 FeishuService');
+      }
       console.log('✅ 飞书Agent桥接服务启动成功');
     } else {
       console.error('❌ 飞书Agent桥接服务启动失败');

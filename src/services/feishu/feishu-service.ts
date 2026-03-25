@@ -13,6 +13,7 @@ import type {
   MessageDetail,
 } from './types.js';
 import { fileURLToPath } from 'url';
+import { FeishuUserAuthService } from './user-auth-service.js';
 
 // AI 修复重试配置
 const AI_FIX_MAX_RETRIES = 2; // AI 修复最大重试次数
@@ -91,6 +92,11 @@ export class FeishuService implements FeishuConnection {
   private ackReactionByChat = new Map<string, string>(); // 消息确认反应
   private typingReactionByChat = new Map<string, string>(); // 输入状态反应
 
+  // ==================== NEW: 用户身份支持 ====================
+  private userAuthService: FeishuUserAuthService | null = null;
+  /** 是否优先使用用户身份（user_access_token）调用 API，默认 true */
+  private preferUserIdentity: boolean = true;
+
   // [FIX] 生成考虑 threadId 的存储 key，避免话题群多 thread 共享 chatId 导致 reaction 互相覆盖
   private getReactionKey(chatId: string, threadId?: string): string {
     return threadId ? `${chatId}:${threadId}` : chatId;
@@ -109,6 +115,60 @@ export class FeishuService implements FeishuConnection {
    */
   getClient(): lark.Client | null {
     return this.client;
+  }
+
+  // ==================== NEW: 用户身份管理 ====================
+
+  /**
+   * 设置用户授权服务（启用用户身份调用）
+   *
+   * 设置后，所有 API 调用将优先使用 user_access_token。
+   * 当 user token 无效或过期时，自动 fallback 到 tenant_access_token（应用身份）。
+   *
+   * @param service FeishuUserAuthService 实例
+   * @param preferUser 是否优先使用用户身份，默认 true
+   */
+  setUserAuthService(service: FeishuUserAuthService, preferUser: boolean = true): void {
+    this.userAuthService = service;
+    this.preferUserIdentity = preferUser;
+    console.log(`[FeishuService] 用户身份服务已设置，优先使用用户身份: ${preferUser}`);
+  }
+
+  /**
+   * 获取当前的 UserAuthService 实例
+   */
+  getUserAuthService(): FeishuUserAuthService | null {
+    return this.userAuthService;
+  }
+
+  /**
+   * 获取 SDK 请求的 options（自动选择身份）
+   *
+   * 当 userAuthService 已设置且有有效 token 时，返回 lark.withUserAccessToken(token)
+   * 否则返回 undefined（SDK 默认使用 tenant_access_token）
+   */
+  private async getUserRequestOptions(): Promise<ReturnType<typeof lark.withUserAccessToken> | undefined> {
+    if (!this.preferUserIdentity || !this.userAuthService) {
+      return undefined;
+    }
+
+    try {
+      const token = await this.userAuthService.getAccessToken();
+      if (token) {
+        return lark.withUserAccessToken(token);
+      }
+    } catch (error) {
+      console.warn('[FeishuService] 获取 user_access_token 失败，降级到应用身份:', error);
+    }
+
+    return undefined;
+  }
+
+  /**
+   * 检查当前是否有有效的用户身份
+   */
+  hasValidUserToken(): boolean {
+    return this.userAuthService?.isAuthorized() ?? false;
   }
 
   async connect(onMessage: (message: FeishuMessage) => void): Promise<boolean> {
@@ -272,8 +332,6 @@ export class FeishuService implements FeishuConnection {
       // parent_id: 话题群中直接回复的父消息 ID
       // upper_message_id: 普通群引用(quote)消息的原消息 ID
       const parentId = message.parent_id || message.upper_message_id || undefined;
-
-      // 调试日志：打印关键字段帮助排查
 
       // 消息去重检查
       if (this.isDuplicate(messageId)) {
@@ -470,10 +528,12 @@ export class FeishuService implements FeishuConnection {
       return null;
     }
 
+    const userOpts = await this.getUserRequestOptions();
+
     try {
       const response = await this.client.im.message.get({
         path: { message_id: messageId },
-      });
+      }, userOpts);
 
 
       const items = (response as any)?.data?.items;
@@ -598,13 +658,15 @@ export class FeishuService implements FeishuConnection {
       const actualFileName = fileName || filePath.split('/').pop() || 'file';
       const fileBuffer = readFileSync(filePath);
 
+      const userOpts = await this.getUserRequestOptions();
+
       const response = await this.client.im.file.create({
         data: {
           file_type: fileType,
           file_name: actualFileName,
           file: fileBuffer,
         },
-      });
+      }, userOpts);
 
       const fileKey = (response as any)?.file_key;
       if (fileKey) {
@@ -639,6 +701,8 @@ export class FeishuService implements FeishuConnection {
     }
 
     const content = JSON.stringify({ file_key: fileKey });
+    // 注意：发送消息通常使用应用身份（bot），不使用 user token
+    // 因为用户身份发消息需要单独的 API，且群聊中 bot 消息更自然
 
     try {
       if (replyMessageId) {
@@ -1229,6 +1293,8 @@ export class FeishuService implements FeishuConnection {
         throw new Error('fileKey is required for downloading image');
       }
 
+      const userOpts = await this.getUserRequestOptions();
+
       const response = await this.client.im.v1.messageResource.get({
         path: {
           message_id: messageId,
@@ -1237,7 +1303,7 @@ export class FeishuService implements FeishuConnection {
         params: {
           type,
         },
-      });
+      }, userOpts);
 
       const fileName = `${filePrefix || fileKey}${getExtFromContentType(response.headers['Content-Type'] || response.headers['content-type'] || '')}`;
       const filePath = join(imageDir, fileName);
@@ -1251,7 +1317,52 @@ export class FeishuService implements FeishuConnection {
     }
   }
 
-  // ==================== NEW: Create + Patch 方法 ====================
+  // ==================== NEW: 以用户身份调用任意飞书 Open API ====================
+
+  /**
+   * 以用户身份发起飞书 Open API 请求
+   *
+   * 使用 lark.Client 的 request 方法 + withUserAccessToken，
+   * 可调用任意飞书 Open API（如文档创建、日历管理、审批等）。
+   *
+   * @param method HTTP 方法
+   * @param url API 路径（如 '/open-apis/docx/v1/documents'）或完整 URL
+   * @param data 请求体（可选）
+   * @param params 查询参数（可选）
+   * @returns API 响应数据
+   */
+  async requestAsUser<T = any>(
+    method: string,
+    url: string,
+    data?: Record<string, any>,
+    params?: Record<string, any>,
+  ): Promise<T | null> {
+    if (!this.client) {
+      console.warn('Feishu client not initialized');
+      return null;
+    }
+
+    const userOpts = await this.getUserRequestOptions();
+    if (!userOpts) {
+      console.warn('[FeishuService] 无有效 user_access_token，无法以用户身份调用');
+      return null;
+    }
+
+    try {
+      const result = await this.client.request({
+        method,
+        url,
+        data,
+        params,
+      }, userOpts);
+      return result as T;
+    } catch (error) {
+      console.error(`[FeishuService] requestAsUser failed [${method} ${url}]:`, error);
+      throw error;
+    }
+  }
+
+  // ==================== Create + Patch 方法 ====================
 
   /**
    * 创建交互式卡片消息并返回 message_id

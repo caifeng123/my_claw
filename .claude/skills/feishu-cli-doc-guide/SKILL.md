@@ -1,6 +1,10 @@
 ---
 name: feishu-cli-doc-guide
-description: 飞书文档创建规范指南。Markdown 语法支持、Mermaid/PlantUML 飞书语法限制、表格处理、图表容错机制等完整规范。供其他飞书技能参考。
+description: >-
+  飞书文档创建前的兼容性检查规范。覆盖 Mermaid/PlantUML 语法限制（8 种图表类型的飞书安全写法）、
+  表格自动拆分规则（9×9 限制）、Callout/公式/图片处理、API 限制与容错机制。
+  被 feishu-cli-write、feishu-cli-import 等技能引用，在生成将要导入飞书的 Markdown 之前必须参考。
+  确保内容兼容飞书，避免导入失败。
 user-invocable: false
 allowed-tools: Read
 ---
@@ -19,7 +23,210 @@ allowed-tools: Read
 
 ---
 
-## 2. Markdown 语法全量参考
+## 2. TL;DR 速查清单
+
+生成飞书 Markdown 前，快速过一遍这 10 条核心规则：
+
+| # | 规则 | 严重度 |
+|---|------|--------|
+| 1 | ❌ Mermaid flowchart 标签禁止 `{}`（会被解析为菱形节点） | 必须遵守 |
+| 2 | ❌ Mermaid 禁止 `par...and...end`（飞书完全不支持） | 必须遵守 |
+| 3 | ❌ Mermaid 节点标签换行禁止 `\n`（会原样显示），用 `<br/>` | 必须遵守 |
+| 4 | ⚠️ Mermaid sequenceDiagram：participant ≤ 8，alt 嵌套 ≤ 1 层 | 强烈建议 |
+| 5 | ✅ 方括号标签含冒号时加双引号：`["类型: string"]` | 必须遵守 |
+| 6 | ❌ PlantUML 禁止行首缩进、`skinparam`、可见性标记（`+ - # ~`） | 必须遵守 |
+| 7 | ⚠️ 表格超过 9 行或 9 列会自动拆分，无需手动处理 | 了解即可 |
+| 8 | ✅ Callout 仅 6 种：NOTE / WARNING / TIP / CAUTION / IMPORTANT / SUCCESS | 必须遵守 |
+| 9 | ⚠️ 块级公式 `$$...$$` 会降级为行内 Equation（API 限制） | 了解即可 |
+| 10 | ✅ 图片默认自动上传，失败时降级为占位块 | 了解即可 |
+
+---
+
+## 3. Mermaid 飞书语法规范
+
+> 这是最重要的章节。Mermaid 图表导入飞书有严格的语法限制，不遵守会导致渲染失败。
+
+### 支持的 8 种图表类型
+
+| 类型 | 声明 | 飞书 diagram_type | 说明 |
+|------|------|------------------|------|
+| 流程图 | `flowchart TD` / `flowchart LR` | 6 (flowchart) | 支持 subgraph |
+| 时序图 | `sequenceDiagram` | 2 (sequence) | 复杂度限制最严格 |
+| 类图 | `classDiagram` | 4 (class) | |
+| 状态图 | `stateDiagram-v2` | 7 (state) | 必须用 v2 |
+| ER 图 | `erDiagram` | 5 (er) | |
+| 甘特图 | `gantt` | 0 (auto) | |
+| 饼图 | `pie` | 0 (auto) | |
+| 思维导图 | `mindmap` | 1 (mindmap) | |
+
+### 7 条强制性规则
+
+#### 规则 1：❌ 禁止在标签中使用花括号 `{}`
+
+花括号会被 Mermaid 解析器识别为菱形（decision）节点，导致语法错误。此规则针对 flowchart 节点标签，erDiagram/classDiagram 语法结构中的 `{}` 不受此限制。
+
+```markdown
+❌ 错误
+flowchart TD
+    A["{name: value}"]
+
+✅ 正确
+flowchart TD
+    A["name: value"]
+```
+
+**替代方案**：移除花括号，或用圆括号/方括号替代。
+
+#### 规则 2：❌ 禁止使用 `par...and...end` 并行语法
+
+飞书画板完全不支持 `par` 语法（错误码 2891001）。
+
+```markdown
+❌ 错误
+sequenceDiagram
+    par
+        A->>B: 请求1
+    and
+        A->>C: 请求2
+    end
+
+✅ 正确：用 Note 替代
+sequenceDiagram
+    Note over A,C: 并行处理
+    A->>B: 请求1
+    A->>C: 请求2
+```
+
+#### 规则 3：⚠️ 方括号中避免冒号
+
+方括号 `[text:xxx]` 中的冒号可能导致解析歧义。
+
+```markdown
+❌ 可能出错
+flowchart TD
+    A[类型:string]
+
+✅ 正确
+flowchart TD
+    A["类型: string"]
+```
+
+**修复方法**：给含冒号的标签加双引号。
+
+#### 规则 4：⚠️ Note 作用域限制
+
+`Note over` 最多跨 2 个相邻 participant。
+
+```markdown
+❌ 错误：跨太多参与者
+sequenceDiagram
+    Note over A,D: 说明
+
+✅ 正确
+sequenceDiagram
+    Note over A,B: 说明
+```
+
+#### 规则 5：⚠️ sequenceDiagram 复杂度阈值
+
+| 维度 | 安全阈值 | 超限风险 |
+|------|---------|---------|
+| participant 数量 | ≤ 8 | 超过 10 + 其他因素 → 失败 |
+| alt/opt 嵌套 | ≤ 1 层 | 超过 2 层 → 失败风险增大 |
+| 消息标签长度 | 简短（≤ 30 字符） | 长标签 + 多参与者 → 失败 |
+| 总消息数 | ≤ 30 | 需结合其他因素评估 |
+
+**超限组合**（实测必定失败）：10+ participant + 2+ alt + 30+ 长消息标签
+
+**建议**：超过安全阈值时，拆分为多个小图。
+
+#### 规则 6：❌ 节点标签换行禁止 `\n`，必须用 `<br>` 或 `<br/>`
+
+飞书画板不支持 Mermaid 节点标签中的 `\n` 转义符，会原样显示为 `\n` 文本。需要使用 `<br>` 或 `<br/>` 实现换行，也可以在源码中写真实换行（需用双引号包裹标签）。
+
+```markdown
+❌ 错误：\n 会原样显示为文本
+flowchart TD
+    A["normalizePort\n(detect-port)"]
+
+✅ 正确：使用 <br>
+flowchart TD
+    A["normalizePort<br>(detect-port)"]
+
+✅ 正确：使用 <br/>
+flowchart TD
+    A["normalizePort<br/>(detect-port)"]
+
+✅ 正确：源码中直接换行（标签必须用双引号）
+flowchart TD
+    A["normalizePort
+(detect-port)"]
+```
+
+#### 规则 7：⚠️ 避免过于复杂的嵌套结构
+
+多层 subgraph 嵌套、大量条件分支等复杂结构会增加渲染失败概率。保持图表简洁。
+
+### 生成前检查清单
+
+在生成 Mermaid 代码块前，逐项检查：
+
+- [ ] 图表类型是否在支持的 8 种之内？
+- [ ] 标签中是否存在花括号 `{}`？→ 移除或替换
+- [ ] 是否使用了 `par...and...end`？→ 改用 `Note over`
+- [ ] 方括号标签中是否有冒号？→ 加双引号
+- [ ] sequenceDiagram 参与者是否 ≤ 8？
+- [ ] sequenceDiagram alt 嵌套是否 ≤ 1 层？
+- [ ] 节点标签换行是否使用了 `\n`？→ 改用 `<br>` 或 `<br/>`
+- [ ] 整体复杂度是否可控？→ 考虑拆分
+
+> 详细的 8 种图表模板和更多正反示例见 `references/mermaid-spec.md`。
+
+---
+
+## 4. PlantUML 安全子集
+
+### 全局规则
+
+1. ✅ 使用 `@startuml` / `@enduml` 包裹（思维导图用 `@startmindmap` / `@endmindmap`）
+2. ❌ **不要使用行首缩进**（飞书画板将缩进行视为独立行）
+3. ❌ 避免 `skinparam`、`!define`、颜色、字体、对齐控制等样式指令
+4. ⚠️ 避免方向控制指令（`left to right direction` 等在部分场景不可靠）
+
+### 各图类型注意事项
+
+| 图类型 | 安全语法 | 禁忌 |
+|--------|---------|------|
+| 活动图 | `start/stop`、`:动作;`、`if/then/else/endif`、`repeat`、`fork` | ❌ 避免过深嵌套 |
+| 时序图 | `participant`、`->`/`-->`、`activate/deactivate`、`note`、`alt/opt/loop` | ❌ 避免样式指令 |
+| 类图 | `class`、`interface`、`package`、关系箭头 | ❌ **避免可见性标记（+ - # ~）** |
+| 用例图 | `actor`、`(用例)`、`<<include>>`/`<<extend>>` | ❌ 避免复杂布局 |
+| 组件图 | `[Component]`、`package/node/cloud/database` | ❌ 避免 ArchiMate sprite |
+| ER 图 | `entity`、关系箭头 | ⚠️ 与 Mermaid ER 语法不同 |
+| 思维导图 | `@startmindmap`、`* / +` 层级标记 | ✅ 必须用专用包裹标记 |
+
+### Mermaid vs PlantUML 选择策略
+
+| 场景 | 推荐 | 原因 |
+|------|------|------|
+| 流程图 | **Mermaid** | 飞书原生支持更好，成功率高 |
+| 时序图（简单） | **Mermaid** | 语法简洁 |
+| 时序图（复杂） | PlantUML | Mermaid 复杂度限制严格 |
+| 类图 | Mermaid | 两者都可，Mermaid 更简洁 |
+| ER 图 | Mermaid | 语法更直观 |
+| 状态图 | Mermaid | stateDiagram-v2 支持好 |
+| 甘特图 | **Mermaid** | PlantUML 甘特图飞书支持差 |
+| 饼图 | **Mermaid** | 简洁 |
+| 思维导图 | 两者均可 | PlantUML 层级标记更灵活 |
+| 用例图 | **PlantUML** | Mermaid 不支持 |
+| 组件图 | **PlantUML** | Mermaid 不支持 |
+| 活动图（复杂分支） | **PlantUML** | 支持更丰富的分支语法 |
+
+**默认推荐 Mermaid**，仅在 Mermaid 不支持的图类型或复杂场景下使用 PlantUML。
+
+---
+
+## 5. Markdown 语法全量参考
 
 ### 支持的语法与 Block 类型映射
 
@@ -32,10 +239,10 @@ allowed-tools: Read
 | `- [x]` / `- [ ]` | 17 | Todo | 任务列表 |
 | `` ```lang `` | 14 | Code | 代码块（支持语言标识） |
 | `> 引用` | 34 | QuoteContainer | 引用容器（导入使用 QuoteContainer） |
-| `> [!NOTE]` | 19 | Callout | 高亮块（6 种类型，见第 5 节） |
+| `> [!NOTE]` | 19 | Callout | 高亮块（6 种类型，见第 6 节） |
 | `---` | 22 | Divider | 分割线 |
-| Markdown 表格 | 31 | Table | 超过 9 行或 9 列自动拆分（见第 6 节） |
-| `![alt](url)` | 27 | Image | 占位块（见第 7 节） |
+| Markdown 表格 | 31 | Table | 超过 9 行或 9 列自动拆分（见第 7 节） |
+| `![alt](url)` | 27 | Image | 默认自动上传（见第 8 节） |
 | `` ```mermaid `` | 21→43 | Diagram→Board | 自动转飞书画板（见第 3 节） |
 | `` ```plantuml `` / `` ```puml `` | 21→43 | Diagram→Board | 自动转飞书画板（见第 4 节） |
 | `$$公式$$` | 16 | Equation | 块级公式（降级为行内 Equation） |
@@ -85,178 +292,20 @@ allowed-tools: Read
 
 ---
 
-## 3. Mermaid 飞书语法规范
-
-> 这是最重要的章节。Mermaid 图表导入飞书有严格的语法限制，不遵守会导致渲染失败。
-
-### 支持的 8 种图表类型
-
-| 类型 | 声明 | 飞书 diagram_type | 说明 |
-|------|------|------------------|------|
-| 流程图 | `flowchart TD` / `flowchart LR` | 6 (flowchart) | 支持 subgraph |
-| 时序图 | `sequenceDiagram` | 2 (sequence) | 复杂度限制最严格 |
-| 类图 | `classDiagram` | 4 (class) | |
-| 状态图 | `stateDiagram-v2` | 7 (state) | 必须用 v2 |
-| ER 图 | `erDiagram` | 5 (er) | |
-| 甘特图 | `gantt` | 0 (auto) | |
-| 饼图 | `pie` | 0 (auto) | |
-| 思维导图 | `mindmap` | 1 (mindmap) | |
-
-### 6 条强制性规则
-
-#### 规则 1：禁止在标签中使用花括号 `{}`
-
-花括号会被 Mermaid 解析器识别为菱形（decision）节点，导致语法错误。此规则针对 flowchart 节点标签，erDiagram/classDiagram 语法结构中的 `{}` 不受此限制。
-
-```markdown
-<!-- ❌ 错误 -->
-flowchart TD
-    A["{name: value}"]
-
-<!-- ✅ 正确 -->
-flowchart TD
-    A["name: value"]
-```
-
-**替代方案**：移除花括号，或用圆括号/方括号替代。
-
-#### 规则 2：禁止使用 `par...and...end` 并行语法
-
-飞书画板完全不支持 `par` 语法（错误码 2891001）。
-
-```markdown
-<!-- ❌ 错误 -->
-sequenceDiagram
-    par
-        A->>B: 请求1
-    and
-        A->>C: 请求2
-    end
-
-<!-- ✅ 正确：用 Note 替代 -->
-sequenceDiagram
-    Note over A,C: 并行处理
-    A->>B: 请求1
-    A->>C: 请求2
-```
-
-#### 规则 3：方括号中避免冒号
-
-方括号 `[text:xxx]` 中的冒号可能导致解析歧义。
-
-```markdown
-<!-- ❌ 可能出错 -->
-flowchart TD
-    A[类型:string]
-
-<!-- ✅ 正确 -->
-flowchart TD
-    A["类型: string"]
-```
-
-**修复方法**：给含冒号的标签加双引号。
-
-#### 规则 4：Note 作用域限制
-
-`Note over` 最多跨 2 个相邻 participant。
-
-```markdown
-<!-- ❌ 错误：跨太多参与者 -->
-sequenceDiagram
-    Note over A,D: 说明
-
-<!-- ✅ 正确 -->
-sequenceDiagram
-    Note over A,B: 说明
-```
-
-#### 规则 5：sequenceDiagram 复杂度阈值
-
-| 维度 | 安全阈值 | 超限风险 |
-|------|---------|---------|
-| participant 数量 | ≤ 8 | 超过 10 + 其他因素 → 失败 |
-| alt/opt 嵌套 | ≤ 1 层 | 超过 2 层 → 失败风险增大 |
-| 消息标签长度 | 简短（≤ 30 字符） | 长标签 + 多参与者 → 失败 |
-| 总消息数 | ≤ 30 | 需结合其他因素评估 |
-
-**超限组合**（实测必定失败）：10+ participant + 2+ alt + 30+ 长消息标签
-
-**建议**：超过安全阈值时，拆分为多个小图。
-
-#### 规则 6：避免过于复杂的嵌套结构
-
-多层 subgraph 嵌套、大量条件分支等复杂结构会增加渲染失败概率。保持图表简洁。
-
-### 生成前检查清单
-
-在生成 Mermaid 代码块前，逐项检查：
-
-- [ ] 图表类型是否在支持的 8 种之内？
-- [ ] 标签中是否存在花括号 `{}`？→ 移除或替换
-- [ ] 是否使用了 `par...and...end`？→ 改用 `Note over`
-- [ ] 方括号标签中是否有冒号？→ 加双引号
-- [ ] sequenceDiagram 参与者是否 ≤ 8？
-- [ ] sequenceDiagram alt 嵌套是否 ≤ 1 层？
-- [ ] 整体复杂度是否可控？→ 考虑拆分
-
-> 详细的 8 种图表模板和更多正反示例见 `references/mermaid-spec.md`。
-
----
-
-## 4. PlantUML 安全子集
-
-### 全局规则
-
-1. 使用 `@startuml` / `@enduml` 包裹（思维导图用 `@startmindmap` / `@endmindmap`）
-2. **不要使用行首缩进**（飞书画板将缩进行视为独立行）
-3. 避免 `skinparam`、`!define`、颜色、字体、对齐控制等样式指令
-4. 避免方向控制指令（`left to right direction` 等在部分场景不可靠）
-
-### 各图类型注意事项
-
-| 图类型 | 安全语法 | 禁忌 |
-|--------|---------|------|
-| 活动图 | `start/stop`、`:动作;`、`if/then/else/endif`、`repeat`、`fork` | 避免过深嵌套 |
-| 时序图 | `participant`、`->`/`-->`、`activate/deactivate`、`note`、`alt/opt/loop` | 避免样式指令 |
-| 类图 | `class`、`interface`、`package`、关系箭头 | **避免可见性标记（+ - # ~）** |
-| 用例图 | `actor`、`(用例)`、`<<include>>`/`<<extend>>` | 避免复杂布局 |
-| 组件图 | `[Component]`、`package/node/cloud/database` | 避免 ArchiMate sprite |
-| ER 图 | `entity`、关系箭头 | 与 Mermaid ER 语法不同 |
-| 思维导图 | `@startmindmap`、`* / +` 层级标记 | 必须用专用包裹标记 |
-
-### Mermaid vs PlantUML 选择策略
-
-| 场景 | 推荐 | 原因 |
-|------|------|------|
-| 流程图 | **Mermaid** | 飞书原生支持更好，成功率高 |
-| 时序图（简单） | **Mermaid** | 语法简洁 |
-| 时序图（复杂） | PlantUML | Mermaid 复杂度限制严格 |
-| 类图 | Mermaid | 两者都可，Mermaid 更简洁 |
-| ER 图 | Mermaid | 语法更直观 |
-| 状态图 | Mermaid | stateDiagram-v2 支持好 |
-| 甘特图 | **Mermaid** | PlantUML 甘特图飞书支持差 |
-| 饼图 | **Mermaid** | 简洁 |
-| 思维导图 | 两者均可 | PlantUML 层级标记更灵活 |
-| 用例图 | **PlantUML** | Mermaid 不支持 |
-| 组件图 | **PlantUML** | Mermaid 不支持 |
-| 活动图（复杂分支） | **PlantUML** | 支持更丰富的分支语法 |
-
-**默认推荐 Mermaid**，仅在 Mermaid 不支持的图类型或复杂场景下使用 PlantUML。
-
----
-
-## 5. Callout 高亮块
+## 6. Callout 高亮块
 
 ### 6 种类型与背景色映射
 
 | 类型 | bgColor | 颜色 | Markdown 语法 | 适用场景 |
 |------|---------|------|--------------|---------|
-| NOTE / INFO | 6 | 蓝色 | `> [!NOTE]` | 补充说明、提示信息 |
+| NOTE | 6 | 蓝色 | `> [!NOTE]` | 补充说明、提示信息 |
 | WARNING | 2 | 红色 | `> [!WARNING]` | 警告、危险提醒 |
 | TIP | 4 | 黄色 | `> [!TIP]` | 技巧、建议 |
 | CAUTION | 3 | 橙色 | `> [!CAUTION]` | 注意事项 |
 | IMPORTANT | 7 | 紫色 | `> [!IMPORTANT]` | 重要信息 |
 | SUCCESS | 5 | 绿色 | `> [!SUCCESS]` | 成功、通过 |
+
+> ⚠️ `INFO` 与 `NOTE` 等效（都映射为 bgColor=6 蓝色），统一使用 `NOTE`。
 
 ### 使用示例
 
@@ -282,13 +331,13 @@ sequenceDiagram
 
 ### 注意事项
 
-- Callout 块不能同时设置 `EmojiId`，仅通过 `BackgroundColor` 区分类型
-- 支持 Callout 内包含子块（段落、列表等）
-- `INFO` 和 `NOTE` 等效，都映射为蓝色 (bgColor=6)
+- ❌ Callout 块不能同时设置 `EmojiId`，仅通过 `BackgroundColor` 区分类型
+- ✅ 支持 Callout 内包含子块（段落、列表等）
+- ✅ 统一使用 `NOTE` 而非 `INFO`（两者等效，`NOTE` 是 Markdown 标准写法）
 
 ---
 
-## 6. 表格规范
+## 7. 表格规范
 
 ### 9 行 × 9 列限制与自动拆分
 
@@ -298,7 +347,7 @@ sequenceDiagram
 
 | 维度 | 处理方式 |
 |------|---------|
-| ≤ 9 行 且 ≤ 9 列 | 直接创建单个表格 |
+| ≤ 9 行 且 ≤ 9 列 | ✅ 直接创建单个表格 |
 | > 9 行 | 按行拆分为多个表格，每个最多 8 行数据 + 1 行表头 |
 | > 9 列 | 按列拆分为多个表格，保留首列作为标识列 |
 | > 9 行 且 > 9 列 | 先列拆分，再行拆分（复合拆分） |
@@ -326,7 +375,7 @@ sequenceDiagram
 - Bullet（无序列表）
 - Heading（标题）
 
-**注意**：飞书 API 创建表格时会自动在每个单元格内创建空的 Text 块。填充内容时应 **更新现有块** 而非创建新块。
+⚠️ **注意**：飞书 API 创建表格时会自动在每个单元格内创建空的 Text 块。填充内容时应 **更新现有块** 而非创建新块。
 
 ### 表格编写建议
 
@@ -336,31 +385,33 @@ sequenceDiagram
 | 数据 | 数据 | 数据 |
 ```
 
-- 确保每行列数一致
-- 大表格（超过 8 行数据或超过 9 列）会自动拆分，无需手动处理
-- 列宽由内容自动决定，无需手动控制
+- ✅ 确保每行列数一致
+- ✅ 大表格（超过 8 行数据或超过 9 列）会自动拆分，无需手动处理
+- ✅ 列宽由内容自动决定，无需手动控制
 
 ---
 
-## 7. 图片处理
+## 8. 图片处理
 
-### 当前限制
+### 图片上传（v1.8.0+）
 
-飞书 DocX Open API **不支持通过 API 插入实际图片内容**。`feishu-cli` 的处理方式：
+`feishu-cli` 默认通过 `--upload-images` 自动上传图片：
 
-1. 遇到 `![alt](url)` 时，创建一个空的 **Image 占位块**（BlockType=27）
-2. 导入完成后，报告中显示 **跳过的图片数量**
-3. 用户需要在飞书文档中手动替换图片
+1. 遇到 `![alt](url)` 时，自动下载网络图片或读取本地图片
+2. 通过素材上传 API 上传到飞书，获取 file_token
+3. 创建 Image 块并引用 file_token，实现图片插入
+4. 上传失败时降级为占位块，导入报告显示失败数量
 
-### 建议
+### 注意事项
 
-- 如果文档中有大量图片，考虑在导入后手动上传
-- 可以使用 `feishu-cli media upload` 上传素材到飞书，获取文件 token
-- 图片相关的 alt 文字会作为占位信息保留
+- ✅ 默认开启图片上传，使用 `--no-upload-images` 可关闭（创建占位块）
+- ⚠️ 图片并发上传数通过 `--image-workers` 控制（默认 2，API 限制 5 QPS）
+- ✅ 支持本地图片路径和网络 URL（HTTP/HTTPS）
+- ✅ 图片相关的 alt 文字会作为占位信息保留
 
 ---
 
-## 8. 公式
+## 9. 公式支持
 
 ### 行内公式
 
@@ -384,13 +435,13 @@ $$
 
 ### 注意事项
 
-- 飞书 API 不支持直接创建块级 Equation（BlockType=16），实际导入时 **降级为行内 Equation**
-- LaTeX 语法兼容飞书 KaTeX 渲染器
-- 公式中的特殊字符无需额外转义
+- ⚠️ 飞书 API 不支持直接创建块级 Equation（BlockType=16），实际导入时 **降级为行内 Equation**
+- ✅ LaTeX 语法兼容飞书 KaTeX 渲染器
+- ✅ 公式中的特殊字符无需额外转义
 
 ---
 
-## 9. API 限制与容错
+## 10. API 限制与容错
 
 ### 三阶段并发管道
 
@@ -418,10 +469,10 @@ $$
 
 | 错误类型 | 判断条件 | 处理方式 |
 |---------|---------|---------|
-| 语法错误 | `Parse error`、`Invalid request parameter` | **不重试**，直接降级为代码块 |
-| 服务端错误 | 500/502/503、`internal error` | 重试（最多 10 次，1s 间隔） |
-| 频率限制 | 429、`rate limit`、`frequency limit` | 重试（归为可重试错误） |
-| 重试耗尽 | 超过最大重试次数 | 降级为代码块 |
+| 语法错误 | `Parse error`、`Invalid request parameter` | ❌ **不重试**，直接降级为代码块 |
+| 服务端错误 | 500/502/503、`internal error` | ✅ 重试（最多 10 次，1s 间隔） |
+| 频率限制 | 429、`rate limit`、`frequency limit` | ✅ 重试（归为可重试错误） |
+| 重试耗尽 | 超过最大重试次数 | ⚠️ 降级为代码块 |
 
 降级处理流程：
 1. 获取文档所有顶层子块
@@ -446,7 +497,7 @@ $$
 
 ---
 
-## 10. 最佳实践检查清单
+## 11. 完整预创建检查清单
 
 创建将导入飞书的 Markdown 文档前，完成以下检查：
 
@@ -460,24 +511,25 @@ $$
 ### Mermaid 图表
 
 - [ ] 图表类型在支持的 8 种之内
-- [ ] 标签无花括号 `{}`
-- [ ] 未使用 `par...and...end`
-- [ ] 方括号标签内含冒号时已加双引号
-- [ ] sequenceDiagram：participant ≤ 8，alt ≤ 1 层
+- [ ] ❌ 标签无花括号 `{}`
+- [ ] ❌ 未使用 `par...and...end`
+- [ ] ✅ 方括号标签内含冒号时已加双引号
+- [ ] ⚠️ sequenceDiagram：participant ≤ 8，alt ≤ 1 层
+- [ ] ❌ 节点标签换行未使用 `\n`，已改用 `<br>` 或 `<br/>`
 - [ ] 复杂图表已拆分为多个小图
 
 ### PlantUML 图表
 
-- [ ] 使用正确的包裹标记（`@startuml`/`@enduml`）
-- [ ] 无行首缩进
-- [ ] 无 `skinparam` 等样式指令
-- [ ] 类图未使用可见性标记（`+ - # ~`）
+- [ ] ✅ 使用正确的包裹标记（`@startuml`/`@enduml`）
+- [ ] ❌ 无行首缩进
+- [ ] ❌ 无 `skinparam` 等样式指令
+- [ ] ❌ 类图未使用可见性标记（`+ - # ~`）
 
 ### 特殊内容
 
-- [ ] 图片已标注（导入后需手动替换）
-- [ ] 公式语法正确（`$...$` 行内 / `$$...$$` 块级）
-- [ ] Callout 类型在 6 种之内（NOTE/WARNING/TIP/CAUTION/IMPORTANT/SUCCESS）
+- [ ] ✅ 图片路径正确（默认自动上传，失败降级为占位块）
+- [ ] ✅ 公式语法正确（`$...$` 行内 / `$$...$$` 块级）
+- [ ] ✅ Callout 类型在 6 种之内（NOTE/WARNING/TIP/CAUTION/IMPORTANT/SUCCESS）
 
 ### 性能考虑
 

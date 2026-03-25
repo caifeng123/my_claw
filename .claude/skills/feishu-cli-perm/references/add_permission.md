@@ -1,69 +1,40 @@
-# feishu-cli perm add 参考
+# perm add 输入检查清单
 
-## 命令概要
+执行 `perm add` 前，逐项确认以下内容：
 
-```bash
-feishu-cli perm add <TOKEN> \
-  --doc-type <DOC_TYPE> \
-  --member-type <MEMBER_TYPE> \
-  --member-id <MEMBER_ID> \
-  --perm <PERM> \
-  [--notification]
-```
+## 1. TOKEN 与 doc-type 匹配
 
-## 参数枚举
+| Token 前缀 | 应使用的 doc-type |
+|------------|------------------|
+| `docx_` | docx |
+| `doccn` | doc |
+| `sht_` | sheet |
+| `bascn` | bitable |
+| `wikicn` | wiki |
+| `fldcn` | folder |
 
-### doc-type（云文档类型）
+如果 Token 无前缀或前缀不明确，需用户手动确认文档类型。
 
-- doc、sheet、file、wiki、bitable、docx、folder、mindnote、minutes、slides
+## 2. member-type 与 member-id 一致
 
-### member-type（协作者 ID 类型）
+| member-type | member-id 格式 |
+|-------------|---------------|
+| email | user@example.com |
+| openid | `ou_` 前缀 |
+| userid | 纯数字或自定义 ID |
+| unionid | `on_` 前缀 |
+| openchat | `oc_` 前缀 |
+| opendepartmentid | `od_` 前缀 |
+| groupid | `gc_` 前缀 |
+| wikispaceid | `ws_` 前缀 |
 
-- email、openid、unionid、openchat、opendepartmentid、userid、groupid、wikispaceid
+## 3. 是否需要通知对方
 
-### perm（权限角色）
+- 添加 `--notification` 会向被授权者发送飞书通知
+- 批量添加时建议开启，单个添加可按需选择
 
-- view、edit、full_access
+## 4. 权限级别选择
 
-### notification
-
-- 添加权限后是否通知对方，传入即生效
-
-## 输入检查清单
-
-- TOKEN 与 doc-type 是否匹配（例如 docx_xxx 用 docx）
-- member-type 与 member-id 是否一致（例如 openid + ou_xxx）
-- 是否需要通知对方（--notification）
-
-## 示例
-
-**按 email 添加用户为可编辑协作者：**
-
-```bash
-feishu-cli perm add docx_xxxxxx \
-  --doc-type docx \
-  --member-type email \
-  --member-id user@example.com \
-  --perm edit
-```
-
-**按部门 ID 添加查看权限：**
-
-```bash
-feishu-cli perm add sht_xxxxxx \
-  --doc-type sheet \
-  --member-type opendepartmentid \
-  --member-id od_xxxxxx \
-  --perm view
-```
-
-**给群聊添加编辑权限并通知：**
-
-```bash
-feishu-cli perm add docx_xxxxxx \
-  --doc-type docx \
-  --member-type openchat \
-  --member-id oc_xxxxxx \
-  --perm edit \
-  --notification
-```
+- `view`：只读分享（外部人员、大范围分享）
+- `edit`：日常协作（团队成员）
+- `full_access`：管理员（需要管理协作者或文档设置的场景）
