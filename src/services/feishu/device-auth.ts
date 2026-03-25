@@ -3,13 +3,10 @@
  *
  * 用于获取用户身份的 access_token，使飞书 API 调用以用户身份执行。
  * 流程：设备码授权 → 用户扫码/访问链接授权 → 获取 user_access_token → 自动刷新
- *
- * Token 持久化格式兼容 feishu-cli 的 ~/.feishu-cli/token.json
  */
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
-import { dirname, join } from 'path';
-import { homedir } from 'os';
+import { dirname, join, resolve } from 'path';
 import { getAllScopes } from '../../config/feishu-scopes.js';
 
 // ========== 类型定义 ==========
@@ -31,10 +28,9 @@ export interface DeviceAuthResponse {
 }
 
 /**
- * 内部 token 数据结构（运行时使用）
+ * Token 数据结构
  *
- * 关键：使用绝对时间戳 expires_at_ms / refresh_expires_at_ms 判断过期，
- * 避免 obtained_at + expires_in 反推带来的精度问题。
+ * 使用绝对时间戳 expires_at_ms / refresh_expires_at_ms 判断过期。
  */
 export interface TokenData {
   access_token: string;
@@ -48,10 +44,9 @@ export interface TokenData {
 }
 
 /**
- * feishu-cli 兼容的 token.json 文件格式
- * 使用 ISO 8601 时间字符串表示过期时间
+ * token.json 持久化文件格式（使用 ISO 8601 时间字符串）
  */
-interface CliTokenFile {
+interface TokenFile {
   access_token: string;
   refresh_token: string;
   token_type: string;
@@ -64,7 +59,7 @@ export interface DeviceAuthClientConfig {
   appId: string;
   appSecret: string;
   platform?: Platform;
-  /** token 持久化文件路径，默认 ~/.feishu-cli/token.json */
+  /** token 持久化文件路径，默认 data/temp/feishu-user-token.json */
   tokenFilePath?: string;
   /** access_token 提前刷新的缓冲时间(秒)，默认 300 (5分钟) */
   refreshBufferSeconds?: number;
@@ -83,8 +78,8 @@ const PLATFORM_CONFIG: Record<Platform, PlatformUrls> = {
   },
 };
 
-/** 默认 token 文件路径: ~/.feishu-cli/token.json */
-const DEFAULT_TOKEN_PATH = join(homedir(), '.feishu-cli', 'token.json');
+/** 默认 token 文件路径 */
+const DEFAULT_TOKEN_PATH = resolve(process.cwd(), 'data', 'temp', 'feishu-user-token.json');
 
 /** refresh_token 默认有效期 30 天 (秒) */
 const DEFAULT_REFRESH_EXPIRES_IN = 30 * 24 * 3600;
@@ -133,10 +128,10 @@ export class DeviceAuthClient {
     return getAllScopes();
   }
 
-  // ==================== Token 持久化（兼容 feishu-cli 格式） ====================
+  // ==================== Token 持久化 ====================
 
   /**
-   * 从 feishu-cli 格式的 token.json 加载
+   * 从 token.json 加载
    */
   private loadTokenFromFile(): void {
     try {
@@ -145,42 +140,9 @@ export class DeviceAuthClient {
       const raw = readFileSync(this.tokenFilePath, 'utf-8');
       const data = JSON.parse(raw);
 
-      // 兼容 feishu-cli 格式（有 expires_at 字段）
-      if (data.expires_at) {
-        this.cachedToken = this.fromCliFormat(data as CliTokenFile);
+      if (data.expires_at && data.access_token) {
+        this.cachedToken = this.fromFileFormat(data as TokenFile);
         this.requestedScope = this.getEffectiveScope([data.scope]);
-      }
-      // 兼容旧格式（有 obtained_at 字段，迁移到绝对时间）
-      else if (data.obtained_at && data.expires_in) {
-        this.cachedToken = {
-          access_token: data.access_token,
-          token_type: data.token_type ?? 'Bearer',
-          expires_at_ms: data.obtained_at + data.expires_in * 1000,
-          refresh_expires_at_ms: data.refresh_token
-            ? data.obtained_at + DEFAULT_REFRESH_EXPIRES_IN * 1000
-            : data.obtained_at + data.expires_in * 1000,
-          refresh_token: data.refresh_token,
-          scope: this.getEffectiveScope([data.scope]),
-        };
-        this.requestedScope = this.cachedToken.scope!;
-        // 立即以新格式回写（同时补全 scope）
-        this.saveTokenToFile(this.cachedToken);
-      }
-      // 只有 access_token 的简单格式
-      else if (data.access_token) {
-        const now = Date.now();
-        const expiresIn = data.expires_in ?? 7200;
-        this.cachedToken = {
-          access_token: data.access_token,
-          token_type: data.token_type ?? 'Bearer',
-          expires_at_ms: now + expiresIn * 1000,
-          refresh_expires_at_ms: data.refresh_token
-            ? now + DEFAULT_REFRESH_EXPIRES_IN * 1000
-            : now + expiresIn * 1000,
-          refresh_token: data.refresh_token,
-          scope: this.getEffectiveScope([data.scope]),
-        };
-        this.requestedScope = this.cachedToken.scope!;
       } else {
         return;
       }
@@ -193,7 +155,7 @@ export class DeviceAuthClient {
   }
 
   /**
-   * 以 feishu-cli 兼容格式写入 token.json
+   * 写入 token.json
    */
   private saveTokenToFile(token: TokenData): void {
     try {
@@ -202,8 +164,8 @@ export class DeviceAuthClient {
         mkdirSync(dir, { recursive: true });
       }
 
-      const cliFormat = this.toCliFormat(token);
-      writeFileSync(this.tokenFilePath, JSON.stringify(cliFormat, null, 2), 'utf-8');
+      const fileFormat = this.toFileFormat(token);
+      writeFileSync(this.tokenFilePath, JSON.stringify(fileFormat, null, 2), 'utf-8');
       console.log(`[DeviceAuth] token 已保存到 ${this.tokenFilePath}`);
     } catch (err) {
       console.warn('[DeviceAuth] 保存 token 文件失败:', err);
@@ -211,37 +173,34 @@ export class DeviceAuthClient {
   }
 
   /**
-   * feishu-cli 格式 → 内部格式
-   *
-   * 直接使用 expires_at / refresh_expires_at 的绝对时间，不反推 obtained_at。
+   * 文件格式 → 内部格式
    */
-  private fromCliFormat(cli: CliTokenFile): TokenData {
-    const expiresAtMs = new Date(cli.expires_at).getTime();
+  private fromFileFormat(file: TokenFile): TokenData {
+    const expiresAtMs = new Date(file.expires_at).getTime();
 
-    // 有 refresh_token 时用文件里的 refresh_expires_at；没有则 = expires_at
     let refreshExpiresAtMs: number;
-    if (cli.refresh_token) {
-      refreshExpiresAtMs = cli.refresh_expires_at
-        ? new Date(cli.refresh_expires_at).getTime()
+    if (file.refresh_token) {
+      refreshExpiresAtMs = file.refresh_expires_at
+        ? new Date(file.refresh_expires_at).getTime()
         : Date.now() + DEFAULT_REFRESH_EXPIRES_IN * 1000;
     } else {
       refreshExpiresAtMs = expiresAtMs;
     }
 
     return {
-      access_token: cli.access_token,
-      token_type: cli.token_type ?? 'Bearer',
+      access_token: file.access_token,
+      token_type: file.token_type ?? 'Bearer',
       expires_at_ms: expiresAtMs,
       refresh_expires_at_ms: refreshExpiresAtMs,
-      refresh_token: cli.refresh_token || undefined,
-      scope: this.getEffectiveScope([cli.scope]),
+      refresh_token: file.refresh_token || undefined,
+      scope: this.getEffectiveScope([file.scope]),
     };
   }
 
   /**
-   * 内部格式 → feishu-cli 格式
+   * 内部格式 → 文件格式
    */
-  private toCliFormat(token: TokenData): CliTokenFile {
+  private toFileFormat(token: TokenData): TokenFile {
     return {
       access_token: token.access_token,
       refresh_token: token.refresh_token ?? '',
@@ -479,9 +438,8 @@ export class DeviceAuthClient {
     } catch {}
   }
 
-
   /**
-   * 获取当前 token 状态摘要（供心跳日志等使用）
+   * 获取当前 token 状态摘要
    */
   getTokenStatus(): {
     hasToken: boolean;
@@ -507,6 +465,7 @@ export class DeviceAuthClient {
       refreshExpiresAt: new Date(this.cachedToken.refresh_expires_at_ms).toISOString(),
     };
   }
+
   // ==================== 辅助方法 ====================
 
   private sleep(ms: number): Promise<void> {

@@ -17,9 +17,9 @@ allowed-tools: Bash, Read
 ## 前置条件
 
 - **feishu-cli**：如尚未安装，请前往 [riba2534/feishu-cli](https://github.com/riba2534/feishu-cli) 获取安装方式
-- 需要已配置飞书应用凭证（`FEISHU_APP_ID` / `FEISHU_APP_SECRET`），通过环境变量或 `~/.feishu-cli/config.yaml` 设置
+- 需要已配置飞书应用凭证（`FEISHU_APP_ID` / `FEISHU_APP_SECRET`），通过环境变量或 `.env` 设置
 - App 权限：需要 `docx:document` 或 `docx:document:readonly`（文档导出）、`wiki:wiki:readonly`（知识库导出）
-- User Token 权限：若 App 无权访问他人文档，需通过 `feishu-cli auth login --scopes "docx:document:readonly offline_access"` 授权，`doc export` 会自动读取保存的 User Token
+- User Token 权限：若 App 无权访问他人文档，使用 `pnpm feishu doc export` 执行（自动注入 User Token）。报权限错误时使用 **feishu-auth** 技能授权后重试
 - 使用 `--expand-mentions` 展开 @用户时，还需 `contact:user.base:readonly` 权限
 
 ## 核心概念
@@ -50,12 +50,12 @@ allowed-tools: Bash, Read
 
    **普通文档**:
    ```bash
-   feishu-cli doc export <document_id> --output <output_path>
+   pnpm feishu doc export <document_id> --output <output_path>
    ```
 
    **知识库文档**:
    ```bash
-   feishu-cli wiki export <node_token> --output <output_path>
+   pnpm feishu wiki export <node_token> --output <output_path>
    ```
 
 3. **验证结果**
@@ -73,7 +73,7 @@ allowed-tools: Bash, Read
 | --front-matter | 添加 YAML front matter（标题和文档 ID） | 否 |
 | --highlight | 保留文本颜色和背景色（输出为 HTML `<span>` 标签） | 否 |
 | --expand-mentions | 展开 @用户为友好格式（需要 contact:user.base:readonly 权限） | 是（默认开启） |
-| --user-access-token | User Access Token（用于访问无 App 权限的文档，未指定时自动从 `auth login` 读取） | 自动读取 |
+| --user-access-token | User Access Token（使用 `pnpm feishu` 时自动注入，无需手动填写） | 自动读取 |
 
 ## 支持的 URL 格式
 
@@ -148,13 +148,13 @@ document_id: ABC123def456
 
 ```bash
 # 普通文档
-feishu-cli doc export <document_id> \
+pnpm feishu doc export <document_id> \
   --output /tmp/doc.md \
   --download-images \
   --assets-dir /tmp/doc_assets
 
 # 知识库文档
-feishu-cli wiki export <node_token> \
+pnpm feishu wiki export <node_token> \
   --output /tmp/wiki.md \
   --download-images \
   --assets-dir /tmp/wiki_assets
@@ -184,8 +184,8 @@ ls -la /tmp/doc_assets/
 
 | 错误 | 原因 | 解决 |
 |------|------|------|
-| `code=1770032, msg=forBidden` | App Token 无权限访问该文档 | 通过 `auth login --scopes "docx:document:readonly offline_access"` 授权 User Token，`doc export` 会自动读取 |
-| `code=99991679, msg=Unauthorized` | User Token 缺少 `docx:document:readonly` scope | 重新执行 `feishu-cli auth login --scopes "docx:document:readonly offline_access"` |
+| `code=1770032, msg=forBidden` | App Token 无权限访问该文档 | 使用 **feishu-auth** 技能授权后重试 |
+| `code=99991679, msg=Unauthorized` | User Token 缺少 `docx:document:readonly` scope | 使用 **feishu-auth** 技能授权后重试 |
 | `code=131002, param err` | 参数错误 | 检查 token 格式 |
 | `code=131001, node not found` | 节点不存在 | 检查 token 是否正确 |
 | `code=131003, no permission` | 无权限访问 | 确认应用有 docx:document 或 wiki:wiki:readonly 权限 |
@@ -220,10 +220,10 @@ ls -la /tmp/doc_assets/
 
 ```bash
 # 添加 --debug 查看详细错误信息
-feishu-cli doc export <doc_id> --debug
+pnpm feishu doc export <doc_id> --debug
 
 # 等待几秒后重试
-sleep 5 && feishu-cli doc export <doc_id>
+sleep 5 && pnpm feishu doc export <doc_id>
 ```
 
 ## 已知问题
@@ -278,7 +278,7 @@ sleep 5 && feishu-cli doc export <doc_id>
 
 ```bash
 # 一条命令完成全部流程（内部自动创建任务→轮询→下载）
-feishu-cli doc export-file <doc_token> --type pdf -o output.pdf
+pnpm feishu doc export-file <doc_token> --type pdf -o output.pdf
 ```
 
 ### 支持的导出格式
@@ -301,13 +301,11 @@ feishu-cli doc export-file <doc_token> --type pdf -o output.pdf
 
 ```bash
 # 导出为 PDF
-feishu-cli doc export-file JKbxdRez1oNWEKxPz14cWMpBnKh --type pdf -o /tmp/report.pdf
+pnpm feishu doc export-file JKbxdRez1oNWEKxPz14cWMpBnKh --type pdf -o /tmp/report.pdf
 
 # 导出为 Word
-feishu-cli doc export-file JKbxdRez1oNWEKxPz14cWMpBnKh --type docx -o /tmp/report.docx
+pnpm feishu doc export-file JKbxdRez1oNWEKxPz14cWMpBnKh --type docx -o /tmp/report.docx
 
-# 使用 User Token 导出（无 App 权限的文档）
-feishu-cli doc export-file JKbxdRez1oNWEKxPz14cWMpBnKh --type pdf -o /tmp/report.pdf --user-access-token u-xxx
 ```
 
 ---
@@ -320,7 +318,7 @@ feishu-cli doc export-file JKbxdRez1oNWEKxPz14cWMpBnKh --type pdf -o /tmp/report
 
 ```bash
 # 一条命令完成全部流程（内部自动上传→创建任务→轮询）
-feishu-cli doc import-file local_file.docx --type docx --name "文档名称"
+pnpm feishu doc import-file local_file.docx --type docx --name "文档名称"
 ```
 
 ### 支持的导入格式
@@ -342,7 +340,7 @@ feishu-cli doc import-file local_file.docx --type docx --name "文档名称"
 
 ```bash
 # 导入 Word 文档（必须指定 --folder）
-feishu-cli doc import-file ~/Documents/report.docx --type docx --name "季度报告" --folder fldcnXXX
+pnpm feishu doc import-file ~/Documents/report.docx --type docx --name "季度报告" --folder fldcnXXX
 ```
 
 ---

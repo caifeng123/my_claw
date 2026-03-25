@@ -15,7 +15,11 @@
     "memory:list": "tsx scripts/memory-cli.ts list",
     "memory:search": "tsx scripts/memory-cli.ts search",
     "memory:stats": "tsx scripts/memory-cli.ts stats",
-    "memory:dump": "tsx scripts/memory-cli.ts dump"
+    "memory:dump": "tsx scripts/memory-cli.ts dump",
+    "auth:check": "tsx scripts/device-auth-login.ts check",
+    "auth:login": "tsx scripts/device-auth-login.ts",
+    "auth:login:force": "tsx scripts/device-auth-login.ts --force",
+    "feishu": "./scripts/feishu-cli-wrapper.sh"
   },
   "devDependencies": {
     "tsx": "^4.21.0",

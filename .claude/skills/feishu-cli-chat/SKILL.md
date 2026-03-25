@@ -26,13 +26,7 @@ allowed-tools: Bash, Read, Write
 
 - **feishu-cli**：如尚未安装，请前往 [riba2534/feishu-cli](https://github.com/riba2534/feishu-cli) 获取安装方式
 
-本技能的核心命令**必须使用 User Token**，使用前需先登录。`chat create`、`chat link`、`msg read-users` 使用 App Token，属于 feishu-cli-toolkit 技能。
-
-```bash
-feishu-cli auth login
-```
-
-未登录时命令会直接报错并提示登录方式。登录后 token 自动加载，无需手动传参。
+本技能的核心命令**必须使用 User Token**，通过 `pnpm feishu` 执行（自动注入 Token）。`chat create`、`chat link`、`msg read-users` 使用 App Token，属于 feishu-cli-toolkit 技能。
 
 ### 身份说明
 
@@ -67,7 +61,7 @@ list API 返回空 + has_more=true → 自动切换到搜索模式 → 逐条获
 如果用户给了群名而不是 chat_id，先搜索：
 
 ```bash
-feishu-cli msg search-chats --query "群名关键词" -o json
+pnpm feishu msg search-chats --query "群名关键词" -o json
 ```
 
 输出中的 `chat_id`（形如 `oc_xxx`）就是后续命令需要的标识。
@@ -76,7 +70,7 @@ feishu-cli msg search-chats --query "群名关键词" -o json
 
 ```bash
 # 获取最近 50 条消息（API 单次上限 50）
-feishu-cli msg history \
+pnpm feishu msg history \
   --container-id oc_xxx \
   --container-id-type chat \
   --page-size 50 \
@@ -84,7 +78,7 @@ feishu-cli msg history \
   -o json
 
 # 按时间范围获取（--start-time 为毫秒级时间戳，仅返回该时间之后的消息）
-feishu-cli msg history \
+pnpm feishu msg history \
   --container-id oc_xxx \
   --container-id-type chat \
   --page-size 50 \
@@ -93,7 +87,7 @@ feishu-cli msg history \
   -o json
 
 # 获取更早的消息（使用上一次返回的 page_token 翻页）
-feishu-cli msg history \
+pnpm feishu msg history \
   --container-id oc_xxx \
   --container-id-type chat \
   --page-size 50 \
@@ -138,7 +132,7 @@ feishu-cli msg history \
 
 ```bash
 # 获取单个话题的所有回复（按时间正序，方便阅读）
-feishu-cli msg history \
+pnpm feishu msg history \
   --container-id omt_xxx \
   --container-id-type thread \
   --page-size 50 \
@@ -150,7 +144,7 @@ feishu-cli msg history \
 
 ```bash
 # 1. 获取主消息流（每个话题的首条消息）
-feishu-cli msg history \
+pnpm feishu msg history \
   --container-id oc_xxx \
   --container-id-type chat \
   --page-size 50 \
@@ -160,8 +154,8 @@ feishu-cli msg history \
 # 2. 从返回结果中提取所有 thread_id
 
 # 3. 对每个 thread_id 获取回复（可并发执行，提高效率）
-feishu-cli msg history --container-id omt_xxx --container-id-type thread --page-size 50 --sort-type ByCreateTimeAsc -o json
-feishu-cli msg history --container-id omt_yyy --container-id-type thread --page-size 50 --sort-type ByCreateTimeAsc -o json
+pnpm feishu msg history --container-id omt_xxx --container-id-type thread --page-size 50 --sort-type ByCreateTimeAsc -o json
+pnpm feishu msg history --container-id omt_yyy --container-id-type thread --page-size 50 --sort-type ByCreateTimeAsc -o json
 # ... 多个话题可并行获取
 ```
 
@@ -193,10 +187,10 @@ text = content.get('text', '')
 
 ```bash
 # 1. 搜索群聊
-feishu-cli msg search-chats --query "Go讨论区" -o json
+pnpm feishu msg search-chats --query "Go讨论区" -o json
 
 # 2. 获取消息（循环翻页直到够数）
-feishu-cli msg history \
+pnpm feishu msg history \
   --container-id oc_xxx \
   --container-id-type chat \
   --page-size 50 \
@@ -219,18 +213,18 @@ feishu-cli msg history \
 
 ```bash
 # 搜索私聊消息
-feishu-cli search messages "关键词" \
+pnpm feishu search messages "关键词" \
   --chat-type p2p_chat \
   -o json
 
 # 如果知道对方的 open_id，可以按发送者筛选
-feishu-cli search messages "关键词" \
+pnpm feishu search messages "关键词" \
   --chat-type p2p_chat \
   --from-ids ou_xxx \
   -o json
 
 # 获取单条消息详情
-feishu-cli msg get om_xxx -o json
+pnpm feishu msg get om_xxx -o json
 ```
 
 ### 查找用户 ID
@@ -239,10 +233,10 @@ feishu-cli msg get om_xxx -o json
 
 ```bash
 # 通过邮箱查找用户
-feishu-cli user search --email user@example.com -o json
+pnpm feishu user search --email user@example.com -o json
 
 # 通过手机号查找用户
-feishu-cli user search --mobile 13800138000 -o json
+pnpm feishu user search --mobile 13800138000 -o json
 ```
 
 > **注意**：`user search` 仅支持 `--email` 和 `--mobile` 精确查找，不支持按姓名模糊搜索。
@@ -262,17 +256,17 @@ feishu-cli user search --mobile 13800138000 -o json
 
 ```bash
 # 按关键词搜索群聊
-feishu-cli msg search-chats --query "关键词" -o json
+pnpm feishu msg search-chats --query "关键词" -o json
 
 # 分页获取所有群
-feishu-cli msg search-chats --page-size 100 -o json
+pnpm feishu msg search-chats --page-size 100 -o json
 ```
 
 ### 在群内搜索消息
 
 ```bash
 # 在指定群中搜索消息
-feishu-cli search messages "关键词" --chat-ids oc_xxx -o json
+pnpm feishu search messages "关键词" --chat-ids oc_xxx -o json
 ```
 
 > **更多搜索功能**（按时间范围、消息类型、发送者、跨模块搜索文档/应用等）请使用 **feishu-cli-search** 技能，提供完整的筛选参数和 Token 排错指南。
@@ -284,7 +278,7 @@ feishu-cli search messages "关键词" --chat-ids oc_xxx -o json
 ### 查看群信息
 
 ```bash
-feishu-cli chat get oc_xxx
+pnpm feishu chat get oc_xxx
 ```
 
 默认输出 JSON 格式，包含群名、描述、群主、群类型、成员数量等。
@@ -293,41 +287,41 @@ feishu-cli chat get oc_xxx
 
 ```bash
 # 获取成员列表
-feishu-cli chat member list oc_xxx
+pnpm feishu chat member list oc_xxx
 
 # 指定 ID 类型
-feishu-cli chat member list oc_xxx --member-id-type user_id
+pnpm feishu chat member list oc_xxx --member-id-type user_id
 
 # 分页获取（大群）
-feishu-cli chat member list oc_xxx --page-size 100 --page-token "xxx"
+pnpm feishu chat member list oc_xxx --page-size 100 --page-token "xxx"
 ```
 
-> **Scope 要求**：使用 User Token 时需要 `im:chat:readonly` 或 `im:chat.members:read` scope。若报 99991679 错误，需通过 `auth login --scopes "... im:chat:readonly"` 重新授权。
+> **Scope 要求**：使用 User Token 时需要 `im:chat:readonly` 或 `im:chat.members:read` scope。若报 99991679 错误，使用 **feishu-auth** 技能授权后重试。
 
 ### 修改群信息
 
 ```bash
 # 改群名
-feishu-cli chat update oc_xxx --name "新群名"
+pnpm feishu chat update oc_xxx --name "新群名"
 
 # 改群描述
-feishu-cli chat update oc_xxx --description "新的群描述"
+pnpm feishu chat update oc_xxx --description "新的群描述"
 
 # 转让群主
-feishu-cli chat update oc_xxx --owner-id ou_xxx
+pnpm feishu chat update oc_xxx --owner-id ou_xxx
 ```
 
 ### 群成员管理
 
 ```bash
 # 添加成员
-feishu-cli chat member add oc_xxx --id-list ou_xxx,ou_yyy
+pnpm feishu chat member add oc_xxx --id-list ou_xxx,ou_yyy
 
 # 移除成员
-feishu-cli chat member remove oc_xxx --id-list ou_xxx
+pnpm feishu chat member remove oc_xxx --id-list ou_xxx
 
 # 使用 user_id 类型
-feishu-cli chat member add oc_xxx --id-list user_xxx --member-id-type user_id
+pnpm feishu chat member add oc_xxx --id-list user_xxx --member-id-type user_id
 ```
 
 ### 创建群聊
@@ -341,7 +335,7 @@ feishu-cli chat create --name "新群聊" --user-ids ou_xxx,ou_yyy
 ### 解散群聊
 
 ```bash
-feishu-cli chat delete oc_xxx
+pnpm feishu chat delete oc_xxx
 # 会要求确认，不可逆操作
 ```
 
@@ -352,7 +346,7 @@ feishu-cli chat delete oc_xxx
 ### 获取单条消息详情
 
 ```bash
-feishu-cli msg get om_xxx -o json
+pnpm feishu msg get om_xxx -o json
 ```
 
 ### 查看消息已读情况
@@ -366,30 +360,30 @@ feishu-cli msg read-users om_xxx -o json
 ### 查看群内置顶消息
 
 ```bash
-feishu-cli msg pins --chat-id oc_xxx -o json
+pnpm feishu msg pins --chat-id oc_xxx -o json
 ```
 
 ### 置顶/取消置顶消息
 
 ```bash
 # 置顶消息
-feishu-cli msg pin <message_id>
+pnpm feishu msg pin <message_id>
 
 # 取消置顶
-feishu-cli msg unpin <message_id>
+pnpm feishu msg unpin <message_id>
 ```
 
 ### Reaction 表情回应
 
 ```bash
 # 添加表情
-feishu-cli msg reaction add <message_id> --emoji-type THUMBSUP
+pnpm feishu msg reaction add <message_id> --emoji-type THUMBSUP
 
 # 删除表情
-feishu-cli msg reaction remove <message_id> --reaction-id <REACTION_ID>
+pnpm feishu msg reaction remove <message_id> --reaction-id <REACTION_ID>
 
 # 查询表情列表
-feishu-cli msg reaction list <message_id> [--emoji-type THUMBSUP] [--page-size 20]
+pnpm feishu msg reaction list <message_id> [--emoji-type THUMBSUP] [--page-size 20]
 ```
 
 常用 emoji-type：`THUMBSUP`（点赞）、`SMILE`（微笑）、`LAUGH`（大笑）、`HEART`（爱心）、`JIAYI`（加一）、`OK`、`FIRE`
@@ -399,7 +393,7 @@ feishu-cli msg reaction list <message_id> [--emoji-type THUMBSUP] [--page-size 2
 仅能删除机器人自己发送的消息，不可恢复。
 
 ```bash
-feishu-cli msg delete <message_id>
+pnpm feishu msg delete <message_id>
 ```
 
 ---
@@ -426,7 +420,7 @@ feishu-cli msg delete <message_id>
 | 创建群聊 | `chat create --name "群名"` | App |
 | 获取群链接 | `chat link oc_xxx` | App |
 
-> 标记 **User** 的命令必须先 `auth login`，未登录会报错。标记 **App** 的命令使用应用身份，无需登录。
+> 标记 **User** 的命令使用 `pnpm feishu` 执行（自动注入 User Token）。报权限错误时使用 **feishu-auth** 技能授权后重试。标记 **App** 的命令使用应用身份，无需登录。
 
 ---
 
@@ -484,4 +478,4 @@ text = content.get('text', '')
 | 发送消息、回复、转发/合并转发 | feishu-cli-msg |
 | 搜索文档/应用、高级消息搜索（多条件筛选） | feishu-cli-search |
 | 表格、日历、任务、文件、知识库等其他模块 | feishu-cli-toolkit |
-| OAuth 登录、Token 管理 | feishu-cli-auth |
+| OAuth 登录、Token 管理 | **feishu-auth** |

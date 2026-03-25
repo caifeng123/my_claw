@@ -3,14 +3,12 @@
  *
  * 在原有 FeishuService (应用身份) 基础上，叠加 DeviceAuthClient 实现：
  * - 以用户身份调用飞书 API（如文档读写、权限管理等）
- * - 自动管理 token 生命周期（持久化 + 自动刷新）
+ * - 自动管理 token 生命周期（持久化 + 按需刷新）
  * - 通过飞书消息引导用户完成设备码授权
- * - **心跳机制**：每天自动触发一次 token 检查 & 刷新，确保 token 常热
+ * - 心跳保活：定期触发 token 检查 & 刷新，防止长时间无调用导致 refresh_token 过期
  */
 
-import * as lark from '@larksuiteoapi/node-sdk';
-import { DeviceAuthClient, type DeviceAuthClientConfig, type DeviceAuthResponse } from './device-auth.js';
-import { getAllScopes } from '../../config/feishu-scopes.js';
+import { DeviceAuthClient, type DeviceAuthResponse } from './device-auth.js';
 
 export interface UserAuthServiceConfig {
   appId: string;
@@ -42,48 +40,27 @@ export class FeishuUserAuthService {
       tokenFilePath: config.tokenFilePath,
     });
 
-    // 自动启动心跳
     if (this.heartbeatIntervalMs > 0) {
       this.startHeartbeat();
     }
   }
 
-  // ==================== 心跳机制 ====================
+  // ==================== 心跳保活 ====================
 
   /**
-   * 启动心跳定时器
-   * - 每 heartbeatIntervalMs（默认 24h）自动调用 getAccessToken()
-   * - getAccessToken() 内部会检查过期并自动 refresh
-   * - 这确保即使没有用户主动请求，token 也不会静默过期
+   * 定时触发 token 刷新，防止长时间无 API 调用导致 refresh_token 静默过期
    */
   private startHeartbeat(): void {
-    if (this.heartbeatTimer) return; // 已在运行
-
-    console.log(`[UserAuth] 💓 心跳已启动，间隔 ${Math.round(this.heartbeatIntervalMs / 3600000)}h`);
+    if (this.heartbeatTimer) return;
 
     this.heartbeatTimer = setInterval(async () => {
+      const status = this.deviceAuthClient.getTokenStatus();
+      if (!status.hasToken) return;
+
       try {
-        const statusBefore = this.deviceAuthClient.getTokenStatus();
-        if (!statusBefore.hasToken) {
-          console.log('[UserAuth] 💓 心跳：无 token，跳过');
-          return;
-        }
-
-        console.log(`[UserAuth] 💓 心跳触发 token 检查...`);
-        const token = await this.deviceAuthClient.getValidAccessToken();
-
-        const statusAfter = this.deviceAuthClient.getTokenStatus();
-        if (token) {
-          console.log(
-            `[UserAuth] 💓 心跳完成：token 有效` +
-            `，access 过期时间 ${statusAfter.accessExpiresAt}` +
-            `，refresh 过期时间 ${statusAfter.refreshExpiresAt}`
-          );
-        } else {
-          console.warn('[UserAuth] 💓 心跳：token 已完全失效，需要重新授权');
-        }
+        await this.deviceAuthClient.getValidAccessToken();
       } catch (err) {
-        console.error('[UserAuth] 💓 心跳异常:', err);
+        console.error('[UserAuth] 心跳刷新 token 异常:', err);
       }
     }, this.heartbeatIntervalMs);
 
@@ -93,14 +70,10 @@ export class FeishuUserAuthService {
     }
   }
 
-  /**
-   * 停止心跳定时器
-   */
-  stopHeartbeat(): void {
+  private stopHeartbeat(): void {
     if (this.heartbeatTimer) {
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = null;
-      console.log('[UserAuth] 💓 心跳已停止');
     }
   }
 
@@ -147,93 +120,11 @@ export class FeishuUserAuthService {
   }
 
   /**
-   * 一键完成设备授权流程（发起 + 轮询），返回授权链接供展示
-   * 注意：此方法会阻塞直到用户授权完成或超时
-   */
-  async authorizeWithDeviceFlow(scope: string = 'offline_access'): Promise<{
-    authUrl: string;
-    userCode: string;
-    waitForAuth: () => Promise<void>;
-  }> {
-    const auth = await this.startDeviceAuth(scope);
-    const authUrl = auth.verification_uri_complete ?? auth.verification_uri;
-
-    return {
-      authUrl,
-      userCode: auth.user_code,
-      waitForAuth: async () => {
-        await this.waitForAuthorization(auth.device_code, auth.interval);
-      },
-    };
-  }
-
-  // ==================== 以用户身份调用 API ====================
-
-  /**
-   * 创建一个带有 user_access_token 的请求头
-   * 用于直接调用飞书 Open API
-   */
-  async getUserAuthHeaders(): Promise<Record<string, string> | null> {
-    const token = await this.getAccessToken();
-    if (!token) return null;
-    return {
-      'Authorization': `Bearer ${token}`,
-      'Content-Type': 'application/json; charset=utf-8',
-    };
-  }
-
-  /**
-   * 以用户身份发起 GET 请求
-   */
-  async userGet<T = any>(url: string): Promise<T | null> {
-    const headers = await this.getUserAuthHeaders();
-    if (!headers) return null;
-
-    const resp = await fetch(url, { headers });
-    if (!resp.ok) {
-      throw new Error(`User API GET failed: ${resp.status} ${resp.statusText}`);
-    }
-    return resp.json() as T;
-  }
-
-  /**
-   * 以用户身份发起 POST 请求
-   */
-  async userPost<T = any>(url: string, body: any): Promise<T | null> {
-    const headers = await this.getUserAuthHeaders();
-    if (!headers) return null;
-
-    const resp = await fetch(url, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body),
-    });
-    if (!resp.ok) {
-      throw new Error(`User API POST failed: ${resp.status} ${resp.statusText}`);
-    }
-    return resp.json() as T;
-  }
-
-  /**
-   * 获取当前授权用户的基本信息
-   */
-  async getCurrentUserInfo(): Promise<any | null> {
-    return this.userGet('https://open.feishu.cn/open-apis/authen/v1/user_info');
-  }
-
-  /**
    * 清除本地 token（登出），同时停止心跳
    */
   logout(): void {
     this.stopHeartbeat();
     this.deviceAuthClient.clearToken();
-  }
-
-  /**
-   * 销毁服务，清理定时器（用于优雅退出）
-   */
-  destroy(): void {
-    this.stopHeartbeat();
   }
 }
 

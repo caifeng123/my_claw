@@ -18,9 +18,9 @@ allowed-tools: Bash, Read, Write
 ## 前置条件
 
 - **feishu-cli**：如尚未安装，请前往 [riba2534/feishu-cli](https://github.com/riba2534/feishu-cli) 获取安装方式
-- **认证**：需要有效的 App Access Token（环境变量 `FEISHU_APP_ID` + `FEISHU_APP_SECRET`，或 `~/.feishu-cli/config.yaml`）
+- **认证**：需要有效的 App Access Token（环境变量 `FEISHU_APP_ID` + `FEISHU_APP_SECRET`，或 `.env`）
 - **权限**：应用需开通 `board:whiteboard`（画板读写）和 `docx:document`（文档中添加画板）
-- **验证**：`feishu-cli auth status` 确认认证状态正常
+- **验证**：确认 App 凭证配置正确
 
 ## 两种模式
 
@@ -328,7 +328,7 @@ JSON 中包含了 API 不支持的字段。只使用以下安全字段：
 
 - 检查应用是否已开通 `board:whiteboard` 权限
 - 确认 `whiteboard_id` 来自 `doc add-board` 的返回值，而非 `document_id`
-- 运行 `feishu-cli auth status` 确认 Token 有效
+- 确认 App 凭证配置正确（报权限错误时使用 **feishu-auth** 技能授权后重试）
 
 **Mermaid 导入降级为代码块**：
 

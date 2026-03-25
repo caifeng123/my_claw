@@ -164,12 +164,6 @@ export class FeishuService implements FeishuConnection {
     return undefined;
   }
 
-  /**
-   * 检查当前是否有有效的用户身份
-   */
-  hasValidUserToken(): boolean {
-    return this.userAuthService?.isAuthorized() ?? false;
-  }
 
   async connect(onMessage: (message: FeishuMessage) => void): Promise<boolean> {
     this.onMessageCallback = onMessage;
@@ -1316,53 +1310,6 @@ export class FeishuService implements FeishuConnection {
       throw error;
     }
   }
-
-  // ==================== NEW: 以用户身份调用任意飞书 Open API ====================
-
-  /**
-   * 以用户身份发起飞书 Open API 请求
-   *
-   * 使用 lark.Client 的 request 方法 + withUserAccessToken，
-   * 可调用任意飞书 Open API（如文档创建、日历管理、审批等）。
-   *
-   * @param method HTTP 方法
-   * @param url API 路径（如 '/open-apis/docx/v1/documents'）或完整 URL
-   * @param data 请求体（可选）
-   * @param params 查询参数（可选）
-   * @returns API 响应数据
-   */
-  async requestAsUser<T = any>(
-    method: string,
-    url: string,
-    data?: Record<string, any>,
-    params?: Record<string, any>,
-  ): Promise<T | null> {
-    if (!this.client) {
-      console.warn('Feishu client not initialized');
-      return null;
-    }
-
-    const userOpts = await this.getUserRequestOptions();
-    if (!userOpts) {
-      console.warn('[FeishuService] 无有效 user_access_token，无法以用户身份调用');
-      return null;
-    }
-
-    try {
-      const result = await this.client.request({
-        method,
-        url,
-        data,
-        params,
-      }, userOpts);
-      return result as T;
-    } catch (error) {
-      console.error(`[FeishuService] requestAsUser failed [${method} ${url}]:`, error);
-      throw error;
-    }
-  }
-
-  // ==================== Create + Patch 方法 ====================
 
   /**
    * 创建交互式卡片消息并返回 message_id

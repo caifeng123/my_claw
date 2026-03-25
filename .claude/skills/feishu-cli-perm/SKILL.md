@@ -28,7 +28,7 @@ allowed-tools: Bash, Read
 ### 安装与认证
 
 - **feishu-cli**：如尚未安装，请前往 [riba2534/feishu-cli](https://github.com/riba2534/feishu-cli) 获取安装方式
-- **认证**：使用 **App Token（应用身份）**，需配置 App ID 和 App Secret（环境变量或 `~/.feishu-cli/config.yaml`）。无需 `auth login`（User Token 不适用于权限管理 API）。
+- **认证**：使用 **App Token（应用身份）**，需配置 App ID 和 App Secret（环境变量或 `.env`）。无需手动授权（User Token 不适用于权限管理 API）。
 
 ### 所需权限 scope
 

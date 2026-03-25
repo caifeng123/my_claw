@@ -86,7 +86,7 @@ allowed-tools: Bash, Read, Write
 
 本技能所有命令使用 **App Token（Bot 身份）**，无需登录。
 
-> **Reaction/Pin/删除/获取消息/搜索群聊？** 这些操作需要 User Token，已移至 **feishu-cli-chat** 技能（需先 `auth login`）。
+> **Reaction/Pin/删除/获取消息/搜索群聊？** 这些操作需要 User Token，已移至 **feishu-cli-chat** 技能（需先通过 **feishu-auth** 技能授权）。
 
 ## 发送命令
 
@@ -545,7 +545,7 @@ feishu-cli msg forward <message_id> \
 | `rate limit exceeded` | API 限流 | 等待几秒后重试 |
 | `user not found` | 用户不存在 | 检查邮箱或 ID 是否正确 |
 | `card content too large` | 卡片 JSON 超过 30 KB | 精简卡片内容或拆分为多条消息 |
-| `Bot/User can NOT be out of the chat` | Bot 不在目标群内 | 添加 `--user-access-token` 切换为 User 身份重试 |
+| `Bot/User can NOT be out of the chat` | Bot 不在目标群内 | 使用 **feishu-auth** 技能授权后，用 `pnpm feishu` 代替 `feishu-cli` 以 User 身份重试 |
 
 ## 参考文档
 

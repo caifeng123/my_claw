@@ -16,9 +16,8 @@ allowed-tools: Bash, Read, Grep
 ## 前置条件
 
 - **feishu-cli**：如尚未安装，请前往 [riba2534/feishu-cli](https://github.com/riba2534/feishu-cli) 获取安装方式
-- 已完成认证（`feishu-cli auth login`）
 - App 权限：需要 `docx:document` 或 `docx:document:readonly`（普通文档）、`wiki:wiki:readonly`（知识库）
-- User Token 权限：若 App 无权访问他人文档，需通过 `feishu-cli auth login --scopes "docx:document:readonly offline_access"` 授权，`doc export` 会自动读取保存的 User Token
+- User Token 权限：若 App 无权访问他人文档，使用 `pnpm feishu doc export` 执行（自动注入 User Token）。报权限错误时使用 **feishu-auth** 技能授权后重试
 
 ## 核心概念
 
@@ -46,35 +45,24 @@ allowed-tools: Bash, Read, Grep
    **普通文档**:
 
    ```bash
-   feishu-cli doc export <document_id> --output /tmp/feishu_doc.md --download-images --assets-dir /tmp/feishu_assets
+   pnpm feishu doc export <document_id> --output /tmp/feishu_doc.md --download-images --assets-dir /tmp/feishu_assets
    ```
 
-   `doc export` 会自动解析 User Access Token（如已登录），解析优先级：
+   使用 `pnpm feishu doc export` 执行，自动注入 User Token。未找到 Token 时回退为 App Access Token（租户身份）。
 
-   1. `--user-access-token` 命令行参数
-   2. `FEISHU_USER_ACCESS_TOKEN` 环境变量
-   3. `~/.feishu-cli/token.json`（通过 `auth login` 保存）
-   4. `config.yaml` 中的 `user_access_token`
-
-   找到 User Token 时使用用户身份访问，未找到时回退为 App Access Token（租户身份）。
-
-   若遇到 `code=1770032 forBidden`（App 无权限且未登录）或 `code=99991679 Unauthorized`（User Token 缺少 scope），需先完成 User Token 授权：
-
-   ```bash
-   feishu-cli auth login --scopes "docx:document:readonly offline_access"
-   ```
+   若遇到 `code=1770032 forBidden` 或 `code=99991679 Unauthorized`，使用 **feishu-auth** 技能授权后重试。
 
    **知识库文档**:
 
    ```bash
-   feishu-cli wiki export <node_token> --output /tmp/feishu_wiki.md --download-images --assets-dir /tmp/feishu_assets
+   pnpm feishu wiki export <node_token> --output /tmp/feishu_wiki.md --download-images --assets-dir /tmp/feishu_assets
    ```
 
    **重要**：务必使用 `--download-images` 参数下载文档中的图片到本地，否则只能看到 `feishu://media/<token>` 引用，无法理解图片内容。
 
    **可选参数**：
 
-   - `--user-access-token`：手动指定 User Access Token（不填则自动从 `~/.feishu-cli/token.json` 读取）
+   - `--user-access-token`：手动指定 User Access Token（使用 `pnpm feishu` 时自动注入，无需手动填写）
    - `--front-matter`：在 Markdown 顶部添加 YAML front matter（含标题和文档 ID）
    - `--highlight`：保留文本颜色和背景色（输出为 HTML `<span>` 标签）
    - `--expand-mentions`：展开 @用户为友好格式（默认开启，需要 contact:user.base:readonly 权限）
@@ -169,31 +157,31 @@ allowed-tools: Bash, Read, Grep
 
 ```bash
 # 1. 先获取节点信息，记录 space_id
-feishu-cli wiki get <node_token>
+pnpm feishu wiki get <node_token>
 
 # 2. 列出该节点下的子节点
-feishu-cli wiki nodes <space_id> --parent <node_token>
+pnpm feishu wiki nodes <space_id> --parent <node_token>
 ```
 
 ### 3. 完整处理流程
 
 ```bash
 # 步骤 1：尝试导出文档
-feishu-cli wiki export <node_token> -o /tmp/doc.md
+pnpm feishu wiki export <node_token> -o /tmp/doc.md
 
 # 步骤 2：检查内容
 # 如果显示 "[Wiki 目录...]"，说明是目录节点
 
 # 步骤 3：获取节点信息
-feishu-cli wiki get <node_token>
+pnpm feishu wiki get <node_token>
 # 记录 space_id 和 has_child 字段
 
 # 步骤 4：获取子节点
-feishu-cli wiki nodes <space_id> --parent <node_token>
+pnpm feishu wiki nodes <space_id> --parent <node_token>
 
 # 步骤 5：逐个导出子节点
-feishu-cli wiki export <child_node_token_1> -o /tmp/child1.md
-feishu-cli wiki export <child_node_token_2> -o /tmp/child2.md
+pnpm feishu wiki export <child_node_token_1> -o /tmp/child1.md
+pnpm feishu wiki export <child_node_token_2> -o /tmp/child2.md
 ```
 
 ## 错误处理与边界情况
@@ -202,8 +190,8 @@ feishu-cli wiki export <child_node_token_2> -o /tmp/child2.md
 
 | 错误                              | 原因                                           | 解决                                                                                                        |
 | --------------------------------- | ---------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| `code=1770032, msg=forBidden`     | App Token 无权限访问该文档                     | 通过 `auth login --scopes "docx:document:readonly offline_access"` 授权 User Token，`doc export` 会自动读取 |
-| `code=99991679, msg=Unauthorized` | User Token 缺少 `docx:document:readonly` scope | 重新执行 `feishu-cli auth login --scopes "docx:document:readonly offline_access"`                           |
+| `code=1770032, msg=forBidden`     | App Token 无权限访问该文档                     | 使用 **feishu-auth** 技能授权后重试 |
+| `code=99991679, msg=Unauthorized` | User Token 缺少 `docx:document:readonly` scope | 使用 **feishu-auth** 技能授权后重试                           |
 | `code=131002, param err`          | 参数错误                                       | 检查 token 格式                                                                                             |
 | `code=131001, node not found`     | 节点不存在                                     | 检查 token 是否正确                                                                                         |
 | `code=131003, no permission`      | 无权限访问                                     | 确认应用有 wiki:wiki:readonly 权限                                                                          |
@@ -233,7 +221,7 @@ feishu-cli wiki export <child_node_token_2> -o /tmp/child2.md
 **情况 4：大型文档**
 
 - 超过 1000 个块的文档可能需要分页获取
-- 使用 `feishu-cli doc blocks <doc_id> --all` 自动分页
+- 使用 `pnpm feishu doc blocks <doc_id> --all` 自动分页
 
 ### 3. 重试机制
 
@@ -241,10 +229,10 @@ feishu-cli wiki export <child_node_token_2> -o /tmp/child2.md
 
 ```bash
 # 添加 --debug 查看详细错误信息
-feishu-cli wiki export <token> --debug
+pnpm feishu wiki export <token> --debug
 
 # 等待几秒后重试
-sleep 5 && feishu-cli wiki export <token>
+sleep 5 && pnpm feishu wiki export <token>
 ```
 
 ## 注意事项
@@ -259,10 +247,7 @@ sleep 5 && feishu-cli wiki export <token>
 
 - 确认应用已获得 `docx:document:readonly`（普通文档）或 `wiki:wiki:readonly`（知识库）权限
 - 如果是他人文档且 App 没有被添加为协作者，需要使用 User Token：
-  ```bash
-  feishu-cli auth login --scopes "docx:document:readonly offline_access"
-  ```
-  授权后 `doc export` 会自动读取，无需额外参数
+  使用 **feishu-auth** 技能授权后重试，无需额外参数
 
 **Q: 文档不存在 / `node not found`**
 
@@ -271,6 +256,5 @@ sleep 5 && feishu-cli wiki export <token>
 
 **Q: Token 过期 / 认证失败**
 
-- 运行 `feishu-cli auth status` 检查当前认证状态
-- 如已过期，运行 `feishu-cli auth login` 重新认证
+- 使用 **feishu-auth** 技能授权后重试
 - 如使用 App Access Token，检查 `FEISHU_APP_ID` 和 `FEISHU_APP_SECRET` 环境变量是否正确
