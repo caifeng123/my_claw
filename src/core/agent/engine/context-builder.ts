@@ -153,7 +153,7 @@ export class ContextBuilder {
 
       return {
         systemPrompt: systemPromptResult.text,
-        messages: resolvedMessages,
+        messages: this.insertConversationBoundary(resolvedMessages),
         stats: {
           systemPromptTokens: systemTokens,
           summaryTokens: 0,
@@ -212,7 +212,7 @@ export class ContextBuilder {
 
     return {
       systemPrompt: systemPromptResult.text,
-      messages,
+      messages: this.insertConversationBoundary(messages),
       stats: {
         systemPromptTokens: systemTokens,
         summaryTokens,
@@ -312,4 +312,45 @@ export class ContextBuilder {
     this.conversationStore.saveSummaryCache(sessionId, newSummary)
     return newSummary
   }
+
+  /**
+   * 在历史消息和当前消息之间插入分界标记
+   * 最后一条 user 消息视为"当前消息"，之前的都是"历史对话"
+   *
+   * 最终结构:
+   *   [历史对话开始] → 历史 user/assistant ... → [当前对话] → 本轮 user 消息
+   */
+  private insertConversationBoundary(messages: MessageParam[]): MessageParam[] {
+    if (messages.length < 2) return messages
+
+    // 找到最后一条 user 消息的索引（即本轮消息）
+    let lastUserIdx = -1
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i]!.role === 'user') {
+        lastUserIdx = i
+        break
+      }
+    }
+
+    // 只有一条 user 消息（首轮对话），不需要分界
+    if (lastUserIdx <= 0) return messages
+
+    // 历史消息开头标记
+    const historyStart: MessageParam[] = [
+      { role: 'user', content: '[以下是历史对话记录，仅供参考上下文]' }
+    ]
+
+    // 当前对话分界标记
+    const currentStart: MessageParam[] = [
+      { role: 'user', content: '[历史对话结束，以下是当前对话]' }
+    ]
+
+    return [
+      ...historyStart,
+      ...messages.slice(0, lastUserIdx),
+      ...currentStart,
+      ...messages.slice(lastUserIdx),
+    ]
+  }
+
 }

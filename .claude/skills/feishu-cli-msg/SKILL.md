@@ -1,21 +1,13 @@
 ---
 name: feishu-cli-msg
-description: >-
-  飞书消息发送。发送消息（text/post/interactive 卡片等 11 种类型）、回复消息、
-  转发/合并转发。使用 App Token（Bot 身份），无需登录。
-  当用户请求"发消息"、"回复"、"转发"、"合并转发"、"发通知"、"发卡片"、
-  "给某人发飞书消息"、"通知某人"时使用，即使没有明确说"发送"，
-  只要意图是把信息传达给某人，都应使用此技能。
-  注意：Reaction/Pin/删除/获取消息详情/消息历史/搜索群聊/群聊管理
-  请使用 feishu-cli-chat 技能（需 User Token）。
-argument-hint: <receive_id> [--msg-type <type>]
-user-invocable: true
-allowed-tools: Bash, Read, Write
+description: 飞书消息发送。发送消息（text/post/interactive 卡片等 11 种类型）、回复消息、转发/合并转发。使用 App Token（Bot 身份），无需登录。当用户请求"发消息"、"回复"、"转发"、"合并转发"、"发通知"、"发卡片"、"给某人发飞书消息"、"通知某人"时使用，即使没有明确说"发送"，只要意图是把信息传达给某人，都应使用此技能。在 cronjob 中发消息不使用此技能，cronjob 已支持。
 ---
 
 # 飞书消息发送与互动技能
 
 通过 feishu-cli 发送飞书消息、回复、转发、Reaction、Pin 等互动操作。
+
+在 cronjob 中发消息不使用此技能，cronjob 已支持。
 
 > **feishu-cli**：如尚未安装，请前往 [riba2534/feishu-cli](https://github.com/riba2534/feishu-cli) 获取安装方式。
 
@@ -49,7 +41,7 @@ allowed-tools: Bash, Read, Write
 
 ## 消息类型选择
 
-### 决策树（Claude 未指定类型时自动选择）
+### 决策树
 
 **默认优先使用 `interactive`（卡片消息）**，样式美观、内容丰富、支持颜色/多列/按钮等。
 
@@ -85,8 +77,6 @@ allowed-tools: Bash, Read, Write
 ## 身份说明
 
 本技能所有命令使用 **App Token（Bot 身份）**，无需登录。
-
-> **Reaction/Pin/删除/获取消息/搜索群聊？** 这些操作需要 User Token，已移至 **feishu-cli-chat** 技能（报错时由 **feishu-notify-admin** 技能通知管理员）。
 
 ## 发送命令
 
@@ -545,7 +535,6 @@ feishu-cli msg forward <message_id> \
 | `rate limit exceeded` | API 限流 | 等待几秒后重试 |
 | `user not found` | 用户不存在 | 检查邮箱或 ID 是否正确 |
 | `card content too large` | 卡片 JSON 超过 30 KB | 精简卡片内容或拆分为多条消息 |
-| `Bot/User can NOT be out of the chat` | Bot 不在目标群内 | 使用 **feishu-notify-admin** 技能通知管理员后，用 `pnpm feishu` 代替 `feishu-cli` 以 User 身份重试 |
 
 ## 参考文档
 

@@ -34,6 +34,7 @@ export function createCronjobTools(scheduler: CronScheduler): RegisteredTool[] {
       '- agent_prompt: {"type":"agent_prompt","prompt":"要执行的指令"}',
       '- feishu_notify: {"type":"feishu_notify","messageTemplate":"消息模板"} 或 {"type":"feishu_notify","agentPrompt":"让Agent生成的指令"}',
       '- custom_script: {"type":"custom_script","command":"shell命令"}',
+      '不要使用 feishu-cli 发送飞书通知，cronjob 已经支持了。',
     ].join('\n'),
     inputSchema: {
       name: z.string().describe('任务名称，如 "每日科技早报"'),

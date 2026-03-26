@@ -773,12 +773,19 @@ ${originalContent}
    * 包含：飞书系统上下文 + 引用消息内容 + 用户消息 + 文件路径
    */
   private buildEnrichedContent(message: FeishuMessage): string {
-    // 引用消息作为前缀，与用户消息合并
+    const parts: string[] = [];
+
+    // 注入飞书会话上下文，供 Agent 在调用 tool（如 create_cronjob）时使用
+    parts.push(`[系统上下文] 当前飞书会话 chatId="${message.chatId}"`);
+
+    // 引用消息作为前缀
     if (message.quotedContent) {
       const quoted = '> ' + message.quotedContent.split('\n').join('\n> ');
-      return quoted + '\n\n' + message.content;
+      parts.push(quoted);
     }
-    return message.content;
+
+    parts.push(message.content);
+    return parts.join('\n\n');
   }
 
   /**
