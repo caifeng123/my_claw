@@ -272,6 +272,35 @@ export class DeviceAuthClient {
   }
 
   /**
+   * 强制刷新 token，不检查 access_token 是否过期。
+   * 用于服务启动时确保拿到完整有效期的 token。
+   * 返回 true 表示刷新成功，false 表示无法刷新（无 token 或无 refresh_token）。
+   */
+  async forceRefresh(): Promise<boolean> {
+    if (!this.cachedToken || !this.cachedToken.refresh_token) {
+      return false;
+    }
+
+    if (this.isRefreshTokenExpired(this.cachedToken)) {
+      console.warn('[DeviceAuth] refresh_token 已过期，无法强制刷新，需要重新授权');
+      this.cachedToken = null;
+      return false;
+    }
+
+    try {
+      console.log('[DeviceAuth] 强制刷新 token...');
+      const newToken = await this.refreshAccessToken(this.cachedToken.refresh_token);
+      this.cachedToken = newToken;
+      this.saveTokenToFile(newToken);
+      console.log('[DeviceAuth] 强制刷新成功，token 有效期已重置');
+      return true;
+    } catch (err) {
+      console.warn('[DeviceAuth] 强制刷新失败:', err);
+      return false;
+    }
+  }
+
+  /**
    * 检查是否已有有效的用户授权（不触发刷新）
    */
   hasValidToken(): boolean {
@@ -420,7 +449,7 @@ export class DeviceAuthClient {
       token_type: data.token_type ?? 'Bearer',
       expires_at_ms: now + expiresIn * 1000,
       refresh_expires_at_ms: now + refreshExpiresIn * 1000,
-      refresh_token: data.refresh_token || undefined,
+      refresh_token: data.refresh_token || refreshToken,
       scope: this.getEffectiveScope([data.scope, this.requestedScope, this.cachedToken?.scope]),
     };
   }

@@ -5,7 +5,7 @@
  * - 以用户身份调用飞书 API（如文档读写、权限管理等）
  * - 自动管理 token 生命周期（持久化 + 按需刷新）
  * - 通过飞书消息引导用户完成设备码授权
- * - 心跳保活：定期触发 token 检查 & 刷新，防止长时间无调用导致 refresh_token 过期
+ * - 心跳保活：启动时强制刷新 + 每小时定时刷新，确保 token 始终有效
  */
 
 import { DeviceAuthClient, type DeviceAuthResponse } from './device-auth.js';
@@ -15,12 +15,12 @@ export interface UserAuthServiceConfig {
   appSecret: string;
   platform?: 'feishu' | 'lark';
   tokenFilePath?: string;
-  /** 心跳间隔（毫秒），默认 24 小时。设为 0 禁用心跳 */
+  /** 心跳间隔（毫秒），默认 1 小时。设为 0 禁用心跳 */
   heartbeatIntervalMs?: number;
 }
 
-/** 默认心跳间隔：24 小时 */
-const DEFAULT_HEARTBEAT_INTERVAL_MS = 24 * 60 * 60 * 1000;
+/** 默认心跳间隔：1 小时 */
+const DEFAULT_HEARTBEAT_INTERVAL_MS = 1 * 60 * 60 * 1000;
 
 export class FeishuUserAuthService {
   private deviceAuthClient: DeviceAuthClient;
@@ -48,21 +48,28 @@ export class FeishuUserAuthService {
   // ==================== 心跳保活 ====================
 
   /**
-   * 定时触发 token 刷新，防止长时间无 API 调用导致 refresh_token 静默过期
+   * 启动时无条件强制刷新一次，拿到完整有效期的 token；
+   * 之后每小时再强制刷新一次，确保 token 始终有效。
    */
   private startHeartbeat(): void {
     if (this.heartbeatTimer) return;
 
-    this.heartbeatTimer = setInterval(async () => {
+    const doRefresh = async () => {
       const status = this.deviceAuthClient.getTokenStatus();
       if (!status.hasToken) return;
 
       try {
-        await this.deviceAuthClient.getValidAccessToken();
+        // 无条件强制刷新，不管 access_token 是否过期
+        await this.deviceAuthClient.forceRefresh();
       } catch (err) {
         console.error('[UserAuth] 心跳刷新 token 异常:', err);
       }
-    }, this.heartbeatIntervalMs);
+    };
+
+    // 启动时立即强制刷新，确保 token 从一开始就是满有效期的
+    doRefresh();
+
+    this.heartbeatTimer = setInterval(doRefresh, this.heartbeatIntervalMs);
 
     // 不阻止 Node.js 进程退出
     if (this.heartbeatTimer && typeof this.heartbeatTimer === 'object' && 'unref' in this.heartbeatTimer) {

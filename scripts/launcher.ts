@@ -24,6 +24,9 @@ import { DeviceAuthClient } from '../src/services/feishu/device-auth.js';
 import { existsSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import dotenv from 'dotenv';
+
+dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -412,7 +415,7 @@ class Launcher {
 
     if (!appId || !appSecret) {
       console.error('❌ FEISHU_APP_ID 或 FEISHU_APP_SECRET 未配置，跳过 token 检查');
-      return;
+      process.exit(1);
     }
 
     const client = new DeviceAuthClient({ appId, appSecret, platform: 'feishu' });
