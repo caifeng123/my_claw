@@ -92,6 +92,9 @@ export class FeishuService implements FeishuConnection {
   private ackReactionByChat = new Map<string, string>(); // 消息确认反应
   private typingReactionByChat = new Map<string, string>(); // 输入状态反应
 
+  // ==================== NEW: 机器人 open_id（用于群聊 @Bot 过滤） ====================
+  private botOpenId: string | null = null;
+
   // ==================== NEW: 用户身份支持 ====================
   private userAuthService: FeishuUserAuthService | null = null;
   /** 是否优先使用用户身份（user_access_token）调用 API，默认 true */
@@ -198,6 +201,12 @@ export class FeishuService implements FeishuConnection {
 
       await this.wsClient.start({ eventDispatcher });
       console.log('Feishu WebSocket client started successfully');
+
+      // 获取机器人自身的 open_id，用于群聊 @Bot 过滤
+      this.fetchBotOpenId().catch(err => {
+        console.warn('⚠️ 获取机器人 open_id 失败，群聊将响应所有消息:', err);
+      });
+
       return true;
     } catch (error) {
       console.error('Failed to start Feishu client:', error);
@@ -315,6 +324,44 @@ export class FeishuService implements FeishuConnection {
     return this.wsClient !== null;
   }
 
+  /**
+   * 获取机器人自身的 open_id（用于群聊 @Bot 判断）
+   * 调用 bot.v3.botInfo.get API
+   */
+  private async fetchBotOpenId(): Promise<void> {
+    if (!this.client) return;
+    try {
+      const res = await (this.client as any).bot.v3.botInfo.get({});
+      const openId = res?.data?.bot?.open_id;
+      if (openId) {
+        this.botOpenId = openId;
+        console.log(`🤖 机器人 open_id 已获取: ${openId}`);
+      } else {
+        console.warn('⚠️ bot.v3.botInfo.get 未返回 open_id');
+      }
+    } catch (error) {
+      console.warn('⚠️ 获取机器人 open_id 失败:', error);
+    }
+  }
+
+  /**
+   * 检查群聊消息是否 @了机器人
+   * @param mentions 消息中的 mentions 列表
+   * @returns true 表示消息中 @了机器人
+   */
+  private isBotMentioned(mentions: any[]): boolean {
+    if (!mentions || !Array.isArray(mentions) || mentions.length === 0) {
+      return false;
+    }
+    // 方式1: 通过 botOpenId 精确匹配
+    if (this.botOpenId) {
+      return mentions.some(m => m.id === this.botOpenId);
+    }
+    // 降级策略: botOpenId 未获取到时，无法精确判断，放行所有群聊消息
+    console.warn('⚠️ botOpenId 未获取到，无法判断群聊消息是否 @机器人，放行处理');
+    return true;
+  }
+
   private async handleMessage(data: any): Promise<void> {
     try {
       const message = data.message;
@@ -333,6 +380,17 @@ export class FeishuService implements FeishuConnection {
         return;
       }
       this.markSeen(messageId);
+
+      // ==================== NEW: 群聊 @Bot 过滤 ====================
+      // chat_type: "p2p" (私聊) / "group" (群聊)
+      const chatType = message.chat_type;
+      if (chatType === 'group') {
+        const mentions = message.mentions;
+        if (!this.isBotMentioned(mentions)) {
+          console.debug(`群聊消息未 @机器人，跳过处理 [chatId=${chatId}, msgId=${messageId}]`);
+          return;
+        }
+      }
 
       // 提取消息内容（使用占位符，不再硬编码路径）
       const extracted = this.extractMessageContent(message.message_type, message.content);
