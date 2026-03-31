@@ -20,7 +20,6 @@ import { ClaudeEngine } from '@/core/agent/engine/claude-engine.js';
 import { getFilesDir } from '../../utils/paths.js';
 import { relative, join } from 'path';
 import type { ImageAnalysisEntry } from '../../core/memory/conversation-store.js';
-import { getUserAuthService } from './user-auth-service.js';
 
 // 状态文件路径
 const STATE_FILE = '.restart-state.json';
@@ -97,12 +96,7 @@ export class FeishuAgentBridge {
 
     if (success) {
       this.isConnected = true;
-      // 注入用户身份服务到 FeishuService（如有），使 API 调用可使用 user_access_token
-      const userAuth = getUserAuthService();
-      if (userAuth) {
-        this.feishuService.setUserAuthService(userAuth);
-        console.log('🔑 用户身份服务已注入 FeishuService');
-      }
+
       console.log('✅ 飞书Agent桥接服务启动成功');
     } else {
       console.error('❌ 飞书Agent桥接服务启动失败');
@@ -419,8 +413,8 @@ private async handleNewCommand(message: FeishuMessage): Promise<void> {
     }
 
     const trimmedContent = message.content.trim();
-    // 去掉所有 @xxx 提及后提取指令（群聊中可能有多个 @）
-    const command = trimmedContent.replace(/@\w+\S*/g, '').trim();
+    // 去掉所有 @姓名(open_id) 提及后提取指令（群聊中可能有多个 @）
+    const command = trimmedContent.replace(/@[^@()]+\([^)]*\)/g, '').trim();
 
     if (command === '/restart') {
       await this.handleRestartCommand(message);
@@ -781,16 +775,36 @@ ${originalContent}
    *   - 续接会话: 仅注入 senderId（chatId/threadId 已在 SDK session 中）
    */
   buildSessionContext(message: FeishuMessage, isNewSession: boolean): string {
+    const parts: string[] = [];
+
+    // bot 身份信息：让 agent 知道自己是谁
+    const botOpenId = this.feishuService.getBotOpenId();
+    const botName = this.feishuService.getBotName();
+    if (botOpenId) {
+      parts.push(`[Bot 身份] 你是飞书机器人「${botName || 'Bot'}」(open_id: ${botOpenId})。当用户消息中出现 @${botName || 'Bot'}(${botOpenId}) 时，说明用户在对你说话。`);
+    }
+
+    // 会话上下文
     if (isNewSession) {
       const ctxParts = [`chatId="${message.chatId}"`];
       if (message.threadId) {
         ctxParts.push(`threadId="${message.threadId}"`);
       }
       ctxParts.push(`senderId="${message.senderId}"`);
-      return `[飞书会话上下文] ${ctxParts.join(', ')}。这些 ID 仅供工具调用时使用，严禁在回复中向用户展示。`;
+      parts.push(`[飞书会话上下文] ${ctxParts.join(', ')}。这些 ID 仅供工具调用时使用，严禁在回复中向用户展示。`);
     } else {
-      return `[飞书会话上下文] 当前消息发送者: senderId="${message.senderId}"。此 ID 仅供内部使用，严禁在回复中展示。`;
+      parts.push(`[飞书会话上下文] 当前消息发送者: senderId="${message.senderId}"。此 ID 仅供内部使用，严禁在回复中展示。`);
     }
+
+    // mentions 上下文：告知 agent 本次消息中有哪些人被 @
+    if (message.mentions && message.mentions.length > 0) {
+      const mentionDescriptions = message.mentions
+        .map(m => m.isSelf ? `@${m.name}(${m.userId}) [这是你自己]` : `@${m.name}(${m.userId})`)
+        .join(', ');
+      parts.push(`[本次消息的 @提及] ${mentionDescriptions}`);
+    }
+
+    return parts.join('\n');
   }
 
   /**

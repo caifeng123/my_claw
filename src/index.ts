@@ -9,6 +9,7 @@ import memoryRouter from './routes/memory.js'
 import { getFeishuConfig, validateFeishuConfig } from './config/feishu.js'
 import { startDefaultFeishuBridge, stopDefaultFeishuBridge, getDefaultFeishuAgentBridge } from './services/feishu/feishu-agent-bridge.js'
 import { agentEngine } from './core/agent/index.js'
+import { UserTokenProbe } from './services/feishu/user-token-probe.js'
 
 // 状态文件路径（与 launcher.ts 保持一致）
 const STATE_FILE = '.restart-state.json'
@@ -22,6 +23,9 @@ interface RestartState {
   error?: string
   hasConflict?: boolean
 }
+
+// User Token 探活实例
+let tokenProbe: UserTokenProbe | null = null;
 
 const app = new Hono()
 
@@ -53,6 +57,25 @@ async function initializeFeishuService() {
 
     if (!success) {
       console.error('❌ 飞书Agent桥接服务启动失败')
+    } else {
+      // 启动 lark-cli User Token 探活（启动时立即刷新一次，之后每 24h 刷新）
+      tokenProbe = new UserTokenProbe({
+        intervalMs: 24 * 60 * 60 * 1000,   // 24h
+        retryIntervalMs: 30 * 60 * 1000,   // 失败后 30min 重试
+        maxConsecutiveFails: 3,
+        onAlert: async (message) => {
+          // 通过 bot 身份给自己发告警（bot 的 tenant_access_token 永不过期）
+          const bridge = getDefaultFeishuAgentBridge();
+          const alertOpenId = process.env.FEISHU_ALERT_OPEN_ID;
+          if (bridge && bridge.isBridgeConnected() && alertOpenId) {
+            try {
+              await bridge.sendMessageToChat(alertOpenId, message);
+            } catch (e) {
+              console.error('❌ 发送 token 告警失败:', e);
+            }
+          }
+        },
+      });
     }
 
     return success
@@ -172,6 +195,7 @@ async function startServer() {
 
   process.on('SIGINT', async () => {
     console.log('\n🛑 收到关闭信号，正在优雅关闭...')
+    tokenProbe?.stop();
     agentEngine.getCronScheduler().stop()
     await stopDefaultFeishuBridge()
     console.log('✅ 服务已关闭')
@@ -180,6 +204,7 @@ async function startServer() {
 
   process.on('SIGTERM', async () => {
     console.log('\n🛑 收到终止信号，正在优雅关闭...')
+    tokenProbe?.stop();
     agentEngine.getCronScheduler().stop()
     await stopDefaultFeishuBridge()
     console.log('✅ 服务已关闭')

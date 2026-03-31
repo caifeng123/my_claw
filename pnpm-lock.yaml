@@ -12,8 +12,8 @@ importers:
         specifier: ^0.2.79
         version: 0.2.79(zod@4.3.6)
       '@larksuiteoapi/node-sdk':
-        specifier: ^1.59.0
-        version: 1.59.0
+        specifier: ^1.60.0
+        version: 1.60.0
       '@mozilla/readability':
         specifier: ^0.5.0
         version: 0.5.0
@@ -346,8 +346,8 @@ packages:
     cpu: [x64]
     os: [win32]
 
-  '@larksuiteoapi/node-sdk@1.59.0':
-    resolution: {integrity: sha512-sBpkruTvZDOxnVtoTbepWKRX0j1Y1ZElQYu0x7+v088sI9pcpbVp6ZzCGn62dhrKPatzNyCJyzYCPXPYQWccrA==}
+  '@larksuiteoapi/node-sdk@1.60.0':
+    resolution: {integrity: sha512-MS1eXx7K6HHIyIcCBkJLb21okoa8ZatUGQWZaCCUePm6a37RWFmT6ZKlKvHxAanSX26wNuNlwP0RhgscsE+T6g==}
 
   '@mixmark-io/domino@2.2.0':
     resolution: {integrity: sha512-Y28PR25bHXUg88kCV7nivXrP2Nj2RueZ3/l/jdx6J9f8J4nsEGcgX0Qe6lt7Pa+J79+kPiJU3LguR6O/6zrLOw==}
@@ -915,7 +915,7 @@ snapshots:
   '@img/sharp-win32-x64@0.34.5':
     optional: true
 
-  '@larksuiteoapi/node-sdk@1.59.0':
+  '@larksuiteoapi/node-sdk@1.60.0':
     dependencies:
       axios: 1.13.6
       lodash.identity: 3.0.0

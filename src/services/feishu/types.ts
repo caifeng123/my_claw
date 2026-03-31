@@ -3,6 +3,18 @@ export interface FeishuConnectionConfig {
   appSecret: string;
 }
 
+// ==================== NEW: 结构化 Mention 信息 ====================
+
+/** 消息中的 @提及 信息 */
+export interface MentionInfo {
+  /** 被 @ 用户的 open_id */
+  userId: string;
+  /** 被 @ 用户的显示名称 */
+  name: string;
+  /** 是否是 @了 bot 自己 */
+  isSelf: boolean;
+}
+
 export interface FeishuMessage {
   messageId: string;       // IMPORTANT: used as reply target for im.message.reply
   chatId: string;
@@ -13,6 +25,11 @@ export interface FeishuMessage {
   messageType: string;
   timestamp: string;
   attachments?: string;    // JSON string of attachment data
+
+  // ==================== NEW: @ 提及列表 ====================
+
+  /** 消息中的 @提及 列表（结构化，供下游代码消费） */
+  mentions?: MentionInfo[];
 
   // ==================== NEW: 引用消息 & 文件附件 ====================
 

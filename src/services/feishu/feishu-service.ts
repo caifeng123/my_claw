@@ -13,7 +13,8 @@ import type {
   MessageDetail,
 } from './types.js';
 import { fileURLToPath } from 'url';
-import { FeishuUserAuthService } from './user-auth-service.js';
+import { IdentityResolver } from './identity-resolver.js';
+import type { MentionInfo } from './types.js';
 
 // AI 修复重试配置
 const AI_FIX_MAX_RETRIES = 2; // AI 修复最大重试次数
@@ -92,13 +93,14 @@ export class FeishuService implements FeishuConnection {
   private ackReactionByChat = new Map<string, string>(); // 消息确认反应
   private typingReactionByChat = new Map<string, string>(); // 输入状态反应
 
-  // ==================== NEW: 机器人 open_id（用于群聊 @Bot 过滤） ====================
+  // ==================== NEW: 机器人身份（用于群聊 @Bot 过滤 + prompt 注入） ====================
   private botOpenId: string | null = null;
+  private botName: string | null = null;
 
-  // ==================== NEW: 用户身份支持 ====================
-  private userAuthService: FeishuUserAuthService | null = null;
-  /** 是否优先使用用户身份（user_access_token）调用 API，默认 true */
-  private preferUserIdentity: boolean = true;
+  // ==================== NEW: 用户身份解析器（openId → 姓名/邮箱 永久缓存） ====================
+  private identityResolver: IdentityResolver | null = null;
+
+
 
   // [FIX] 生成考虑 threadId 的存储 key，避免话题群多 thread 共享 chatId 导致 reaction 互相覆盖
   private getReactionKey(chatId: string, threadId?: string): string {
@@ -120,52 +122,7 @@ export class FeishuService implements FeishuConnection {
     return this.client;
   }
 
-  // ==================== NEW: 用户身份管理 ====================
 
-  /**
-   * 设置用户授权服务（启用用户身份调用）
-   *
-   * 设置后，所有 API 调用将优先使用 user_access_token。
-   * 当 user token 无效或过期时，自动 fallback 到 tenant_access_token（应用身份）。
-   *
-   * @param service FeishuUserAuthService 实例
-   * @param preferUser 是否优先使用用户身份，默认 true
-   */
-  setUserAuthService(service: FeishuUserAuthService, preferUser: boolean = true): void {
-    this.userAuthService = service;
-    this.preferUserIdentity = preferUser;
-    console.log(`[FeishuService] 用户身份服务已设置，优先使用用户身份: ${preferUser}`);
-  }
-
-  /**
-   * 获取当前的 UserAuthService 实例
-   */
-  getUserAuthService(): FeishuUserAuthService | null {
-    return this.userAuthService;
-  }
-
-  /**
-   * 获取 SDK 请求的 options（自动选择身份）
-   *
-   * 当 userAuthService 已设置且有有效 token 时，返回 lark.withUserAccessToken(token)
-   * 否则返回 undefined（SDK 默认使用 tenant_access_token）
-   */
-  private async getUserRequestOptions(): Promise<ReturnType<typeof lark.withUserAccessToken> | undefined> {
-    if (!this.preferUserIdentity || !this.userAuthService) {
-      return undefined;
-    }
-
-    try {
-      const token = await this.userAuthService.getAccessToken();
-      if (token) {
-        return lark.withUserAccessToken(token);
-      }
-    } catch (error) {
-      console.warn('[FeishuService] 获取 user_access_token 失败，降级到应用身份:', error);
-    }
-
-    return undefined;
-  }
 
 
   async connect(onMessage: (message: FeishuMessage) => void): Promise<boolean> {
@@ -331,17 +288,49 @@ export class FeishuService implements FeishuConnection {
   private async fetchBotOpenId(): Promise<void> {
     if (!this.client) return;
     try {
-      const res = await (this.client as any).bot.v3.botInfo.get({});
-      const openId = res?.data?.bot?.open_id;
+      // 使用 client.request() 直接调 REST API（兼容所有 SDK 版本）
+      const res = await (this.client as any).request({
+        method: 'GET',
+        url: '/open-apis/bot/v3/info',
+      });
+      console.log('🔍 [fetchBotOpenId] API 响应:', JSON.stringify(res?.data || res, null, 2));
+
+      const bot = res?.data?.bot ?? res?.bot;
+      const openId = bot?.open_id;
       if (openId) {
         this.botOpenId = openId;
-        console.log(`🤖 机器人 open_id 已获取: ${openId}`);
+        this.botName = bot?.app_name || 'Bot';
+        console.log(`🤖 机器人信息已获取: ${this.botName} (${openId})`);
       } else {
-        console.warn('⚠️ bot.v3.botInfo.get 未返回 open_id');
+        console.warn('⚠️ /open-apis/bot/v3/info 未返回 open_id，完整响应:', JSON.stringify(res, null, 2));
       }
     } catch (error) {
       console.warn('⚠️ 获取机器人 open_id 失败:', error);
     }
+
+    // 无论 bot info 是否成功，都初始化 IdentityResolver
+    this.identityResolver = new IdentityResolver(
+      './data/identity-cache.json',
+      () => this.client,
+    );
+    console.log(`📇 IdentityResolver 已初始化，缓存 ${this.identityResolver.cacheSize} 个用户`);
+  }
+
+  // ==================== NEW: 暴露 bot 身份 & IdentityResolver ====================
+
+  /** 获取机器人的 open_id */
+  getBotOpenId(): string | null {
+    return this.botOpenId;
+  }
+
+  /** 获取机器人的名称 */
+  getBotName(): string | null {
+    return this.botName;
+  }
+
+  /** 获取 IdentityResolver 实例 */
+  getIdentityResolver(): IdentityResolver | null {
+    return this.identityResolver;
   }
 
   /**
@@ -353,9 +342,12 @@ export class FeishuService implements FeishuConnection {
     if (!mentions || !Array.isArray(mentions) || mentions.length === 0) {
       return false;
     }
-    // 方式1: 通过 botOpenId 精确匹配
+    // 通过 botOpenId 精确匹配（兼容 id 为 string 或 object 两种格式）
     if (this.botOpenId) {
-      return mentions.some(m => m.id === this.botOpenId);
+      return mentions.some(m => {
+        const openId = typeof m.id === 'string' ? m.id : m.id?.open_id;
+        return openId === this.botOpenId;
+      });
     }
     // 降级策略: botOpenId 未获取到时，无法精确判断，放行所有群聊消息
     console.warn('⚠️ botOpenId 未获取到，无法判断群聊消息是否 @机器人，放行处理');
@@ -405,14 +397,45 @@ export class FeishuService implements FeishuConnection {
       // [FIX] 图片下载已统一由 bridge 层管理（下载到 session 目录），service 层不再冗余下载。
       // 如需单独使用 service 层（不经过 bridge），可取消此处注释。
 
-      // 处理 @ 提及
+      // ==================== 处理 @ 提及（结构化 + 文本替换） ====================
+      console.log('🔍 [handleMessage] 原始 mentions:', JSON.stringify(message.mentions, null, 2));
+      console.log('🔍 [handleMessage] 替换前 content:', content);
+      const structuredMentions: MentionInfo[] = [];
       if (message.mentions && Array.isArray(message.mentions)) {
         for (const mention of message.mentions) {
-          if (mention.key) {
-            content = content.replace(mention.key, `@${mention.name || ''}`);
+          // 兼容两种 SDK 版本: mention.id 可能是 string(open_id) 或 object({ open_id })
+          const mentionOpenId = typeof mention.id === 'string'
+            ? mention.id
+            : mention.id?.open_id || '';
+          const mentionName = mention.name || '';
+          const isSelf = !!(this.botOpenId && mentionOpenId === this.botOpenId);
+
+          // 构建结构化 MentionInfo
+          if (mentionOpenId) {
+            structuredMentions.push({
+              userId: mentionOpenId,
+              name: mentionName,
+              isSelf,
+            });
+
+            // 顺便缓存到 IdentityResolver（从 mention 事件中获得的姓名）
+            if (this.identityResolver && mentionName) {
+              this.identityResolver.cacheFromMention(mentionOpenId, mentionName);
+            }
+          }
+
+          // 文本替换：所有 @（包括 bot）都替换为 @姓名(open_id)
+          if (mention.key && mentionOpenId) {
+            content = content.replace(mention.key, `@${mentionName}(${mentionOpenId})`);
+          } else if (mention.key) {
+            content = content.replace(mention.key, `@${mentionName}`);
           }
         }
+        // 清理多余空格
+        content = content.replace(/\s+/g, ' ').trim();
       }
+      console.log('🔍 [handleMessage] 替换后 content:', content);
+      console.log('🔍 [handleMessage] 结构化 mentions:', JSON.stringify(structuredMentions, null, 2));
 
       // 记录最后一条消息ID
       this.lastMessageIdByChat.set(this.getReactionKey(chatId, threadId), messageId);
@@ -430,6 +453,7 @@ export class FeishuService implements FeishuConnection {
 
         // ==================== NEW: 附加字段 ====================
         parentId,
+        mentions: structuredMentions.length > 0 ? structuredMentions : undefined,
         imageKeys: extracted.imageKeys,
         fileKeys: extracted.fileKeys,
       };
@@ -580,12 +604,10 @@ export class FeishuService implements FeishuConnection {
       return null;
     }
 
-    const userOpts = await this.getUserRequestOptions();
-
     try {
       const response = await this.client.im.message.get({
         path: { message_id: messageId },
-      }, userOpts);
+      });
 
 
       const items = (response as any)?.data?.items;
@@ -710,15 +732,13 @@ export class FeishuService implements FeishuConnection {
       const actualFileName = fileName || filePath.split('/').pop() || 'file';
       const fileBuffer = readFileSync(filePath);
 
-      const userOpts = await this.getUserRequestOptions();
-
       const response = await this.client.im.file.create({
         data: {
           file_type: fileType,
           file_name: actualFileName,
           file: fileBuffer,
         },
-      }, userOpts);
+      });
 
       const fileKey = (response as any)?.file_key;
       if (fileKey) {
@@ -753,9 +773,6 @@ export class FeishuService implements FeishuConnection {
     }
 
     const content = JSON.stringify({ file_key: fileKey });
-    // 注意：发送消息通常使用应用身份（bot），不使用 user token
-    // 因为用户身份发消息需要单独的 API，且群聊中 bot 消息更自然
-
     try {
       if (replyMessageId) {
         await this.client.im.message.reply({
@@ -1345,8 +1362,6 @@ export class FeishuService implements FeishuConnection {
         throw new Error('fileKey is required for downloading image');
       }
 
-      const userOpts = await this.getUserRequestOptions();
-
       const response = await this.client.im.v1.messageResource.get({
         path: {
           message_id: messageId,
@@ -1355,7 +1370,7 @@ export class FeishuService implements FeishuConnection {
         params: {
           type,
         },
-      }, userOpts);
+      });
 
       const fileName = `${filePrefix || fileKey}${getExtFromContentType(response.headers['Content-Type'] || response.headers['content-type'] || '')}`;
       const filePath = join(imageDir, fileName);
