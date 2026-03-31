@@ -162,7 +162,7 @@ export class AgentEngine {
         parentToolUseId: string | null,
         toolUseId: string,
       ) => {
-        const resultStr = typeof result === 'string' ? result : JSON.stringify(result).slice(0, 3000)
+        const resultStr = typeof result === 'string' ? result : JSON.stringify(result)
 
         if (tc.hasActiveTrace(toolUseId)) {
           await tc.finishTrace(toolUseId, resultStr)
@@ -288,11 +288,7 @@ export class AgentEngine {
     } finally {
       this.abortControllers.delete(sessionId)
 
-      // flush 本轮 skill 列表（仅日志/调试用）
-      const turnSkills = this.traceCollector.flushTurnSkills(sessionId)
-      if (turnSkills.length > 0) {
-        console.log(`📊 [AgentEngine] Turn skills: ${turnSkills.join(', ')}`)
-      }
+
     }
   }
 

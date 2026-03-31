@@ -3,7 +3,8 @@ import type { AgentResponse, EventHandlers } from '../types/agent'
 import { ToolManager } from './tool-manager'
 import { SessionIdStore } from './session-id-store'
 import { getVisionGuardConfig } from './vision-guard'
-import { SKILL_OPTIMIZER_AGENT } from '../../self-iteration/skill-optimizer-agent.js'
+import { PERSONAL_OPTIMIZER_AGENT, OTHERS_ANALYZER_AGENT } from '../../self-iteration/skill-optimizer-agent.js'
+import { getSkillInterceptorConfig } from '../../self-iteration/skill-interceptor.js'
 
 export class ClaudeEngine {
   private config: {
@@ -41,13 +42,13 @@ export class ClaudeEngine {
   }
 
   /**
-   * 构建包含 VisionGuard 的 query options
-   * 将三层防线注入到每次 query 调用中
+   * 构建包含 VisionGuard + SkillInterceptor 的 query options
    *
    * 改造点：
    * - 新增 sessionId 参数，用于自动设置 resume
    * - cwd 固定为 process.cwd()，确保 resume 路径一致
-   * - [self-iteration] 注入 skill-optimizer SubAgent
+   * - [self-iteration] 注入 SubAgent 定义
+   * - [self-iteration] 合并 PreToolUse Hook
    */
   private buildQueryOptions(
     toolsConfig: Awaited<ReturnType<ToolManager['getTools']>>,
@@ -57,6 +58,7 @@ export class ClaudeEngine {
   ) {
     const { model, env } = this.config
     const guard = this.visionGuard
+    const skillInterceptor = getSkillInterceptorConfig()
 
     // 合并 allowedTools: 原有工具 + Agent (Sub-Agent 必需)
     const allowedTools = [
@@ -74,10 +76,19 @@ export class ClaudeEngine {
     // [RESUME] 查找已有的 SDK session_id
     const sdkSessionId = sessionId ? this.sessionIdStore.get(sessionId) : undefined
 
-    // [SELF-ITERATION] 合并 agents: VisionGuard agents + skill-optimizer
+    // [SELF-ITERATION] 合并 agents: VisionGuard + 个人优化器 + 他人分析器
     const agents = {
       ...guard.agents,
-      'skill-optimizer': SKILL_OPTIMIZER_AGENT,
+      'personal-optimizer': PERSONAL_OPTIMIZER_AGENT,
+      'others-analyzer': OTHERS_ANALYZER_AGENT,
+    }
+
+    // [SELF-ITERATION] 合并 hooks: VisionGuard PreToolUse + SkillInterceptor PreToolUse
+    const mergedHooks = {
+      PreToolUse: [
+        ...guard.hooks.PreToolUse,
+        ...skillInterceptor.hooks.PreToolUse,
+      ],
     }
 
     return {
@@ -91,11 +102,11 @@ export class ClaudeEngine {
       // 层级一: System Prompt 引导
       ...(finalSystemPrompt ? { systemPrompt: finalSystemPrompt } : {}),
 
-      // [SELF-ITERATION] 注入 skill-optimizer + VisionGuard SubAgent
+      // [SELF-ITERATION] 注入 SubAgent 定义
       agents,
 
-      // 层级二: PreToolUse Hook 拦截 Read 图片
-      hooks: guard.hooks,
+      // [SELF-ITERATION] 合并后的 Hook（VisionGuard + SkillInterceptor）
+      hooks: mergedHooks,
 
       // 层级三: canUseTool 兜底 (含 Bash cat 图片拦截)
       canUseTool: guard.canUseTool,

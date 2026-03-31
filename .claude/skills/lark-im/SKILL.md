@@ -136,3 +136,9 @@ lark-cli im <resource> <method> [flags] # 调用 API
 | `pins.create` | `im:message.pins:write_only` |
 | `pins.delete` | `im:message.pins:write_only` |
 | `pins.list` | `im:message.pins:read` |
+
+## 调用实践
+必须阅读以下内容：
+- 最佳实践(iteration/best-practices.md): 最佳实践
+- 最差实践(iteration/pitfalls.md): 注意避免的错误实践
+
