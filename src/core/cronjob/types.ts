@@ -29,11 +29,15 @@ export interface CronJob {
   lastRunStatus?: 'success' | 'failed'
 }
 
-export type CronTaskType = 'agent_prompt' | 'feishu_notify' | 'custom_script'
+export type CronTaskType = 'agent_prompt' | 'feishu_notify' | 'custom_script' | 'self_iteration'
 
 // ==================== 任务配置 ====================
 
-export type CronTaskConfig = AgentPromptConfig | FeishuNotifyConfig | CustomScriptConfig
+export type CronTaskConfig =
+  | AgentPromptConfig
+  | FeishuNotifyConfig
+  | CustomScriptConfig
+  | SelfIterationTaskConfig
 
 export interface AgentPromptConfig {
   type: 'agent_prompt'
@@ -55,6 +59,12 @@ export interface CustomScriptConfig {
   command: string
   /** 超时毫秒数，默认 30000 */
   timeout?: number
+}
+
+export interface SelfIterationTaskConfig {
+  type: 'self_iteration'
+  /** 'all' 扫描所有有 trace 的 Skill，或指定名称列表 */
+  skills: 'all' | string[]
 }
 
 // ==================== 执行日志 ====================

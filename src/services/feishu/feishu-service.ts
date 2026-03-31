@@ -1000,6 +1000,11 @@ export class FeishuService implements FeishuConnection {
   }
 
   private getSenderName(openId: string): string {
+    // 优先从 identityResolver 缓存中获取真实姓名
+    if (this.identityResolver) {
+      const cached = this.identityResolver.getCached(openId);
+      if (cached && cached.name) return cached.name;
+    }
     return openId;
   }
 

@@ -68,8 +68,10 @@ export class CronExecutor {
         error: errMsg.slice(0, 500),
       })
 
-      // 失败也通知飞书
-      await this.notify(job.notifyChatId, `❌ 定时任务 [${job.name}] 执行失败:\n${errMsg}`)
+      // 失败也通知飞书（self_iteration 无 chatId 则跳过）
+      if (job.notifyChatId) {
+        await this.notify(job.notifyChatId, `❌ 定时任务 [${job.name}] 执行失败:\n${errMsg}`)
+      }
 
       console.error(`❌ 定时任务失败: [${job.name}]`, error)
     }
@@ -86,6 +88,8 @@ export class CronExecutor {
         return await this.executeFeishuNotify(job)
       case 'custom_script':
         return await this.executeCustomScript(job)
+      case 'self_iteration':
+        return await this.executeSelfIteration(job)
       default:
         throw new Error(`未知任务类型: ${(job.taskConfig as any).type}`)
     }
@@ -163,9 +167,55 @@ export class CronExecutor {
   }
 
   /**
+   * self_iteration: Skill 自迭代 — 分析 traces，提炼知识，按需优化 SKILL.md
+   */
+  private async executeSelfIteration(job: CronJob): Promise<string> {
+    const config = job.taskConfig as import('./types.js').SelfIterationTaskConfig
+
+    // 动态 import 避免循环依赖
+    const { IterationChecker } = await import('../self-iteration/iteration-checker.js')
+    const { ClaudeEngine } = await import('../agent/engine/claude-engine.js')
+
+    // 创建独立 ClaudeEngine 实例（不污染主会话）
+    const engine = new ClaudeEngine()
+    const checker = new IterationChecker(engine)
+
+    console.log(`🌙 [CronExecutor] Starting self-iteration: skills=${JSON.stringify(config.skills)}`)
+
+    const report = await checker.runNightly(config.skills)
+
+    // 构建摘要
+    const lines: string[] = [
+      `🌙 Skill 自迭代报告 (${report.runAt})`,
+      '',
+    ]
+
+    for (const skill of report.skills) {
+      const icon = skill.action === 'optimized' ? '🔧' :
+                   skill.action === 'analyzed' ? '📊' :
+                   skill.action === 'error' ? '❌' : '⏭️'
+      lines.push(`${icon} **${skill.skillName}**: ${skill.action} (${skill.tracesAnalyzed} traces) — ${skill.reason}`)
+    }
+
+    if (report.skills.length === 0) {
+      lines.push('No skills with traces found.')
+    }
+
+    const summary = lines.join('\n')
+
+    // 如果配置了 notifyChatId，推送报告到飞书
+    if (job.notifyChatId) {
+      await this.notify(job.notifyChatId, summary)
+    }
+
+    return summary
+  }
+
+  /**
    * 发送飞书消息（直接发到 chat 顶层，不回话题）
    */
   private async notify(chatId: string, text: string): Promise<void> {
+    if (!chatId) return
     try {
       const bridge = getDefaultFeishuAgentBridge()
       if (bridge?.isBridgeConnected()) {

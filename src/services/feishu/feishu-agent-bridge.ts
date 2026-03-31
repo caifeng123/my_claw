@@ -448,6 +448,22 @@ private async handleNewCommand(message: FeishuMessage): Promise<void> {
         this.updateThreadActivity(message.threadId, message.chatId);
       }
 
+      // ==================== NEW: 异步解析发信人身份 ====================
+      // 确保 Agent 知道当前对话的用户是谁（姓名而非 openId）
+      const identityResolver = this.feishuService.getIdentityResolver();
+      if (identityResolver && message.senderId) {
+        try {
+          const userInfo = await identityResolver.resolveUser(message.senderId);
+          if (userInfo?.name) {
+            message.senderName = userInfo.name;
+            console.log(`👤 发信人身份已解析: ${message.senderId} → ${userInfo.name}`);
+          }
+        } catch (err) {
+          console.warn(`⚠️ 解析发信人身份失败: ${message.senderId}`, err);
+        }
+      }
+
+
       // ==================== NEW: 异步获取引用消息内容 ====================
       let quotedContent: string | null = null;
       if (message.parentId) {
@@ -785,7 +801,8 @@ ${originalContent}
       parts.push(`[Bot 身份] 你是飞书机器人「${botName || 'Bot'}」(open_id: ${botOpenId})。当用户消息中出现 @${botName || 'Bot'}(${botOpenId}) 时，说明用户在对你说话。`);
     }
 
-    // 会话上下文
+    // 会话上下文（内部 ID，不向用户展示）
+    // 发信人身份已通过 buildEnrichedContent 以 @姓名(open_id): 前缀注入到用户消息中
     if (isNewSession) {
       const ctxParts = [`chatId="${message.chatId}"`];
       if (message.threadId) {
@@ -819,7 +836,11 @@ ${originalContent}
       parts.push(quoted);
     }
 
-    parts.push(message.content);
+    // 在用户消息前加发信人标识，格式与 mentions 一致: @姓名(open_id)
+    const senderPrefix = message.senderName && message.senderId
+      ? `@${message.senderName}(${message.senderId}): `
+      : '';
+    parts.push(senderPrefix + message.content);
     return parts.join('\n\n');
   }
 

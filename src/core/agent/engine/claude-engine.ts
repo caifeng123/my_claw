@@ -3,6 +3,7 @@ import type { AgentResponse, EventHandlers } from '../types/agent'
 import { ToolManager } from './tool-manager'
 import { SessionIdStore } from './session-id-store'
 import { getVisionGuardConfig } from './vision-guard'
+import { SKILL_OPTIMIZER_AGENT } from '../../self-iteration/skill-optimizer-agent.js'
 
 export class ClaudeEngine {
   private config: {
@@ -46,6 +47,7 @@ export class ClaudeEngine {
    * 改造点：
    * - 新增 sessionId 参数，用于自动设置 resume
    * - cwd 固定为 process.cwd()，确保 resume 路径一致
+   * - [self-iteration] 注入 skill-optimizer SubAgent
    */
   private buildQueryOptions(
     toolsConfig: Awaited<ReturnType<ToolManager['getTools']>>,
@@ -72,6 +74,12 @@ export class ClaudeEngine {
     // [RESUME] 查找已有的 SDK session_id
     const sdkSessionId = sessionId ? this.sessionIdStore.get(sessionId) : undefined
 
+    // [SELF-ITERATION] 合并 agents: VisionGuard agents + skill-optimizer
+    const agents = {
+      ...guard.agents,
+      'skill-optimizer': SKILL_OPTIMIZER_AGENT,
+    }
+
     return {
       ...toolsConfig,
       allowedTools: uniqueAllowedTools,
@@ -83,8 +91,8 @@ export class ClaudeEngine {
       // 层级一: System Prompt 引导
       ...(finalSystemPrompt ? { systemPrompt: finalSystemPrompt } : {}),
 
-      // Vision Sub-Agent 定义 (haiku model, 独立上下文)
-      agents: guard.agents,
+      // [SELF-ITERATION] 注入 skill-optimizer + VisionGuard SubAgent
+      agents,
 
       // 层级二: PreToolUse Hook 拦截 Read 图片
       hooks: guard.hooks,
