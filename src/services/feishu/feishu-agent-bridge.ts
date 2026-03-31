@@ -769,14 +769,36 @@ ${originalContent}
   // ==================== NEW: 构建 enrichedContent，注入引用上下文 ====================
 
   /**
+   * 构建飞书会话上下文（注入到 systemPrompt，而非 userMessage）
+   * 
+   * 放在 systemPrompt 中的好处：
+   *   1. Agent 不会把系统上下文当作用户对话内容复述给用户
+   *   2. systemPrompt 层级的指令遵从度更高
+   *   3. chatId/senderId 等内部 ID 不会泄露到回复中
+   *
+   * [RESUME 优化]:
+   *   - 新会话: 注入完整上下文 (chatId, threadId, senderId)
+   *   - 续接会话: 仅注入 senderId（chatId/threadId 已在 SDK session 中）
+   */
+  buildSessionContext(message: FeishuMessage, isNewSession: boolean): string {
+    if (isNewSession) {
+      const ctxParts = [`chatId="${message.chatId}"`];
+      if (message.threadId) {
+        ctxParts.push(`threadId="${message.threadId}"`);
+      }
+      ctxParts.push(`senderId="${message.senderId}"`);
+      return `[飞书会话上下文] ${ctxParts.join(', ')}。这些 ID 仅供工具调用时使用，严禁在回复中向用户展示。`;
+    } else {
+      return `[飞书会话上下文] 当前消息发送者: senderId="${message.senderId}"。此 ID 仅供内部使用，严禁在回复中展示。`;
+    }
+  }
+
+  /**
    * 构建发送给 Agent 的 enrichedContent
-   * 包含：飞书系统上下文 + 引用消息内容 + 用户消息 + 文件路径
+   * 仅包含：引用消息内容 + 用户消息（不再包含系统上下文）
    */
   private buildEnrichedContent(message: FeishuMessage): string {
     const parts: string[] = [];
-
-    // 注入飞书会话上下文，供 Agent 在调用 tool（如 create_cronjob）时使用
-    parts.push(`[系统上下文] 当前飞书会话 chatId="${message.chatId}"`);
 
     // 引用消息作为前缀
     if (message.quotedContent) {
@@ -880,9 +902,11 @@ ${originalContent}
       },
     };
 
+    const isNewSession = !getAgentEngine().hasResumeSession(sessionId);
+    const sessionContext = this.buildSessionContext(message, isNewSession);
     const enrichedContent = this.buildEnrichedContent(message);
 
-    await getAgentEngine().sendMessageStream(sessionId, enrichedContent, message.senderId, eventHandlers);
+    await getAgentEngine().sendMessageStream(sessionId, enrichedContent, message.senderId, eventHandlers, sessionContext);
   }
 
   /**
@@ -923,17 +947,21 @@ ${originalContent}
       },
     };
 
+    const isNewSession = !getAgentEngine().hasResumeSession(sessionId);
+    const sessionContext = this.buildSessionContext(message, isNewSession);
     const enrichedContent = this.buildEnrichedContent(message);
 
-    await getAgentEngine().sendMessageStream(sessionId, enrichedContent, message.senderId, eventHandlers);
+    await getAgentEngine().sendMessageStream(sessionId, enrichedContent, message.senderId, eventHandlers, sessionContext);
   }
 
   /**
    * 处理常规回复 (V4.4: 使用 buildEnrichedContent)
    */
   private async handleRegularResponse(sessionId: string, message: FeishuMessage): Promise<void> {
+    const isNewSession = !getAgentEngine().hasResumeSession(sessionId);
+    const sessionContext = this.buildSessionContext(message, isNewSession);
     const enrichedContent = this.buildEnrichedContent(message);
-    const response = await getAgentEngine().sendMessage(sessionId, enrichedContent, message.senderId);
+    const response = await getAgentEngine().sendMessage(sessionId, enrichedContent, message.senderId, sessionContext);
 
     const replyMessageId = message.threadId ? message.messageId : undefined;
 

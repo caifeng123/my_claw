@@ -1,11 +1,21 @@
 /**
- * SessionManager V4.1 - 基于 ConversationStore + ContextBuilder 的会话管理
- * 替代原有的纯内存会话管理，支持持久化和智能上下文构建
+ * SessionManager V5.0 - Resume 模式会话管理
+ *
+ * 改造说明：
+ *   V4.x: 调用 ContextBuilder.build() 手动拼装上下文（裁剪/压缩/摘要/图片替换）
+ *   V5.0: 上下文管理完全交给 SDK resume 机制，SessionManager 简化为：
+ *     1. 内存中维护 SessionState（会话元数据）
+ *     2. ConversationStore 保留为辅助（记忆系统、CLI 查看、定时任务回溯）
+ *     3. 不再调用 ContextBuilder.build()
+ *
+ * 核心变化：
+ *   - 移除 buildContext() 方法（ContextBuilder 不再作为上下文管理核心）
+ *   - addMessage() 仍然写入 ConversationStore（辅助用途）
+ *   - SystemPromptBuilder 改为直接暴露，由 AgentEngine 调用
  */
 
 import type { SessionConfig, SessionState } from '../types/agent.js'
 import { ConversationStore } from '../../memory/conversation-store.js'
-import { ContextBuilder, type ContextBuildResult, type MessageParam } from './context-builder.js'
 import { estimateTokens } from '../../memory/config.js'
 
 // 简化消息类型
@@ -17,13 +27,11 @@ type SimpleMessage = {
 export class SessionManager {
   private sessions: Map<string, SessionState>
   private conversationStore: ConversationStore
-  private contextBuilder: ContextBuilder
 
-  constructor(conversationStore: ConversationStore, contextBuilder: ContextBuilder) {
+  constructor(conversationStore: ConversationStore) {
     this.sessions = new Map()
     this.conversationStore = conversationStore
-    this.contextBuilder = contextBuilder
-    console.log('📋 SessionManager V4.1 初始化完成')
+    console.log('📋 SessionManager V5.0 初始化完成（Resume 模式）')
   }
 
   /**
@@ -42,10 +50,10 @@ export class SessionManager {
 
     this.sessions.set(config.sessionId, session)
 
-    // 尝试从 ConversationStore 恢复历史
+    // 检查 ConversationStore 中是否已有历史（用于日志提示）
     const existingHistory = this.conversationStore.loadSync(config.sessionId)
     if (existingHistory.length > 0) {
-      console.log(`💾 会话 ${config.sessionId} 已恢复 ${existingHistory.length} 条历史记录`)
+      console.log(`💾 会话 ${config.sessionId} 发现 ${existingHistory.length} 条本地历史记录`)
     }
 
     console.log(`✅ 会话创建成功: ${config.sessionId}`)
@@ -67,7 +75,11 @@ export class SessionManager {
   }
 
   /**
-   * 向会话添加消息并持久化
+   * 向会话添加消息并持久化到 ConversationStore
+   *
+   * [RESUME 模式说明]:
+   *   ConversationStore 写入仅用于辅助目的（记忆系统、CLI、定时任务回溯），
+   *   不再作为下一轮对话上下文的来源。上下文由 SDK resume 机制自动管理。
    */
   addMessage(sessionId: string, message: SimpleMessage): void {
     const session = this.sessions.get(sessionId)
@@ -79,24 +91,16 @@ export class SessionManager {
     const content = this.extractTextContent(message.content)
     const role = message.role as 'user' | 'assistant' | 'system'
 
-    // 持久化到 ConversationStore（JSONL 文件）
+    // 持久化到 ConversationStore（JSONL 文件 → 辅助用途）
     this.conversationStore.append(sessionId, role, content)
 
-    // 更新内存中的会话状态（轻量引用，不保存完整历史）
+    // 更新内存中的会话状态
     session.updatedAt = new Date()
     session.contextLength += estimateTokens(content)
   }
 
   /**
-   * 构建上下文（核心方法，取代原有 getMessages）
-   * 通过 ContextBuilder 智能构建：关键词记忆检索 + 对话压缩 + 保鲜区
-   */
-  async buildContext(sessionId: string, userMessage: string): Promise<ContextBuildResult> {
-    return this.contextBuilder.build(sessionId, userMessage)
-  }
-
-  /**
-   * 获取会话的原始消息历史（兼容旧接口）
+   * 获取会话的原始消息历史（兼容旧接口，用于 CLI / API 查看）
    */
   getMessages(sessionId: string): SimpleMessage[] {
     const history = this.conversationStore.loadSync(sessionId)
@@ -115,9 +119,7 @@ export class SessionManager {
       throw new Error(`会话不存在: ${sessionId}`)
     }
 
-    // 删除整个 session 目录（对话 + 文件一起清除）
     this.conversationStore.deleteSession(sessionId)
-
     session.messages = []
     session.contextLength = 0
     session.updatedAt = new Date()
@@ -174,7 +176,6 @@ export class SessionManager {
     const totalSessions = this.sessions.size
     const persistedSessions = this.conversationStore.listSessions().length
 
-    // 从 ConversationStore 获取消息总数
     let totalMessages = 0
     for (const [, session] of this.sessions) {
       const history = this.conversationStore.loadSync(session.sessionId)
@@ -192,9 +193,6 @@ export class SessionManager {
 
   // ==================== 内部方法 ====================
 
-  /**
-   * 提取文本内容（兼容字符串和数组格式）
-   */
   private extractTextContent(content: string | any[]): string {
     if (typeof content === 'string') return content
     if (Array.isArray(content)) {
