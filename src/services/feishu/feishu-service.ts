@@ -14,7 +14,7 @@ import type {
 } from './types.js';
 import { fileURLToPath } from 'url';
 import { IdentityResolver } from './identity-resolver.js';
-import type { MentionInfo } from './types.js';
+import { parseMentions, isBotMentioned as checkBotMentioned } from './mention-utils.js';
 
 // AI 修复重试配置
 const AI_FIX_MAX_RETRIES = 2; // AI 修复最大重试次数
@@ -334,24 +334,10 @@ export class FeishuService implements FeishuConnection {
   }
 
   /**
-   * 检查群聊消息是否 @了机器人
-   * @param mentions 消息中的 mentions 列表
-   * @returns true 表示消息中 @了机器人
+   * 检查群聊消息是否 @了机器人（委托给纯函数 mention-utils.isBotMentioned）
    */
   private isBotMentioned(mentions: any[]): boolean {
-    if (!mentions || !Array.isArray(mentions) || mentions.length === 0) {
-      return false;
-    }
-    // 通过 botOpenId 精确匹配（兼容 id 为 string 或 object 两种格式）
-    if (this.botOpenId) {
-      return mentions.some(m => {
-        const openId = typeof m.id === 'string' ? m.id : m.id?.open_id;
-        return openId === this.botOpenId;
-      });
-    }
-    // 降级策略: botOpenId 未获取到时，无法精确判断，放行所有群聊消息
-    console.warn('⚠️ botOpenId 未获取到，无法判断群聊消息是否 @机器人，放行处理');
-    return true;
+    return checkBotMentioned(mentions, this.botOpenId || undefined);
   }
 
   private async handleMessage(data: any): Promise<void> {
@@ -400,40 +386,18 @@ export class FeishuService implements FeishuConnection {
       // ==================== 处理 @ 提及（结构化 + 文本替换） ====================
       console.log('🔍 [handleMessage] 原始 mentions:', JSON.stringify(message.mentions, null, 2));
       console.log('🔍 [handleMessage] 替换前 content:', content);
-      const structuredMentions: MentionInfo[] = [];
-      if (message.mentions && Array.isArray(message.mentions)) {
-        for (const mention of message.mentions) {
-          // 兼容两种 SDK 版本: mention.id 可能是 string(open_id) 或 object({ open_id })
-          const mentionOpenId = typeof mention.id === 'string'
-            ? mention.id
-            : mention.id?.open_id || '';
-          const mentionName = mention.name || '';
-          const isSelf = !!(this.botOpenId && mentionOpenId === this.botOpenId);
 
-          // 构建结构化 MentionInfo
-          if (mentionOpenId) {
-            structuredMentions.push({
-              userId: mentionOpenId,
-              name: mentionName,
-              isSelf,
-            });
+      const { content: replacedContent, mentions: structuredMentions, identityHints } =
+        parseMentions(content, message.mentions, this.botOpenId || undefined);
+      content = replacedContent;
 
-            // 顺便缓存到 IdentityResolver（从 mention 事件中获得的姓名）
-            if (this.identityResolver && mentionName) {
-              this.identityResolver.cacheFromMention(mentionOpenId, mentionName);
-            }
-          }
-
-          // 文本替换：所有 @（包括 bot）都替换为 @姓名(open_id)
-          if (mention.key && mentionOpenId) {
-            content = content.replace(mention.key, `@${mentionName}(${mentionOpenId})`);
-          } else if (mention.key) {
-            content = content.replace(mention.key, `@${mentionName}`);
-          }
+      // 将 mention 中的身份信息写入缓存
+      if (this.identityResolver) {
+        for (const [openId, name] of identityHints) {
+          this.identityResolver.cacheFromMention(openId, name);
         }
-        // 清理多余空格
-        content = content.replace(/\s+/g, ' ').trim();
       }
+
       console.log('🔍 [handleMessage] 替换后 content:', content);
       console.log('🔍 [handleMessage] 结构化 mentions:', JSON.stringify(structuredMentions, null, 2));
 

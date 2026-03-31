@@ -12,6 +12,7 @@
 import { FeishuService, FeishuSendError } from './feishu-service.js';
 import { StreamingCardRenderer } from './streaming-card-renderer.js';
 import type { FeishuConnectionConfig, FeishuMessage, ThreadContext } from './types.js';
+import { formatMentionsForPrompt } from './mention-utils.js';
 import { getAgentEngine } from '../../core/agent-registry.js';
 import type { EventHandlers } from '@/core/agent/types/agent.js';
 import { writeFileSync, existsSync, readdirSync } from 'fs';
@@ -797,11 +798,9 @@ ${originalContent}
     }
 
     // mentions 上下文：告知 agent 本次消息中有哪些人被 @
-    if (message.mentions && message.mentions.length > 0) {
-      const mentionDescriptions = message.mentions
-        .map(m => m.isSelf ? `@${m.name}(${m.userId}) [这是你自己]` : `@${m.name}(${m.userId})`)
-        .join(', ');
-      parts.push(`[本次消息的 @提及] ${mentionDescriptions}`);
+    const mentionPrompt = formatMentionsForPrompt(message.mentions);
+    if (mentionPrompt) {
+      parts.push(mentionPrompt);
     }
 
     return parts.join('\n');
