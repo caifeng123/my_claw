@@ -1,6 +1,15 @@
 /**
- * AgentEngine V4.3 - 智能分层记忆系统 + CronJob 定时任务
- * 集成 MemoryDB、ConversationStore、ContextBuilder、SystemPromptBuilder、CronScheduler
+ * AgentEngine V5.0 - Resume 模式
+ *
+ * 改造说明：
+ *   V4.x: 每次调用 query() 都是新 session，通过 ContextBuilder 手动拼接历史
+ *   V5.0: 使用 SDK resume 机制续接对话，核心变化：
+ *     1. sendMessage/sendMessageStream 只传当前用户消息给 ClaudeEngine
+ *     2. ClaudeEngine 内部通过 resume 选项自动恢复完整对话上下文
+ *     3. ContextBuilder 仅负责构建 system prompt（记忆注入）
+ *     4. ConversationStore 保留为辅助（记忆系统、CLI、定时任务）
+ *
+ * 集成: MemoryDB、ConversationStore、SystemPromptBuilder、CronScheduler、SessionIdStore
  */
 
 import { ClaudeEngine } from './engine/claude-engine.js'
@@ -47,51 +56,44 @@ export class AgentEngine {
     this.memoryDb = new MemoryDB()
     this.conversationStore = new ConversationStore()
 
-    // 上下文层
+    // 上下文层（Resume 模式下仅负责 system prompt 构建）
     const systemPromptBuilder = new SystemPromptBuilder(this.memoryDb)
-    this.contextBuilder = new ContextBuilder(this.conversationStore, systemPromptBuilder)
+    this.contextBuilder = new ContextBuilder(systemPromptBuilder)
 
-    // Claude 引擎层
+    // Claude 引擎层（内含 SessionIdStore，管理 resume 映射）
     this.claudeEngine = new ClaudeEngine()
-    // 注入压缩查询函数（延迟注入，避免循环依赖）
-    this.contextBuilder.setCompressQuery(
-      this.claudeEngine.compressQuery.bind(this.claudeEngine)
-    )
 
-    // 初始化会话管理器（注入 ConversationStore + ContextBuilder）
-    this.sessionManager = new SessionManager(this.conversationStore, this.contextBuilder)
+    // [RESUME] 不再需要注入 compressQuery（SDK 自动处理上下文压缩）
+    // this.contextBuilder.setCompressQuery(...)
+
+    // 初始化会话管理器（Resume 模式下不再需要 ContextBuilder）
+    this.sessionManager = new SessionManager(this.conversationStore)
     // 初始化流处理器
     this.streamHandler = new StreamHandler()
 
-    // 注册到 registry（必须在 CronScheduler 之前，因为 tick 会 getAgentEngine()）
+    // 注册到 registry
     registerAgentEngine(this)
 
-    // 定时任务（构造即启动 tick，tick 中会 getAgentEngine()）
+    // 定时任务
     this.cronScheduler = new CronScheduler()
 
-    // 工具层（统一注册，依赖 cronScheduler 实例）
+    // 工具层
     this.toolManager = new ToolManager()
     this.registerBuiltinTools()
     this.claudeEngine.toolManager = this.toolManager
 
-    console.log('🤖 Agent引擎 V4.3 初始化完成（智能分层记忆 + CronJob）')
+    console.log('🤖 Agent引擎 V5.0 初始化完成（Resume 模式）')
   }
 
   /**
    * 统一注册所有内置工具
    */
   private registerBuiltinTools(): void {
-    // 自定义工具
     this.toolManager.registerTools([calculatorTool, timeTool])
-    // Tavily 工具
     this.toolManager.registerTools(createTavilyTools())
-    // 内存工具
     this.toolManager.registerTools(createMemoryTools(this.memoryDb))
-    // CronJob 工具
     this.toolManager.registerTools(createCronjobTools(this.cronScheduler))
-    // Link Analyze 工具
     this.toolManager.registerTools(createLinkAnalyzeTools())
-    // 用户身份授权工具
     const appId = process.env.FEISHU_APP_ID || ''
     const appSecret = process.env.FEISHU_APP_SECRET || ''
     if (appId && appSecret) {
@@ -101,11 +103,16 @@ export class AgentEngine {
 
   /**
    * 发送消息给Agent（非流式）
+   *
+   * [RESUME 改造]:
+   *   原来: 调用 buildContext() 拼装历史 → 整个历史作为 prompt 发送
+   *   现在: 只传当前消息 + sessionId → ClaudeEngine 内部通过 resume 恢复上下文
    */
   async sendMessage(
     sessionId: string,
     message: string,
     userId?: string,
+    sessionContext?: string,
   ): Promise<AgentResponse> {
     try {
       // 获取或创建会话
@@ -114,37 +121,35 @@ export class AgentEngine {
         session = this.sessionManager.createSession({ sessionId, userId })
       }
 
-      // 添加用户消息到会话（持久化到 JSONL）
-      const userMessage: SimpleMessage = {
-        role: 'user',
-        content: message,
-      }
+      // 添加用户消息到 ConversationStore（辅助用途：记忆系统、CLI）
+      const userMessage: SimpleMessage = { role: 'user', content: message }
       this.sessionManager.addMessage(sessionId, userMessage)
 
-      // 通过 ContextBuilder 构建上下文（关键词记忆检索 + 对话压缩）
-      const context = await this.sessionManager.buildContext(sessionId, message)
+      // [RESUME] 构建最新的 system prompt（注入高优记忆）
+      const systemPromptResult = this.contextBuilder.buildSystemPrompt()
 
-      console.log(`📊 上下文构建完成 [session=${sessionId}]:`, {
-        systemPromptTokens: context.stats.systemPromptTokens,
-        summaryTokens: context.stats.summaryTokens,
-        recentTokens: context.stats.recentTokens,
-        totalTokens: context.stats.totalTokens,
-        compressionTriggered: context.stats.compressionTriggered,
-        totalRounds: context.stats.totalRounds,
-        recentRounds: context.stats.recentRounds,
+      // 将飞书会话上下文追加到 system prompt（而非 userMessage）
+      // 这样 Agent 不会把 chatId/senderId 等内部 ID 当作对话内容复述给用户
+      const finalSystemPrompt = sessionContext
+        ? `${systemPromptResult.text}\n\n${sessionContext}`
+        : systemPromptResult.text
+
+      console.log(`📊 System prompt 构建完成 [session=${sessionId}]:`, {
+        systemPromptTokens: systemPromptResult.stats.totalTokens,
+        memoryCount: systemPromptResult.stats.memoryCount,
+        hasSessionContext: !!sessionContext,
+        resumeMode: true,
       })
 
-      // 发送消息给Claude（带 systemPrompt）
+      // [RESUME] 只传当前消息 + sessionId，ClaudeEngine 通过 resume 恢复上下文
       const response = await this.claudeEngine.sendMessage(
-        context.messages,
-        context.systemPrompt,
+        message,
+        finalSystemPrompt,
+        sessionId,
       )
 
-      // 添加助手响应到会话（持久化）
-      const assistantMessage: SimpleMessage = {
-        role: 'assistant',
-        content: response.content,
-      }
+      // 添加助手响应到 ConversationStore（辅助用途）
+      const assistantMessage: SimpleMessage = { role: 'assistant', content: response.content }
       this.sessionManager.addMessage(sessionId, assistantMessage)
 
       return response
@@ -156,14 +161,18 @@ export class AgentEngine {
 
   /**
    * 流式发送消息给Agent
+   *
+   * [RESUME 改造]:
+   *   原来: buildContext() 返回 messages 数组 → 传给 sendMessageStream
+   *   现在: 只传当前消息 + sessionId → SDK resume 自动恢复完整上下文
    */
   async sendMessageStream(
     sessionId: string,
     message: string,
     userId?: string,
-    eventHandlers?: EventHandlers
+    eventHandlers?: EventHandlers,
+    sessionContext?: string,
   ): Promise<void> {
-    // 创建 AbortController 用于支持 /stop 中断
     const abortController = new AbortController()
     this.abortControllers.set(sessionId, abortController)
 
@@ -174,21 +183,24 @@ export class AgentEngine {
         session = this.sessionManager.createSession({ sessionId, userId })
       }
 
-      // 添加用户消息到会话（持久化到 JSONL）
-      const userMessage: SimpleMessage = {
-        role: 'user',
-        content: message,
-      }
+      // 添加用户消息到 ConversationStore（辅助用途）
+      const userMessage: SimpleMessage = { role: 'user', content: message }
       this.sessionManager.addMessage(sessionId, userMessage)
 
-      // 通过 ContextBuilder 构建上下文
-      const context = await this.sessionManager.buildContext(sessionId, message)
+      // [RESUME] 构建最新的 system prompt
+      const systemPromptResult = this.contextBuilder.buildSystemPrompt()
 
-      console.log(`📊 上下文构建完成(流式) [session=${sessionId}]:`, {
-        systemPromptTokens: context.stats.systemPromptTokens,
-        compressionTriggered: context.stats.compressionTriggered,
-        totalRounds: context.stats.totalRounds,
-        recentRounds: context.stats.recentRounds,
+      // 将飞书会话上下文追加到 system prompt（而非 userMessage）
+      // 这样 Agent 不会把 chatId/senderId 等内部 ID 当作对话内容复述给用户
+      const finalSystemPrompt = sessionContext
+        ? `${systemPromptResult.text}\n\n${sessionContext}`
+        : systemPromptResult.text
+
+      console.log(`📊 System prompt 构建完成(流式) [session=${sessionId}]:`, {
+        systemPromptTokens: systemPromptResult.stats.totalTokens,
+        memoryCount: systemPromptResult.stats.memoryCount,
+        hasSessionContext: !!sessionContext,
+        resumeMode: true,
       })
 
       // 设置流式处理器
@@ -196,22 +208,19 @@ export class AgentEngine {
         this.streamHandler.setEventHandlers(eventHandlers)
       }
 
-      // 发送流式消息给Claude（带 systemPrompt + abortController）
+      // [RESUME] 只传当前消息 + sessionId，SDK resume 自动恢复完整上下文
       const responseContent = await this.claudeEngine.sendMessageStream(
-        context.messages,
+        message,
         eventHandlers || this.streamHandler.getEventHandlers(),
-        context.systemPrompt,
+        finalSystemPrompt,
         abortController,
+        sessionId,
       )
 
-      // 添加助手响应到会话（持久化）
-      const assistantMessage: SimpleMessage = {
-        role: 'assistant',
-        content: responseContent,
-      }
+      // 添加助手响应到 ConversationStore（辅助用途）
+      const assistantMessage: SimpleMessage = { role: 'assistant', content: responseContent }
       this.sessionManager.addMessage(sessionId, assistantMessage)
     } catch (error) {
-      // 如果是主动中断，不当作错误处理
       if (abortController.signal.aborted) {
         console.log(`⏹️ 会话 ${sessionId} 已被用户中断`)
         return
@@ -228,46 +237,39 @@ export class AgentEngine {
 
   // ==================== 工具管理 ====================
 
-  /**
-   * 注册工具
-   */
   registerTool(options: any): void {
     this.toolManager.registerTool(options)
   }
 
-  /**
-   * 获取所有工具名称
-   */
   getToolNames(): string[] {
     return this.toolManager.getToolNames()
   }
 
   // ==================== 会话管理 ====================
 
-  /**
-   * 创建会话
-   */
   createSession(config: SessionConfig): SessionState {
     return this.sessionManager.createSession(config)
   }
 
-  /**
-   * 获取会话
-   */
   getSession(sessionId: string): SessionState | null {
     return this.sessionManager.getSession(sessionId)
   }
 
-  /**
-   * 删除会话
-   */
   deleteSession(sessionId: string): boolean {
+    // [RESUME] 同时清理 SDK session 映射
+    this.claudeEngine.getSessionIdStore().delete(sessionId)
     return this.sessionManager.deleteSession(sessionId)
   }
 
   /**
-   * 中断会话的当前请求
+   * 检查指定 session 是否存在 SDK resume 映射
+   * 用于判断是否为新会话（首次对话 vs 续接对话）
+   * 场景: feishu-agent-bridge 决定注入完整上下文还是仅注入 senderId
    */
+  hasResumeSession(sessionId: string): boolean {
+    return this.claudeEngine.getSessionIdStore().has(sessionId)
+  }
+
   abortSession(sessionId: string): boolean {
     const controller = this.abortControllers.get(sessionId)
     if (controller) {
@@ -278,64 +280,42 @@ export class AgentEngine {
     return false
   }
 
-  /**
-   * 获取会话统计
-   */
   getSessionStats(): any {
     return this.sessionManager.getSessionStats()
   }
 
-  /**
-   * 清理过期会话
-   */
   cleanupExpiredSessions(maxAge?: number): number {
+    // [RESUME] 同步清理过期的 SDK session 映射
+    this.claudeEngine.getSessionIdStore().cleanup()
     return this.sessionManager.cleanupExpiredSessions(maxAge)
   }
 
   // ==================== 事件处理 ====================
 
-  /**
-   * 设置流式事件处理器
-   */
   setEventHandlers(eventHandlers: EventHandlers): void {
     this.streamHandler.setEventHandlers(eventHandlers)
   }
 
-  /**
-   * 创建WebSocket处理器
-   */
   createWebSocketHandler(ws: WebSocket): EventHandlers {
     return this.streamHandler.createWebSocketHandler(ws)
   }
 
-  /**
-   * 创建HTTP流处理器
-   */
   createHTTPStreamHandler(write: (chunk: string) => void): EventHandlers {
     return this.streamHandler.createHTTPStreamHandler(write)
   }
 
   // ==================== 记忆系统 ====================
 
-  /**
-   * 获取 MemoryDB 实例（供外部使用，如 CLI、路由）
-   */
   getMemoryDb(): MemoryDB {
     return this.memoryDb
   }
 
-  /**
-   * 获取 ConversationStore 实例
-   */
   getConversationStore(): ConversationStore {
     return this.conversationStore
   }
 
   // ==================== CronJob ====================
 
-  /**
-   * 获取 CronScheduler 实例
-   */
   getCronScheduler(): CronScheduler {
     return this.cronScheduler
   }
