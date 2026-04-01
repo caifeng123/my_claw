@@ -1,13 +1,14 @@
 /**
- * AgentEngine V5.2 - Resume 模式 + Skill 自迭代 (CronJob 驱动)
+ * AgentEngine V5.3 - Resume 模式 + Skill 自迭代 (全量 Timeline 采集)
  *
  * V5.0: SDK resume 机制
  * V5.1: Skill 自迭代 (setInterval 驱动) — 已废弃
- * V5.2: Skill 自迭代 (CronJob 驱动)
- *   - TraceCollector 通过 EventTap 采集所有 Skill trace（成功+失败）
- *   - 按天写入 .claude/skills/{name}/iteration/traces/{date}.jsonl
- *   - 每天 0 点 CronJob 触发 IterationChecker.runNightly()
- *   - SubAgent 分析 trace → 提炼知识 → 按需优化 SKILL.md
+ * V5.2: Skill 自迭代 (CronJob 驱动) — Trace per-Skill 采集
+ * V5.3: Skill 自迭代 (全量 Timeline 采集)
+ *   - TraceCollector 改为 per-turn 全量 timeline 记录
+ *   - 不在采集时做 Skill 归属判断
+ *   - 读取时按 skill_start 位置 slice，按需获取各 Skill 视角
+ *   - 同时兼容写入旧格式（per-skill JSONL），iteration-checker 无需改动
  */
 
 import { ClaudeEngine } from './engine/claude-engine.js'
@@ -85,7 +86,7 @@ export class AgentEngine {
     // [SELF-ITERATION] 确保内置 CronJob 存在
     this.ensureSelfIterationCronJob()
 
-    console.log('🤖 Agent引擎 V5.2 初始化完成（Resume + Skill 自迭代 CronJob）')
+    console.log('🤖 Agent引擎 V5.3 初始化完成（Resume + Skill 自迭代 Timeline）')
   }
 
   /**
@@ -127,7 +128,12 @@ export class AgentEngine {
   // ==================== EventTap — Trace 采集 ====================
 
   /**
-   * 包装 eventHandlers，注入 TraceCollector
+   * 包装 eventHandlers，注入全量 timeline 采集
+   *
+   * V5.3 改造：
+   *   - 不再维护 activeTraces / pendingSteps
+   *   - 只做一件事：往 timeline 里 push 事件
+   *   - Skill 归属判断完全交给读取时的 sliceForSkill()
    */
   private wrapWithTraceCollector(
     sessionId: string,
@@ -136,6 +142,9 @@ export class AgentEngine {
   ): EventHandlers {
     const tc = this.traceCollector
     const original = eventHandlers ?? {}
+
+    // 启动 turn 级别的 timeline 记录
+    tc.startTurn(sessionId, userMessage)
 
     return {
       ...original,
@@ -146,11 +155,27 @@ export class AgentEngine {
         parentToolUseId: string | null,
         toolUseId: string,
       ) => {
-        if (toolName === 'Skill' && !parentToolUseId) {
-          const skillName = input?.skill_name || input?.name || input?.skill || 'unknown'
-          tc.startTrace(skillName, toolUseId, sessionId, userMessage, input)
-        } else if (parentToolUseId && tc.hasActiveTrace(parentToolUseId)) {
-          tc.addStepStart(parentToolUseId, toolName, toolUseId, input ?? {})
+        if (toolName === 'Skill') {
+          // Skill 工具调用 → 记录 skill_start
+          const skillName = input?.skill || input?.name || input?.skill_name || 'unknown'
+          tc.addEvent(sessionId, {
+            ts: Date.now(),
+            type: 'skill_start',
+            skill: skillName,
+            toolUseId,
+            parentToolUseId,
+            input: input ?? {},
+          })
+        } else {
+          // 普通工具调用 → 记录 tool_start
+          tc.addEvent(sessionId, {
+            ts: Date.now(),
+            type: 'tool_start',
+            tool: toolName,
+            toolUseId,
+            parentToolUseId,
+            input: input ?? {},
+          })
         }
 
         await original.onToolUseStart?.(toolName, input, parentToolUseId, toolUseId)
@@ -164,14 +189,40 @@ export class AgentEngine {
       ) => {
         const resultStr = typeof result === 'string' ? result : JSON.stringify(result)
 
-        if (tc.hasActiveTrace(toolUseId)) {
-          await tc.finishTrace(toolUseId, resultStr)
-        } else if (tc.hasPendingStep(toolUseId)) {
-          const status = resultStr.toLowerCase().includes('error') ? 'error' : 'ok'
-          tc.addStepEnd(toolUseId, resultStr, status)
+        if (toolName === 'Skill') {
+          // Skill tool_result 返回 → 记录 skill_ready
+          tc.addEvent(sessionId, {
+            ts: Date.now(),
+            type: 'skill_ready',
+            toolUseId,
+            output: resultStr,
+          })
+        } else {
+          // 普通工具结束 → 记录 tool_end
+          const status = resultStr.toLowerCase().includes('error') ? 'error' as const : 'ok' as const
+          tc.addEvent(sessionId, {
+            ts: Date.now(),
+            type: 'tool_end',
+            tool: toolName,
+            toolUseId,
+            output: resultStr,
+            status,
+          })
         }
 
         await original.onToolUseStop?.(toolName, result, parentToolUseId, toolUseId)
+      },
+
+      onContentStop: async () => {
+        // Turn 结束 → 关闭 timeline 并持久化
+        await tc.finishTurn(sessionId, '')
+        await original.onContentStop?.()
+      },
+
+      onError: async (error: string) => {
+        // 异常时也关闭 timeline
+        await tc.finishTurn(sessionId, `Error: ${error}`)
+        await original.onError?.(error)
       },
     }
   }
@@ -256,7 +307,7 @@ export class AgentEngine {
         resumeMode: true,
       })
 
-      // [SELF-ITERATION] 包装 eventHandlers，注入 Trace 采集
+      // [SELF-ITERATION] 包装 eventHandlers，注入全量 timeline 采集
       const wrappedHandlers = this.wrapWithTraceCollector(
         sessionId,
         message,
@@ -287,8 +338,6 @@ export class AgentEngine {
       })
     } finally {
       this.abortControllers.delete(sessionId)
-
-
     }
   }
 

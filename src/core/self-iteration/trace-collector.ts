@@ -1,167 +1,221 @@
 // src/core/self-iteration/trace-collector.ts
-// Trace 采集器 (V4) — 由 EventTap 驱动，按天写入 traces/{date}.jsonl
+// Trace 采集器 (V5) — 全量 timeline 模式
 //
-// 核心变化：
-//   - 不截断任何内容，完整记录所有 tool 输入输出
-//   - 精简字段：去掉 traceId / sessionId / skillName（已在文件路径中）
-//   - 嵌套 Skill 自然作为 step 记录（parentToolUseId 链）
+// V5 核心变化：
+//   - 按 turn 维度记录全量 timeline 事件流
+//   - 写入 per-skill 路径: {skillName}/iteration/traces/{date}.jsonl
+//   - 读取时由 sliceForSkill() 按需切片
 
 import {
   existsSync,
   mkdirSync,
   appendFileSync,
+  readFileSync,
 } from 'node:fs'
 import { join, dirname } from 'node:path'
-import type { SkillTrace, SkillStep } from './types.js'
+import type {
+  TimelineEvent,
+  TurnTrace,
+  SkillView,
+  SkillStep,
+  SkillTrace,
+} from './types.js'
 import { SKILLS_DIR } from './config.js'
 
-/** 活跃 Trace — 内存中跟踪正在执行的 Skill 调用 */
-interface ActiveTrace {
-  skillName: string
-  skillToolUseId: string
+/** 活跃 turn — 内存中跟踪正在进行的 turn */
+interface ActiveTurn {
+  sessionId: string
   userIntent: string
   startedAt: number
-  steps: SkillStep[]
-  /** toolUseId → pending step info */
-  pendingSteps: Map<string, {
-    toolName: string
-    input: Record<string, unknown>
-    startedAt: number
-  }>
+  timeline: TimelineEvent[]
 }
 
 export class TraceCollector {
-  /** Skill toolUseId → ActiveTrace */
-  private activeTraces = new Map<string, ActiveTrace>()
+  /** sessionId → ActiveTurn（一个 session 同时只有一个活跃 turn） */
+  private activeTurns = new Map<string, ActiveTurn>()
 
   // ─── Public API（由 EventTap 调用） ───
 
-  /**
-   * Skill 调用开始
-   */
-  startTrace(
-    skillName: string,
-    skillToolUseId: string,
-    _sessionId: string,
-    userIntent: string,
-    _skillInput?: Record<string, unknown>,
-  ): void {
-    this.activeTraces.set(skillToolUseId, {
-      skillName,
-      skillToolUseId,
+  startTurn(sessionId: string, userIntent: string): void {
+    this.activeTurns.set(sessionId, {
+      sessionId,
       userIntent,
       startedAt: Date.now(),
-      steps: [],
-      pendingSteps: new Map(),
-    })
-
-    console.log(`📊 [TraceCollector] Started trace for "${skillName}" (toolUseId=${skillToolUseId})`)
-  }
-
-  /**
-   * Skill 内部工具调用开始（包括嵌套 Skill）
-   */
-  addStepStart(
-    parentToolUseId: string,
-    toolName: string,
-    toolUseId: string,
-    input: Record<string, unknown>,
-  ): void {
-    const trace = this.activeTraces.get(parentToolUseId)
-    if (!trace) return
-
-    trace.pendingSteps.set(toolUseId, {
-      toolName,
-      input,
-      startedAt: Date.now(),
+      timeline: [],
     })
   }
 
-  /**
-   * Skill 内部工具调用结束 — 不截断结果
-   */
-  addStepEnd(toolUseId: string, result: string, status: 'ok' | 'error'): void {
-    for (const trace of this.activeTraces.values()) {
-      const pending = trace.pendingSteps.get(toolUseId)
-      if (!pending) continue
-
-      trace.pendingSteps.delete(toolUseId)
-      trace.steps.push({
-        toolName: pending.toolName,
-        input: pending.input,
-        output: result,
-        durationMs: Date.now() - pending.startedAt,
-        status,
-      })
-      return
-    }
+  addEvent(sessionId: string, event: TimelineEvent): void {
+    const turn = this.activeTurns.get(sessionId)
+    if (!turn) return
+    turn.timeline.push(event)
   }
 
-  /**
-   * Skill 执行结束 — 持久化完整 trace（不截断）
-   */
-  async finishTrace(skillToolUseId: string, result: string): Promise<void> {
-    const active = this.activeTraces.get(skillToolUseId)
-    if (!active) return
+  async finishTurn(sessionId: string, finalOutput: string): Promise<void> {
+    const turn = this.activeTurns.get(sessionId)
+    if (!turn) return
 
-    this.activeTraces.delete(skillToolUseId)
+    this.activeTurns.delete(sessionId)
 
     const now = Date.now()
 
-    const trace: SkillTrace = {
-      startedAt: new Date(active.startedAt).toISOString(),
+    turn.timeline.push({
+      ts: now,
+      type: 'turn_end',
+      output: finalOutput,
+    })
+
+    const trace: TurnTrace = {
+      sessionId: turn.sessionId,
+      userIntent: turn.userIntent,
+      startedAt: new Date(turn.startedAt).toISOString(),
       finishedAt: new Date(now).toISOString(),
-      duration: now - active.startedAt,
-      userIntent: active.userIntent,
-      steps: active.steps,
-      output: result,
-      status: this.inferStatus(result, active.steps),
+      duration: now - turn.startedAt,
+      timeline: turn.timeline,
+      output: finalOutput,
+      status: TraceCollector.inferStatusFromEvents(turn.timeline),
     }
 
+    // 只有包含 Skill 调用的 turn 才写入
+    const hasSkill = turn.timeline.some(e => e.type === 'skill_start')
+    if (!hasSkill) return
+
     try {
-      this.appendTrace(active.skillName, trace)
+      this.persistPerSkill(trace)
     } catch (err) {
       console.error(`[TraceCollector] Failed to persist trace:`, err)
     }
 
+    const skillCount = turn.timeline.filter(e => e.type === 'skill_start').length
+    const toolCount = turn.timeline.filter(e => e.type === 'tool_start').length
     console.log(
-      `📊 [TraceCollector] Finished "${active.skillName}": ${trace.status} (${trace.duration}ms, ${trace.steps.length} steps)`,
+      `📊 [TraceCollector] Turn finished: ${trace.status} (${trace.duration}ms, ` +
+      `${skillCount} skill(s), ${toolCount} tool call(s))`,
     )
   }
 
-  hasActiveTrace(toolUseId: string): boolean {
-    return this.activeTraces.has(toolUseId)
+  hasActiveTurn(sessionId: string): boolean {
+    return this.activeTurns.has(sessionId)
   }
 
-  hasPendingStep(toolUseId: string): boolean {
-    for (const trace of this.activeTraces.values()) {
-      if (trace.pendingSteps.has(toolUseId)) return true
+  // ─── 静态工具：读取时 slice ───
+
+  static sliceForSkill(trace: TurnTrace, skillName: string): SkillView | null {
+    const startIdx = trace.timeline.findIndex(
+      e => e.type === 'skill_start' && e.skill === skillName,
+    )
+    if (startIdx === -1) return null
+
+    const events = trace.timeline.slice(startIdx)
+    const startTs = events[0].ts
+    const endTs = events[events.length - 1]?.ts ?? startTs
+
+    return {
+      skillName,
+      startedAt: startTs,
+      finishedAt: endTs,
+      duration: endTs - startTs,
+      events,
+      steps: TraceCollector.extractSteps(events),
+      status: TraceCollector.inferStatusFromEvents(events),
     }
-    return false
   }
 
-  // ─── Private ───
+  static extractSkillNames(trace: TurnTrace): string[] {
+    return trace.timeline
+      .filter(e => e.type === 'skill_start' && e.skill)
+      .map(e => e.skill!)
+  }
 
-  private inferStatus(
-    result: string,
-    steps: SkillStep[],
-  ): 'success' | 'failure' | 'partial' {
-    const hasErrorSteps = steps.some(s => s.status === 'error')
-    const failureKeywords = ['error', 'failed', 'Error', 'FAILED', '失败', '错误', 'exception', 'Exception']
-    const resultLower = result.toLowerCase()
-    const resultHasError = failureKeywords.some(kw => resultLower.includes(kw.toLowerCase()))
+  static toSkillTrace(view: SkillView, userIntent: string, sessionId: string): SkillTrace {
+    return {
+      sessionId,
+      startedAt: new Date(view.startedAt).toISOString(),
+      finishedAt: new Date(view.finishedAt).toISOString(),
+      duration: view.duration,
+      userIntent,
+      steps: view.steps,
+      output: view.events.find(e => e.type === 'turn_end')?.output ?? '',
+      status: view.status,
+    }
+  }
 
-    if (resultHasError && hasErrorSteps) return 'failure'
-    if (resultHasError || hasErrorSteps) return 'partial'
+  // ─── Private：持久化 ───
+
+  /**
+   * 按 Skill 维度写入各自目录
+   * 路径：.claude/skills/{skillName}/iteration/traces/{date}.jsonl
+   */
+  private persistPerSkill(trace: TurnTrace): void {
+    const skillNames = TraceCollector.extractSkillNames(trace)
+    const today = new Date().toISOString().slice(0, 10)
+
+    for (const skillName of skillNames) {
+      const view = TraceCollector.sliceForSkill(trace, skillName)
+      if (!view) continue
+
+      const skillTrace = TraceCollector.toSkillTrace(view, trace.userIntent, trace.sessionId)
+      const filePath = join(SKILLS_DIR, skillName, 'iteration', 'traces', `${today}.jsonl`)
+      const dir = dirname(filePath)
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+      appendFileSync(filePath, JSON.stringify(skillTrace) + '\n', 'utf-8')
+
+      console.log(`📝 [TraceCollector] Written trace for "${skillName}" → ${filePath}`)
+    }
+  }
+
+  // ─── Private：工具方法 ───
+
+  private static extractSteps(events: TimelineEvent[]): SkillStep[] {
+    const steps: SkillStep[] = []
+    const pending = new Map<string, TimelineEvent>()
+
+    for (const e of events) {
+      if (e.type === 'tool_start' && e.toolUseId) {
+        pending.set(e.toolUseId, e)
+      } else if (e.type === 'tool_end' && e.toolUseId) {
+        const start = pending.get(e.toolUseId)
+        if (start) {
+          pending.delete(e.toolUseId)
+          steps.push({
+            toolName: start.tool ?? 'unknown',
+            input: start.input ?? {},
+            output: e.output ?? '',
+            durationMs: e.ts - start.ts,
+            status: e.status ?? 'ok',
+          })
+        }
+      }
+    }
+
+    return steps
+  }
+
+  private static inferStatusFromEvents(events: TimelineEvent[]): 'success' | 'failure' | 'partial' {
+    const errors = events.filter(e => e.type === 'tool_end' && e.status === 'error')
+    const tools = events.filter(e => e.type === 'tool_end')
+    if (tools.length === 0) return 'success'
+    if (errors.length === tools.length) return 'failure'
+    if (errors.length > 0) return 'partial'
     return 'success'
   }
 
-  private appendTrace(skillName: string, trace: SkillTrace): void {
-    const today = new Date().toISOString().slice(0, 10)
-    const filePath = join(SKILLS_DIR, skillName, 'iteration', 'traces', `${today}.jsonl`)
-    const dir = dirname(filePath)
-    if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+  // ─── 静态工具：从文件加载 ───
 
-    appendFileSync(filePath, JSON.stringify(trace) + '\n', 'utf-8')
+  static loadSkillTraces(skillName: string, date: string): SkillTrace[] {
+    const filePath = join(SKILLS_DIR, skillName, 'iteration', 'traces', `${date}.jsonl`)
+    if (!existsSync(filePath)) return []
+
+    const traces: SkillTrace[] = []
+    try {
+      const lines = readFileSync(filePath, 'utf-8').trim().split('\n').filter(Boolean)
+      for (const line of lines) {
+        try {
+          traces.push(JSON.parse(line) as SkillTrace)
+        } catch { /* skip malformed */ }
+      }
+    } catch { /* skip unreadable */ }
+
+    return traces
   }
 }

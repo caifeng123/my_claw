@@ -1,9 +1,9 @@
 // src/core/self-iteration/skill-optimizer-agent.ts
-// SubAgent 定义 — 个人 Skill 优化器 + 他人 Skill 分析器
+// SubAgent 定义 (V5) — 个人 Skill 优化器 + 他人 Skill 分析器
 //
-// 由 CronJob 夜间批量调用，通过不同 prompt 引导 AI 走不同路径：
-//   - 个人 Skill → 全量优化（SKILL.md / scripts / references，不动 iteration/）
-//   - 他人 Skill → 只写 iteration/best-practices.md + pitfalls.md
+// V5 核心变化：
+//   - SubAgent 自行读取 trace + session history，不再接收预消化文本
+//   - 追加模式写入 best-practices.md / pitfalls.md
 
 import {
   PERSONAL_SKILL_SYSTEM_PROMPT,
@@ -12,13 +12,13 @@ import {
 
 /**
  * 个人 Skill 优化 SubAgent
- * 全量修改 skill 目录（除 iteration/）
+ * 全量修改 skill 目录（除 iteration/traces/）+ 追加 best-practices / pitfalls
  */
 export const PERSONAL_OPTIMIZER_AGENT = {
   description:
-    'Personal skill optimizer. Analyzes execution traces and directly modifies ' +
-    'SKILL.md, scripts, references to improve the skill. ' +
-    'Does NOT modify iteration/ directory. Internal use — triggered by nightly CronJob.',
+    'Personal skill optimizer (V5). Reads trace files and session history autonomously, ' +
+    'analyzes execution patterns, modifies SKILL.md/scripts/references, and appends to ' +
+    'best-practices.md and pitfalls.md. Triggered by nightly CronJob.',
 
   prompt: PERSONAL_SKILL_SYSTEM_PROMPT,
 
@@ -28,13 +28,13 @@ export const PERSONAL_OPTIMIZER_AGENT = {
 
 /**
  * 他人 Skill 分析 SubAgent
- * 只写 iteration/best-practices.md + pitfalls.md
+ * 只追加写入 iteration/best-practices.md + pitfalls.md
  */
 export const OTHERS_ANALYZER_AGENT = {
   description:
-    'Others skill analyzer. Analyzes execution traces and updates only ' +
-    'iteration/best-practices.md and iteration/pitfalls.md. ' +
-    'Does NOT modify SKILL.md, scripts, or references. Internal use — triggered by nightly CronJob.',
+    'Others skill analyzer (V5). Reads trace files and session history autonomously, ' +
+    'analyzes execution patterns, and appends findings to iteration/best-practices.md ' +
+    'and iteration/pitfalls.md only. Triggered by nightly CronJob.',
 
   prompt: OTHERS_SKILL_SYSTEM_PROMPT,
 

@@ -1,5 +1,5 @@
 // src/core/self-iteration/index.ts
-// Barrel export — Skill 自迭代系统 (V4)
+// Barrel export — Skill 自迭代系统 (V5)
 
 // ─── Trace 采集 ───
 export { TraceCollector } from './trace-collector.js'
@@ -29,10 +29,17 @@ export { PERSONAL_SKILL_SYSTEM_PROMPT, OTHERS_SKILL_SYSTEM_PROMPT } from './prom
 export { DEFAULT_CONFIG, SKILLS_DIR } from './config.js'
 
 export type {
+  // V5 新类型
+  TimelineEvent,
+  TimelineEventType,
+  TurnTrace,
+  SkillView,
+  // 兼容旧类型
   SkillTrace,
   SkillStep,
   NightlyReport,
   NightlySkillReport,
+  SelfIterationConfig,
 } from './types.js'
 
 export type { SkillFrontmatter } from './metadata-parser.js'
